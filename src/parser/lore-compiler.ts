@@ -1,9 +1,13 @@
 /**
  * Full SillyTavern / CCV3 Lorebook (World Info) compiler:
  *  - Supports all 30+ World Info fields (both array `entries` and keyed object `{ "0": ... }`).
- *  - Parses & strips V3 `@@` / `@@@` decorators from content.
- *  - Maps `delay` / `@@activate_only_after` -> `gate.minTurn`, `@@activate_only_every` -> `gate.everyNTurns`.
- *  - Enforces ReDoS-safe regex compilation with automatic literal fallback.
+ *  - Parses & strips full CCV3 `@@` decorators with genuine `@@@` fallback semantics:
+ *      @@activate, @@dont_activate, @@activate_only_after, @@activate_only_every,
+ *      @@keep_activate_after_match, @@dont_activate_after_match, @@additional_keys,
+ *      @@exclude_keys (independent field — NEVER clobbers selectiveLogic!),
+ *      @@ignore_on_max_context, @@depth, @@reverse_depth, @@position, @@role,
+ *      @@scan_depth, @@use_regex, @@match_whole_words, @@case_sensitive.
+ *  - Enforces ReDoS-safe regex compilation (including inline `/pattern/flags` keys).
  *  - Performs one-time static scan for `match_character_*` flags.
  *  - Extracts entity index terms for local HippoRAG 2 PPR graph recall.
  */
@@ -12,14 +16,22 @@ import type { CompiledLoreBook, CompiledLoreEntry, GateCondition, SelectiveLogic
 import { sanitizeFrontendShell } from "./sanitizer.js";
 
 const MAX_REGEX_LENGTH = 200;
-// Reject obvious catastrophic backtracking shapes like (a+)+, (.*)+, (.+)*
 const REDOS_RISK_PATTERN = /\([^)]*[+*][^)]*\)[+*?]|\(\?:[^)]*[+*][^)]*\)[+*?]/;
 
-export function isSafeRegexPattern(pattern: string): boolean {
+/** Parse inline SillyTavern `/pattern/flags` key syntax. */
+export function parseInlineRegexKey(key: string): { pattern: string; flags: string } | null {
+  const m = /^\/([\s\S]+)\/([gimsuy]*)$/.exec(key.trim());
+  if (!m) return null;
+  return { pattern: m[1]!, flags: m[2] ?? "" };
+}
+
+export function isSafeRegexPattern(rawKey: string): boolean {
+  const inline = parseInlineRegexKey(rawKey);
+  const pattern = inline ? inline.pattern : rawKey;
   if (!pattern || pattern.length > MAX_REGEX_LENGTH) return false;
   if (REDOS_RISK_PATTERN.test(pattern)) return false;
   try {
-    new RegExp(pattern);
+    new RegExp(pattern, inline?.flags);
     return true;
   } catch {
     return false;
@@ -64,8 +76,45 @@ function mapSelectiveLogic(raw: unknown): SelectiveLogic {
   }
 }
 
+function mapPositionValue(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+  if (typeof raw !== "string") return undefined;
+  const s = raw.trim().toLowerCase();
+  if (/^\d+$/.test(s)) return parseInt(s, 10);
+  switch (s) {
+    case "before_char":
+    case "before_desc":
+      return 0;
+    case "after_char":
+    case "after_desc":
+    case "personality":
+    case "scenario":
+      return 1;
+    case "an_top":
+    case "before_an":
+      return 2;
+    case "an_bottom":
+    case "after_an":
+      return 3;
+    case "in_chat":
+    case "at_depth":
+      return 4;
+    case "before_example":
+    case "before_em":
+      return 5;
+    case "after_example":
+    case "after_em":
+      return 6;
+    case "outlet":
+      return 7;
+    default:
+      return undefined;
+  }
+}
+
 export interface ParsedDecorators {
   cleanedContent: string;
+  forceActivate: boolean;
   manualRecallOnly: boolean;
   minTurn?: number;
   everyNTurns?: number;
@@ -76,93 +125,137 @@ export interface ParsedDecorators {
   lowBudgetPriority: boolean;
   positionOverride?: number;
   depthOverride?: number;
+  reverseDepth?: number;
+  roleOverride?: "system" | "user" | "assistant";
+  scanDepthOverride?: number;
+  useRegexOverride?: boolean;
+  matchWholeWordsOverride?: boolean;
+  caseSensitiveOverride?: boolean;
 }
 
-/** Parse CCV3 `@@` / `@@@` leading decorators and strip all decorator lines from content. */
+/**
+ * Parse CCV3 `@@` primary decorators and `@@@` fallback decorators.
+ * A `@@@` fallback decorator is ONLY applied if the immediately preceding `@@` decorator was unrecognized.
+ * All `@@` and `@@@` lines are stripped from content so raw decorator syntax never leaks to the LLM.
+ */
 export function parseV3Decorators(content: string): ParsedDecorators {
   const lines = content.split("\n");
   const kept: string[] = [];
-  let manualRecallOnly = false;
-  let minTurn: number | undefined;
-  let everyNTurns: number | undefined;
-  let stickyPermanent = false;
-  let oneShot = false;
-  const additionalKeys: string[] = [];
-  const excludeKeys: string[] = [];
-  let lowBudgetPriority = false;
-  let positionOverride: number | undefined;
-  let depthOverride: number | undefined;
+
+  const result: ParsedDecorators = {
+    cleanedContent: "",
+    forceActivate: false,
+    manualRecallOnly: false,
+    stickyPermanent: false,
+    oneShot: false,
+    additionalKeys: [],
+    excludeKeys: [],
+    lowBudgetPriority: false,
+  };
+
+  let lastPrimaryWasUnknown = false;
+
+  const applyDecorator = (name: string, arg: string): boolean => {
+    switch (name) {
+      case "activate":
+        result.forceActivate = true;
+        return true;
+      case "dont_activate":
+        result.manualRecallOnly = true;
+        return true;
+      case "activate_only_after": {
+        const n = parseInt(arg, 10);
+        if (Number.isFinite(n) && n >= 0) result.minTurn = n;
+        return true;
+      }
+      case "activate_only_every": {
+        const n = parseInt(arg, 10);
+        if (Number.isFinite(n) && n > 0) result.everyNTurns = n;
+        return true;
+      }
+      case "keep_activate_after_match":
+        result.stickyPermanent = true;
+        return true;
+      case "dont_activate_after_match":
+        result.oneShot = true;
+        return true;
+      case "additional_keys":
+        result.additionalKeys.push(...toStringArray(arg));
+        return true;
+      case "exclude_keys":
+        result.excludeKeys.push(...toStringArray(arg));
+        return true;
+      case "ignore_on_max_context":
+        result.lowBudgetPriority = true;
+        return true;
+      case "depth": {
+        const n = parseInt(arg, 10);
+        if (Number.isFinite(n) && n >= 0) result.depthOverride = n;
+        return true;
+      }
+      case "reverse_depth": {
+        const n = parseInt(arg, 10);
+        if (Number.isFinite(n) && n >= 0) result.reverseDepth = n;
+        return true;
+      }
+      case "scan_depth": {
+        const n = parseInt(arg, 10);
+        if (Number.isFinite(n) && n > 0) result.scanDepthOverride = Math.min(n, 50);
+        return true;
+      }
+      case "position": {
+        const pos = mapPositionValue(arg);
+        if (pos !== undefined) result.positionOverride = pos;
+        return true;
+      }
+      case "role": {
+        const r = arg.trim().toLowerCase();
+        if (r === "system" || r === "user" || r === "assistant") {
+          result.roleOverride = r;
+        }
+        return true;
+      }
+      case "use_regex":
+        result.useRegexOverride = arg.toLowerCase() !== "false";
+        return true;
+      case "match_whole_words":
+        result.matchWholeWordsOverride = arg.toLowerCase() !== "false";
+        return true;
+      case "case_sensitive":
+        result.caseSensitiveOverride = arg.toLowerCase() !== "false";
+        return true;
+      default:
+        return false;
+    }
+  };
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("@@")) {
+      lastPrimaryWasUnknown = false;
       kept.push(line);
       continue;
     }
-    // Strip leading @@ or @@@
+
+    const isFallback = trimmed.startsWith("@@@");
     const body = trimmed.replace(/^@{2,3}/, "").trim();
     const spaceIdx = body.search(/\s+/);
     const name = (spaceIdx >= 0 ? body.slice(0, spaceIdx) : body).toLowerCase();
     const arg = spaceIdx >= 0 ? body.slice(spaceIdx).trim() : "";
 
-    switch (name) {
-      case "dont_activate":
-        manualRecallOnly = true;
-        break;
-      case "activate_only_after": {
-        const n = parseInt(arg, 10);
-        if (Number.isFinite(n) && n >= 0) minTurn = n;
-        break;
+    if (isFallback) {
+      if (lastPrimaryWasUnknown) {
+        const recognized = applyDecorator(name, arg);
+        if (recognized) lastPrimaryWasUnknown = false;
       }
-      case "activate_only_every": {
-        const n = parseInt(arg, 10);
-        if (Number.isFinite(n) && n > 0) everyNTurns = n;
-        break;
-      }
-      case "keep_activate_after_match":
-        stickyPermanent = true;
-        break;
-      case "dont_activate_after_match":
-        oneShot = true;
-        break;
-      case "additional_keys":
-        additionalKeys.push(...toStringArray(arg));
-        break;
-      case "exclude_keys":
-        excludeKeys.push(...toStringArray(arg));
-        break;
-      case "ignore_on_max_context":
-        lowBudgetPriority = true;
-        break;
-      case "depth": {
-        const n = parseInt(arg, 10);
-        if (Number.isFinite(n) && n >= 0) depthOverride = n;
-        break;
-      }
-      case "position":
-        if (arg === "before_desc" || arg === "0") positionOverride = 0;
-        else if (arg === "after_desc" || arg === "1") positionOverride = 1;
-        else if (arg === "in_chat" || arg === "4") positionOverride = 4;
-        break;
-      default:
-        // Unknown decorator line is still stripped so raw @@ syntax never leaks to LLM
-        break;
+    } else {
+      const recognized = applyDecorator(name, arg);
+      lastPrimaryWasUnknown = !recognized;
     }
   }
 
-  return {
-    cleanedContent: kept.join("\n").trim(),
-    manualRecallOnly,
-    minTurn,
-    everyNTurns,
-    stickyPermanent,
-    oneShot,
-    additionalKeys,
-    excludeKeys,
-    lowBudgetPriority,
-    positionOverride,
-    depthOverride,
-  };
+  result.cleanedContent = kept.join("\n").trim();
+  return result;
 }
 
 /** Extract clean entity labels from title + keys for local PPR graph indexing. */
@@ -193,6 +286,21 @@ export interface StaticScanContext {
   creatorNotes?: string;
 }
 
+/** Extract raw entries list from array or keyed object dictionary. */
+export function extractRawLoreEntries(rawBook: Record<string, unknown> | undefined | null): Record<string, unknown>[] {
+  if (!rawBook || typeof rawBook !== "object") return [];
+  const rawEntriesField = rawBook.entries;
+  if (Array.isArray(rawEntriesField)) {
+    return rawEntriesField.filter((x): x is Record<string, unknown> => Boolean(x && typeof x === "object"));
+  }
+  if (rawEntriesField && typeof rawEntriesField === "object") {
+    return Object.values(rawEntriesField as Record<string, unknown>).filter(
+      (x): x is Record<string, unknown> => Boolean(x && typeof x === "object"),
+    );
+  }
+  return [];
+}
+
 /** Compile a SillyTavern / CCV3 character_book or standalone Lorebook JSON object. */
 export function compileLoreBook(
   rawBook: Record<string, unknown> | undefined | null,
@@ -203,16 +311,7 @@ export function compileLoreBook(
     return { tokenBudget: 1800, scanDepth: 4, entries: [], warnings };
   }
 
-  const rawEntriesField = rawBook.entries;
-  let rawList: Record<string, unknown>[] = [];
-  if (Array.isArray(rawEntriesField)) {
-    rawList = rawEntriesField.filter((x): x is Record<string, unknown> => Boolean(x && typeof x === "object"));
-  } else if (rawEntriesField && typeof rawEntriesField === "object") {
-    rawList = Object.values(rawEntriesField as Record<string, unknown>).filter(
-      (x): x is Record<string, unknown> => Boolean(x && typeof x === "object"),
-    );
-  }
-
+  const rawList = extractRawLoreEntries(rawBook);
   const tokenBudget = toNumber(rawBook.token_budget, 1800);
   const scanDepth = Math.max(1, Math.min(toNumber(rawBook.scan_depth, 4), 20));
   const compiled: CompiledLoreEntry[] = [];
@@ -234,7 +333,6 @@ export function compileLoreBook(
     const { cleaned } = sanitizeFrontendShell(dec.cleanedContent, `lore:${title}`, options.rawPassthrough);
     const finalContent = cleaned.trim();
 
-    // Enabled normalization: standalone books use `disable: true`, card books use `enabled: boolean`
     const enabled =
       typeof raw.enabled === "boolean"
         ? raw.enabled
@@ -242,33 +340,41 @@ export function compileLoreBook(
           ? !raw.disable
           : true;
 
-    const constant = Boolean(raw.constant);
+    const constant = Boolean(raw.constant) || dec.forceActivate;
     const keys = [...toStringArray(raw.keys ?? raw.key), ...dec.additionalKeys];
-    let secondaryKeys = toStringArray(raw.secondary_keys ?? raw.keysecondary);
-    let selective = Boolean(raw.selective ?? secondaryKeys.length > 0);
-    let selectiveLogic = mapSelectiveLogic(raw.selectiveLogic ?? ext.selectiveLogic);
+    const secondaryKeys = toStringArray(raw.secondary_keys ?? raw.keysecondary);
+    const excludeKeys = [...dec.excludeKeys];
+    const selective = Boolean(raw.selective ?? secondaryKeys.length > 0);
+    const selectiveLogic = mapSelectiveLogic(raw.selectiveLogic ?? ext.selectiveLogic);
 
-    if (dec.excludeKeys.length > 0) {
-      secondaryKeys = [...secondaryKeys, ...dec.excludeKeys];
-      selective = true;
-      selectiveLogic = "NOT_ANY";
-    }
-
-    let useRegex = Boolean(raw.use_regex ?? ext.use_regex ?? false);
+    let useRegex = dec.useRegexOverride ?? Boolean(raw.use_regex ?? ext.use_regex ?? false);
     if (useRegex) {
-      const badKey = [...keys, ...secondaryKeys].find((k) => !isSafeRegexPattern(k));
+      const badKey = [...keys, ...secondaryKeys, ...excludeKeys].find((k) => !isSafeRegexPattern(k));
       if (badKey !== undefined) {
-        warnings.push(`Lore "${title}": unsafe or invalid regex "${badKey.slice(0, 40)}", downgraded to literal matching`);
+        warnings.push(`世界书「${title}」含不安全或非法正则 "${badKey.slice(0, 40)}"，已自动降级为字面匹配`);
         useRegex = false;
       }
     }
 
-    const caseSensitive = Boolean(raw.case_sensitive ?? raw.caseSensitive ?? ext.case_sensitive ?? false);
-    const matchWholeWords = Boolean(raw.match_whole_words ?? raw.matchWholeWords ?? ext.match_whole_words ?? false);
+    const caseSensitive =
+      dec.caseSensitiveOverride ?? Boolean(raw.case_sensitive ?? raw.caseSensitive ?? ext.case_sensitive ?? false);
+    const matchWholeWords =
+      dec.matchWholeWordsOverride ?? Boolean(raw.match_whole_words ?? raw.matchWholeWords ?? ext.match_whole_words ?? false);
     const priority = toNumber(raw.priority ?? raw.order ?? raw.insertion_order, 100);
-    const rawPos = dec.positionOverride ?? raw.position ?? ext.position;
-    const position = typeof rawPos === "string" ? (rawPos === "before_char" ? 0 : rawPos === "after_char" ? 1 : 4) : toNumber(rawPos, 4);
+    const position =
+      dec.positionOverride ??
+      mapPositionValue(raw.position ?? ext.position) ??
+      4;
     const depthHint = dec.depthOverride ?? toNumber(raw.depth ?? ext.depth, 4);
+    const roleRaw = dec.roleOverride ?? raw.role ?? ext.role;
+    const role: "system" | "user" | "assistant" | undefined =
+      roleRaw === "user" || roleRaw === 1
+        ? "user"
+        : roleRaw === "assistant" || roleRaw === 2
+          ? "assistant"
+          : roleRaw === "system" || roleRaw === 0
+            ? "system"
+            : undefined;
     const pinned = Boolean(raw.ignore_budget ?? raw.ignoreBudget ?? ext.ignore_budget ?? false);
 
     const delay = toNumber(raw.delay ?? ext.delay, 0);
@@ -276,16 +382,22 @@ export function compileLoreBook(
     const cooldownTurns = toNumber(raw.cooldown ?? ext.cooldown, 0);
     const probability = toNumber(raw.probability ?? ext.probability, 100);
     const useProbability = Boolean(raw.useProbability ?? ext.useProbability ?? probability < 100);
-    const group = typeof (raw.group ?? ext.group) === "string" && String(raw.group ?? ext.group).trim()
-      ? String(raw.group ?? ext.group).trim()
-      : undefined;
+    const group =
+      typeof (raw.group ?? ext.group) === "string" && String(raw.group ?? ext.group).trim()
+        ? String(raw.group ?? ext.group).trim()
+        : undefined;
     const groupOverride = Boolean(raw.group_override ?? raw.groupOverride ?? ext.group_override ?? false);
     const groupWeight = toNumber(raw.group_weight ?? raw.groupWeight ?? ext.group_weight, 100);
     const useGroupScoring = Boolean(raw.use_group_scoring ?? raw.useGroupScoring ?? ext.use_group_scoring ?? false);
 
     const noGraphSpread = Boolean(
-      raw.prevent_recursion ?? raw.preventRecursion ?? ext.prevent_recursion ??
-      raw.exclude_recursion ?? raw.excludeRecursion ?? ext.exclude_recursion ?? false,
+      raw.prevent_recursion ??
+        raw.preventRecursion ??
+        ext.prevent_recursion ??
+        raw.exclude_recursion ??
+        raw.excludeRecursion ??
+        ext.exclude_recursion ??
+        false,
     );
     const graphSecondHopOnly = Boolean(
       raw.delay_until_recursion ?? raw.delayUntilRecursion ?? ext.delay_until_recursion ?? false,
@@ -296,7 +408,12 @@ export function compileLoreBook(
         ? String(raw.outletName ?? ext.outlet_name).trim()
         : undefined;
 
-    // Build physical GateCondition from delay / decorators / explicit gate extension
+    const scanDepthOverride =
+      dec.scanDepthOverride ??
+      (raw.scanDepth !== undefined || ext.scan_depth !== undefined
+        ? toNumber(raw.scanDepth ?? ext.scan_depth, 0) || undefined
+        : undefined);
+
     const gate: GateCondition = {};
     const effectiveMinTurn = Math.max(delay, dec.minTurn ?? 0);
     if (effectiveMinTurn > 0) gate.minTurn = effectiveMinTurn;
@@ -306,14 +423,16 @@ export function compileLoreBook(
     }
     const hasGate = Object.keys(gate).length > 0;
 
-    // One-time static evaluation of match_character_* flags
     let staticPrebound = false;
     if (options.staticScan && !constant && keys.length > 0) {
       const scanPool: string[] = [];
-      if (raw.matchCharacterDescription ?? ext.match_character_description) scanPool.push(options.staticScan.description ?? "");
-      if (raw.matchCharacterPersonality ?? ext.match_character_personality) scanPool.push(options.staticScan.personality ?? "");
+      if (raw.matchCharacterDescription ?? ext.match_character_description)
+        scanPool.push(options.staticScan.description ?? "");
+      if (raw.matchCharacterPersonality ?? ext.match_character_personality)
+        scanPool.push(options.staticScan.personality ?? "");
       if (raw.matchScenario ?? ext.match_scenario) scanPool.push(options.staticScan.scenario ?? "");
-      if (raw.matchCharacterDepthPrompt ?? ext.match_character_depth_prompt) scanPool.push(options.staticScan.depthPrompt ?? "");
+      if (raw.matchCharacterDepthPrompt ?? ext.match_character_depth_prompt)
+        scanPool.push(options.staticScan.depthPrompt ?? "");
       if (raw.matchCreatorNotes ?? ext.match_creator_notes) scanPool.push(options.staticScan.creatorNotes ?? "");
       const joined = scanPool.join("\n").toLowerCase();
       if (joined && keys.some((k) => joined.includes(k.toLowerCase()))) {
@@ -330,6 +449,7 @@ export function compileLoreBook(
       manualRecallOnly: dec.manualRecallOnly,
       keys,
       secondaryKeys,
+      excludeKeys,
       selective,
       selectiveLogic,
       useRegex,
@@ -338,6 +458,9 @@ export function compileLoreBook(
       priority,
       position,
       depthHint,
+      reverseDepth: dec.reverseDepth,
+      role,
+      scanDepthOverride,
       pinned,
       lowBudgetPriority: dec.lowBudgetPriority,
       stickyTurns,

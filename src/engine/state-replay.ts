@@ -1,16 +1,23 @@
 /**
- * Deterministic Event Sourcing Replay for Pi Session Tree (JSONL DAG).
+ * 100% Session-Only Deterministic Event Sourcing Replay for Pi Session Tree (JSONL DAG).
  *
- * Scanning `ctx.sessionManager.getBranch()` and replaying `rp:tx` / `rp:bind` / `rp:persona` /
- * `rp:note` / `rp:hide` / `rp:cast` entries guarantees that branching or rewinding in Pi's
- * native Session Tree rolls back 100% of L1 state (stats, inventory, CFSM, eras, bi-temporal
- * facts, foresights, sticky/cooldown lore runtime) with zero desync.
+ * Strict Lifecycle Guarantees:
+ *  1. ZERO cross-session pollution: RP mode ONLY activates inside a session whose branch
+ *     contains an explicit active `rp:tx` `bind` event. Other sessions in the same project
+ *     or directory stay 100% dormant (0 tokens, 0 tools changed, 0 UI).
+ *  2. Clean re-bind: binding a card cleanly resets all transient world state so nothing leaks
+ *     from a previous character/story in the same session.
+ *  3. Complete exit: `unbind` resets ALL RP state fields back to a pristine dormant state.
+ *  4. Tree rewind/fork: replaying `ctx.sessionManager.getBranch()` restores 100% of stats,
+ *     inventory, CFSM, eras, bi-temporal facts, beliefs, foresights, sticky/cooldown, notes,
+ *     lore overrides, and hidden floors deterministically.
  */
 
+import * as crypto from "node:crypto";
 import type {
   PersonaProfile,
+  PiMessage,
   PiSessionEntry,
-  ProjectWorldConfig,
   RpTxEntry,
   SessionRpState,
 } from "../types.js";
@@ -24,10 +31,25 @@ const DEFAULT_PERSONA: PersonaProfile = {
   description: "",
 };
 
+/** Compute a deterministic fingerprint for a PiMessage so `/rp hide` works on AgentMessage[] without entryId. */
+export function computeMessageFingerprint(msg: Pick<PiMessage, "role" | "content" | "timestamp">): string {
+  const text =
+    typeof msg.content === "string"
+      ? msg.content
+      : Array.isArray(msg.content)
+        ? msg.content
+            .filter((b): b is { type: "text"; text: string } => Boolean(b && b.type === "text" && typeof b.text === "string"))
+            .map((b) => b.text)
+            .join("")
+        : "";
+  const head = text.trim().slice(0, 160);
+  const ts = typeof msg.timestamp === "number" ? String(msg.timestamp) : "";
+  return crypto.createHash("sha1").update(`${msg.role}|${ts}|${head}`).digest("hex").slice(0, 16);
+}
+
 export function createInitialRpState(): SessionRpState {
   return {
     active: false,
-    explicitlyUnbound: false,
     cardId: null,
     cardSlug: null,
     cardSource: null,
@@ -38,6 +60,7 @@ export function createInitialRpState(): SessionRpState {
     rawPassthrough: false,
     hudMode: "minimal",
     settlementMode: "tool-assisted",
+    pacingMode: "balanced",
     loreTokenBudget: 1800,
     sidecarModel: undefined,
     initialPersona: null,
@@ -64,17 +87,26 @@ export function createInitialRpState(): SessionRpState {
     foresights: new Map(),
     notes: [],
     hiddenEntryIds: new Set<string>(),
+    hiddenFingerprints: new Set<string>(),
+    loreOverrides: {},
     loreSticky: {},
     loreCooldown: {},
     loreConsumedOneShots: new Set<string>(),
   };
 }
 
+function resetWorldStateInPlace(state: SessionRpState): void {
+  const fresh = createInitialRpState();
+  Object.assign(state, fresh);
+}
+
 export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
   switch (tx.kind) {
-    case "bind":
+    case "bind": {
+      // Clean reset of prior story state before binding new card
+      const prevPersona = state.initialPersona ?? (state.currentPersona.id !== "default" ? state.currentPersona : null);
+      resetWorldStateInPlace(state);
       state.active = true;
-      state.explicitlyUnbound = false;
       state.cardId = tx.cardId;
       state.cardSlug = tx.cardSlug;
       state.cardSource = tx.cardSource;
@@ -83,11 +115,17 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       state.activeCharacters = [...tx.activeCharacters];
       if (tx.presetId !== undefined) state.presetId = tx.presetId;
       if (tx.rawPassthrough !== undefined) state.rawPassthrough = tx.rawPassthrough;
+      const chosenPersona = tx.persona ?? prevPersona;
+      if (chosenPersona) {
+        state.initialPersona = { ...chosenPersona };
+        state.currentPersona = { ...chosenPersona };
+      }
       break;
+    }
 
     case "unbind":
-      state.active = false;
-      state.explicitlyUnbound = true;
+      // Complete exit: wipe every trace of RP state so session returns to 100% pure dormant state
+      resetWorldStateInPlace(state);
       break;
 
     case "preset_set":
@@ -97,6 +135,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     case "config_patch":
       if (tx.hudMode !== undefined) state.hudMode = tx.hudMode;
       if (tx.settlementMode !== undefined) state.settlementMode = tx.settlementMode;
+      if (tx.pacingMode !== undefined) state.pacingMode = tx.pacingMode;
       if (tx.rawPassthrough !== undefined) state.rawPassthrough = tx.rawPassthrough;
       if (tx.loreTokenBudget !== undefined) state.loreTokenBudget = tx.loreTokenBudget;
       if (tx.sidecarModel !== undefined) state.sidecarModel = tx.sidecarModel;
@@ -105,7 +144,14 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     case "persona_set":
       if (state.initialPersona === null && state.turn === 0) {
         state.initialPersona = { ...tx.persona };
-      } else if (state.initialPersona && state.initialPersona.name !== tx.persona.name) {
+      } else if (
+        state.initialPersona &&
+        (state.initialPersona.name !== tx.persona.name ||
+          state.initialPersona.description !== tx.persona.description)
+      ) {
+        state.personaChangedMidSession = true;
+      } else if (state.initialPersona === null && state.turn > 0) {
+        state.initialPersona = { ...state.currentPersona };
         state.personaChangedMidSession = true;
       }
       state.currentPersona = { ...tx.persona };
@@ -134,10 +180,18 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         if (tx.hidden) state.hiddenEntryIds.add(id);
         else state.hiddenEntryIds.delete(id);
       }
+      for (const fp of tx.fingerprints ?? []) {
+        if (tx.hidden) state.hiddenFingerprints.add(fp);
+        else state.hiddenFingerprints.delete(fp);
+      }
       break;
 
     case "cast_set":
       state.activeCharacters = [...tx.slugs];
+      break;
+
+    case "lore_toggle":
+      state.loreOverrides[tx.entryId] = tx.enabled;
       break;
 
     case "clock_tick":
@@ -147,7 +201,6 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       if (tx.worldTimeLabel !== undefined) state.worldTimeLabel = tx.worldTimeLabel;
       else if (tx.dayDelta) state.worldTimeLabel = `Day ${state.day}`;
       if (tx.phase !== undefined) state.phase = tx.phase;
-      // Decrement TTL on temporary director notes
       state.notes = state.notes
         .map((n) => (n.remainingTurns === null ? n : { ...n, remainingTurns: n.remainingTurns - 1 }))
         .filter((n) => n.remainingTurns === null || n.remainingTurns > 0);
@@ -274,16 +327,10 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
 }
 
 /**
- * Deterministically replay the full L1 world state from a Pi session branch.
- * Respects binding priority:
- *  1. Explicit session branch `rp:tx` bind/unbind takes highest precedence.
- *  2. If no explicit bind/unbind on branch, falls back to project `.pi/rp/world.json`.
- *  3. Otherwise stays dormant (`active: false`).
+ * Deterministically replay the full L1 world state strictly from THIS session's branch.
+ * NEVER auto-activates from project-level config! Only explicit `bind` in this branch activates RP mode.
  */
-export function replayBranchState(
-  branch: PiSessionEntry[],
-  projectConfig?: { worldDir: string; config: ProjectWorldConfig } | null,
-): SessionRpState {
+export function replayBranchState(branch: PiSessionEntry[]): SessionRpState {
   const state = createInitialRpState();
 
   for (const entry of branch) {
@@ -291,22 +338,6 @@ export function replayBranchState(
     const data = entry.data as RpTxEntry | undefined;
     if (!data || typeof data !== "object" || typeof data.kind !== "string") continue;
     applyRpTx(state, data);
-  }
-
-  // Fallback to project-level auto-binding when session has no explicit bind or unbind
-  if (!state.active && !state.explicitlyUnbound && projectConfig?.config.defaultCardSlug) {
-    const cfg = projectConfig.config;
-    state.active = true;
-    state.cardSlug = cfg.defaultCardSlug;
-    state.cardId = cfg.defaultCardSlug;
-    state.cardSource = "project";
-    state.worldDir = projectConfig.worldDir;
-    state.activeCharacters = cfg.activeCharacters ? [...cfg.activeCharacters] : [cfg.defaultCardSlug];
-    if (cfg.defaultPresetId) state.presetId = cfg.defaultPresetId;
-    if (cfg.rawPassthrough !== undefined) state.rawPassthrough = cfg.rawPassthrough;
-    if (cfg.hudMode) state.hudMode = cfg.hudMode;
-    if (cfg.settlementMode) state.settlementMode = cfg.settlementMode;
-    if (cfg.loreTokenBudget) state.loreTokenBudget = cfg.loreTokenBudget;
   }
 
   return state;

@@ -1,5 +1,8 @@
 /**
- * Deterministic / true-random XdY(+/-mod) dice & check engine using Node crypto.randomInt.
+ * Deterministic / true-random dice & check engine using Node crypto.randomInt.
+ * Supports:
+ *  - Standard XdY(+/-mod) and shorthand d20 / d100
+ *  - Advantage / Disadvantage / Keep-Highest / Keep-Lowest: 2d20kh1, 2d20kl1, 4d6kh3+2
  */
 
 import * as crypto from "node:crypto";
@@ -7,6 +10,7 @@ import * as crypto from "node:crypto";
 export interface RollCheckResult {
   expression: string;
   rolls: number[];
+  keptRolls: number[];
   modifier: number;
   total: number;
   dc?: number;
@@ -20,14 +24,18 @@ export function rollDiceCheck(options: {
   dc?: number;
   deterministicRolls?: number[];
 }): RollCheckResult {
-  const m = /^\s*(\d+)\s*d\s*(\d+)\s*(?:([+-])\s*(\d+))?\s*$/i.exec(options.expression);
+  const m = /^\s*(\d*)\s*d\s*(\d+)\s*(?:(kh|kl)\s*(\d+))?\s*(?:([+-])\s*(\d+))?\s*$/i.exec(options.expression);
   if (!m) {
-    throw new Error(`Invalid dice expression "${options.expression}" (expected e.g. 1d20+3, 2d6, 1d100)`);
+    throw new Error(
+      `无效的骰子表达式 "${options.expression}"（支持如 1d20、d20+3、2d6、1d100、2d20kh1 优势、2d20kl1 劣势）`,
+    );
   }
-  const count = Math.min(Math.max(parseInt(m[1]!, 10), 1), 100);
+  const count = Math.min(Math.max(m[1] ? parseInt(m[1], 10) : 1, 1), 100);
   const sides = Math.min(Math.max(parseInt(m[2]!, 10), 2), 10000);
-  const sign = m[3] === "-" ? -1 : 1;
-  const exprMod = m[4] ? parseInt(m[4], 10) * sign : 0;
+  const keepMode = m[3]?.toLowerCase() as "kh" | "kl" | undefined;
+  const keepCount = m[4] ? Math.min(Math.max(parseInt(m[4], 10), 1), count) : count;
+  const sign = m[5] === "-" ? -1 : 1;
+  const exprMod = m[6] ? parseInt(m[6], 10) * sign : 0;
   const modifier = exprMod + (options.extraModifier ?? 0);
 
   const rolls: number[] = [];
@@ -40,13 +48,20 @@ export function rollDiceCheck(options: {
     rolls.push(r);
   }
 
-  const sum = rolls.reduce((a, b) => a + b, 0);
+  let keptRolls = rolls.slice();
+  if (keepMode === "kh") {
+    keptRolls = rolls.slice().sort((a, b) => b - a).slice(0, keepCount);
+  } else if (keepMode === "kl") {
+    keptRolls = rolls.slice().sort((a, b) => a - b).slice(0, keepCount);
+  }
+
+  const sum = keptRolls.reduce((a, b) => a + b, 0);
   const total = sum + modifier;
   const critical: RollCheckResult["critical"] =
-    count === 1 && sides === 20
-      ? rolls[0] === 20
+    keptRolls.length === 1 && sides === 20
+      ? keptRolls[0] === 20
         ? "nat_max"
-        : rolls[0] === 1
+        : keptRolls[0] === 1
           ? "nat_min"
           : null
       : null;
@@ -60,9 +75,13 @@ export function rollDiceCheck(options: {
           : total >= options.dc
       : undefined;
 
+  const keepSuffix = keepMode ? `${keepMode}${keepCount}` : "";
+  const modSuffix = modifier > 0 ? `+${modifier}` : modifier < 0 ? `${modifier}` : "";
+
   return {
-    expression: `${count}d${sides}${modifier > 0 ? `+${modifier}` : modifier < 0 ? `${modifier}` : ""}`,
+    expression: `${count}d${sides}${keepSuffix}${modSuffix}`,
     rolls,
+    keptRolls,
     modifier,
     total,
     dc: options.dc,

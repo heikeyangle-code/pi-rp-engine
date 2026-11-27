@@ -4,46 +4,45 @@
 
 ---
 
-## 一、项目（Project）vs 对话（Session）生命周期模型
+## 一、严格单会话存活（Session-Only）与彻底退出生命周期模型
 
-这是让用户日常写代码与玩 RP 彻底互不干扰、同时又兼顾「大世界长篇」与「轻量短打」的最优双模式设计：
+> **v2 重要架构修正**：已彻底废弃旧版 `<cwd>/.pi/rp/world.json` 项目级自动绑定机制！项目级自动绑定会导致同一项目下新建的普通编程会话误入 RP 模式。v2 强制执行 **「素材库被动存放，激活严格限定于单个会话，退出即彻底清零」**。
 
-### 1. 安装与静默机制（Zero-Pollution Dormancy）
+### 1. 安装与绝对静默机制（Zero-Pollution Dormancy）
 - 扩展**全局安装一次**（如 `~/.pi/agent/extensions/pi-rp-engine/` 或 `pi install`）。
-- 所有 RP 工具注册时均设置 **`defaultActive: false`**（Pi 1.6.1 `ToolDefinition` 原生字段，未激活时 0 工具 Token 注入）。
-- **零第三方运行时依赖（直用 Pi `VIRTUAL_MODULES`）**：经核对 `@earendil-works/pi-coding-agent@1.6.1` `virtual-modules.js`，扩展运行期由 Pi 自动注入 `@earendil-works/pi-coding-agent`、`@earendil-works/pi-ai`、`@earendil-works/pi-tui`、`@earendil-works/pi-agent-core` 与 `typebox`；结合 Node 内置 `fs`/`zlib`/`crypto` 即可完成 PNG tEXt、ZIP/CHARX 解包、真随机掷骰与本地存储，**无需在手机端或桌面端 `npm install` 任何外部运行包**。
-- 在任何未激活 RP 模式的普通对话/编程项目里：
-  - `before_agent_start` 直接 `return`（0 Token 注入）；
-  - `context` 直接原样放行；
+- 所有 6 个 RP 工具注册时均设置 **`defaultActive: false`**（Pi 1.6.1 `ToolDefinition` 原生字段，未激活时 0 工具 Token 注入）。
+- **零第三方运行时依赖**：仅使用 Node 内置 `fs`/`os`/`path`/`zlib`/`crypto` 与 Pi 官方接口完成 PNG `ccv3`/`chara` 块提取、ZIP/CHARX 解包、真随机掷骰、BM25+PPR 召回与本地存储。
+- 在任何未显式开启 RP 的普通编程会话中：
+  - `before_agent_start`、`context`、`turn_end`、`session_before_compact` 全部直接 `return`（0 Token、0 耗时）；
   - `setStatus` / `setWidget` 全清（0 UI 占用）；
-  - RP 工具不出现在工具表里（0 工具定义 Token）。
+  - 原有编程工具表 100% 不受影响。
 
-### 2. 双模式无缝统一：以「一世界 = 一项目」为主，支持「单库按对话切卡」
+### 2. 被动素材库 vs 会话专属绑定
 ```text
-模式 A（推荐主模式）：一长篇大卡 / 一世界观 = 一个 Project（Workspace）
-  <project-root>/
-    .pi/rp/
-      world.json              # 项目级默认绑定世界/卡包配置（打开该项目自动识别 RP 模式）
-      cards/<slug>/
-        card.compiled.json    # 清洗并保真编译后的标准卡（含完整 mes_example 与导入报告）
-        card.raw.json         # 原始无损备份（随时可切 Raw Passthrough 或重新编译）
-        lore.compiled.json    # 编译后世界书 + 实体别名图谱索引
-        assets/               # .charx / PNG 解包立绘、头像、背景图
-      persona.json            # 玩家在此世界里的 Persona 设定
-  └─ 该项目下的每个 Session（新对话） = 该世界的一条独立攻略线 / 不同开场白开局
-  └─ 同一 Session 内的 Session Tree 分叉 = 剧情分支存档（所有 L1 状态随分支 100% 自动回滚）
+静态素材库（绝不自动激活任何会话！）：
+  ~/.pi/agent/rp-library/      # 全局角色库（默认推荐：跨目录复用卡片、预设、人设与上次导入目录偏好）
+    cards/<slug>/
+      card.compiled.json       # 保真编译后的标准卡（含 100% mes_example 与导入审计报告）
+      card.raw.json            # 原始无损备份（随时可切 Raw Passthrough 重新编译）
+      assets/                  # .charx / PNG 解包立绘与头像
+    presets/<id>.json          # 编译后的酒馆预设
+    personas.json              # 全局玩家人设档案
+    ui-prefs.json              # 最近导入目录与默认人设偏好
+  <cwd>/.pi/rp/                # 可选项目级素材库（同样纯被动存储，绝不连带其他会话）
 
-模式 B（轻量兼容模式）：一个「酒馆角色库」Project + 按 Session 独立绑卡
-  ~/.pi/agent/rp-library/     # 或共享工作区的 .pi/rp/library/，存放多张轻卡
-  └─ 对话 1：运行 `/rp load alice` → 写入 `pi.appendEntry("rp:bind", { cardRef: "alice" })`
-  └─ 对话 2：运行 `/rp load detective` → 写入 `pi.appendEntry("rp:bind", { cardRef: "detective" })`
-  └─ 两个对话互不串台，状态各自住在自己的 JSONL 会话树里！
+单会话运行态（100% 绑定当前 Pi Session Tree）：
+  └─ 仅当用户在当前会话执行 `/rp load` 或 `/rp import -> 立即开启` 时，
+     才向当前会话树写入 `rp:tx { kind: "bind", ... }`；
+  └─ 同项目里新建的其他会话因分支中没有 `bind`，永远保持纯净编程模式；
+  └─ 同一会话内的 Session Tree 分叉/回溯会自动精确重放全部 L1 状态；
+  └─ 执行 `/rp exit` / `/rp off` / `Alt+Shift+X` 写入 `rp:tx { kind: "unbind" }`，
+     瞬间清空全部内存态（卡/共演/预设/OOC/世界书缓存）、恢复原有编程工具并清零 HUD。
 ```
 
-**激活判定优先级（`resolveRpBinding(cwd, branch)`）**：
-1. 优先读当前会话分支上的 `rp:bind` 条目（会话级显式绑定 / 显式关闭 `rp:unbind` 优先级最高）；
-2. 若当前会话无显式绑定，检查当前工作区是否存在 `<cwd>/.pi/rp/world.json`（项目级自动绑定）；
-3. 若都没有 → **完全静默休眠**，直到用户手动运行 `/rp import`、`/rp load` 或 `/rp new`。
+**激活判定规则（`replayBranchState(branch)`）**：
+1. 仅重放当前会话分支 `ctx.sessionManager.getBranch()` 中的 `rp:tx` 事件；
+2. 遇到 `bind` 时自动先重置旧世界状态再绑定新卡；遇到 `unbind` 时彻底归零全部字段；
+3. 若分支最终 `state.active === false` → **100% 休眠**，绝不读取任何项目自动激活配置。
 
 ---
 

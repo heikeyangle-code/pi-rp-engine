@@ -1,27 +1,33 @@
 /**
- * Zero-dependency local HippoRAG 2 (2-hop Personalized PageRank) + BM25 + Full World Info
- * 4-way selectiveLogic + sticky / cooldown / oneShot / group_weight / probability recall engine.
- *
- * Runs in pure TypeScript in < 2-5 ms on mobile with zero external vector DB or embedding API.
+ * Zero-dependency local HippoRAG 2 (2-hop Personalized PageRank) + BM25 + Official SillyTavern
+ * World Info engine:
+ *  - Inline `/pattern/flags` regex keys (even when `useRegex: false`, matching ST `world-info.js`)
+ *  - Full 4-way `selectiveLogic` (`AND_ANY`, `AND_ALL`, `NOT_ANY`, `NOT_ALL`)
+ *  - Independent CCV3 `excludeKeys` (never clobbers `selectiveLogic`)
+ *  - Per-entry `scanDepthOverride` (`@@scan_depth N`)
+ *  - Exact `sticky` / `cooldown` / `oneShot` lifecycle (including `sticky === 0 && cooldown > 0`!)
+ *  - `group` / `groupOverride` / `groupWeight` / `useGroupScoring` + deterministic `probability`
+ *  - Respects live `state.loreOverrides` toggles from `/rp panel`
+ *  - Couples active bi-temporal facts & open foresights into the seed entity context
  */
 
-import type { CompiledLoreEntry, SessionRpState } from "../types.js";
+import type { CompiledLoreEntry, PiMessage, SessionRpState } from "../types.js";
 import { evaluateGate } from "../engine/gates.js";
+import { parseInlineRegexKey, isSafeRegexPattern } from "../parser/lore-compiler.js";
 import { selectWithinTokenBudget } from "../context/token-budget.js";
+import { getActiveFacts } from "./bitemporal.js";
 
 /** Tokenize mixed Chinese/English text into CJK bigrams + lowercased Latin words. */
 export function tokenizeHybrid(text: string): string[] {
   const tokens: string[] = [];
   const lower = text.toLowerCase();
 
-  // Latin words (length >= 2)
   const wordRe = /[a-z0-9_]{2,}/g;
   let m: RegExpExecArray | null;
   while ((m = wordRe.exec(lower)) !== null) {
     tokens.push(m[0]!);
   }
 
-  // CJK contiguous runs -> bigrams (and single char if length == 1)
   const cjkRe = /[\u4e00-\u9fff]+/g;
   while ((m = cjkRe.exec(lower)) !== null) {
     const run = m[0]!;
@@ -41,18 +47,46 @@ function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function matchKey(haystack: string, key: string, entry: CompiledLoreEntry): boolean {
+function extractMsgText(m: PiMessage): string {
+  if (typeof m.content === "string") return m.content;
+  if (Array.isArray(m.content)) {
+    return m.content
+      .filter((b): b is { type: "text"; text: string } => Boolean(b && b.type === "text" && typeof b.text === "string"))
+      .map((b) => b.text)
+      .join("");
+  }
+  return "";
+}
+
+/**
+ * Match a single World Info key against haystack following official SillyTavern `world-info.js`:
+ *  - Inline `/pattern/flags` is ALWAYS evaluated as RegExp (guarded for ReDoS), even when `useRegex: false`.
+ *  - When `useRegex: true`, bare keys are compiled as RegExp (respecting `caseSensitive`).
+ *  - When `matchWholeWords: true`, applies word-boundary checks for ASCII/alphanumeric words.
+ */
+export function matchWorldInfoKey(haystack: string, key: string, entry: CompiledLoreEntry): boolean {
   if (!key) return false;
-  if (entry.useRegex) {
+
+  const inline = parseInlineRegexKey(key);
+  if (inline) {
+    if (isSafeRegexPattern(key)) {
+      try {
+        const flags = inline.flags || (entry.caseSensitive ? "" : "i");
+        return new RegExp(inline.pattern, flags).test(haystack);
+      } catch {
+        // Fallback to literal
+      }
+    }
+  } else if (entry.useRegex && isSafeRegexPattern(key)) {
     try {
-      const re = new RegExp(key, entry.caseSensitive ? "" : "i");
-      return re.test(haystack);
+      return new RegExp(key, entry.caseSensitive ? "" : "i").test(haystack);
     } catch {
       // Fallback to literal
     }
   }
-  if (entry.matchWholeWords && /^[a-zA-Z0-9_]+$/.test(key)) {
-    const re = new RegExp(`\\b${escapeRegExp(key)}\\b`, entry.caseSensitive ? "" : "i");
+
+  if (entry.matchWholeWords && /^[a-zA-Z0-9_\-']+$/.test(key)) {
+    const re = new RegExp(`(?<![a-zA-Z0-9_])${escapeRegExp(key)}(?![a-zA-Z0-9_])`, entry.caseSensitive ? "" : "i");
     return re.test(haystack);
   }
   if (entry.caseSensitive) {
@@ -61,17 +95,23 @@ function matchKey(haystack: string, key: string, entry: CompiledLoreEntry): bool
   return haystack.toLowerCase().includes(key.toLowerCase());
 }
 
-/** Evaluate World Info primary + 4-way secondary selectiveLogic. */
+/** Evaluate World Info primary + 4-way secondary selectiveLogic + independent CCV3 excludeKeys. */
 export function matchesWorldInfoKeys(haystack: string, entry: CompiledLoreEntry): boolean {
   if (entry.keys.length === 0) return false;
-  const primaryHit = entry.keys.some((k) => matchKey(haystack, k, entry));
+
+  // CCV3 @@exclude_keys: hard-blocks activation if any excluded key appears
+  if (entry.excludeKeys.length > 0 && entry.excludeKeys.some((k) => matchWorldInfoKey(haystack, k, entry))) {
+    return false;
+  }
+
+  const primaryHit = entry.keys.some((k) => matchWorldInfoKey(haystack, k, entry));
   if (!primaryHit) return false;
 
   if (!entry.selective || entry.secondaryKeys.length === 0) {
     return true;
   }
 
-  const secHits = entry.secondaryKeys.map((k) => matchKey(haystack, k, entry));
+  const secHits = entry.secondaryKeys.map((k) => matchWorldInfoKey(haystack, k, entry));
   switch (entry.selectiveLogic) {
     case "AND_ANY":
       return secHits.some(Boolean);
@@ -96,6 +136,7 @@ function deterministicPercent(seed: string): number {
 
 export interface RecallResult {
   selected: CompiledLoreEntry[];
+  activatedIds: string[];
   nextSticky: Record<string, number>;
   nextCooldown: Record<string, number>;
   nextConsumedOneShots: string[];
@@ -104,22 +145,41 @@ export interface RecallResult {
 }
 
 /**
- * Local BM25 + 2-hop Personalized PageRank Entity Graph Recall with full World Info semantics.
+ * Local BM25 + 2-hop Personalized PageRank Entity Graph Recall with full SillyTavern World Info semantics.
  */
 export function recallLoreWithGraphPpr(options: {
   entries: CompiledLoreEntry[];
   state: SessionRpState;
   recentText: string;
+  messages?: PiMessage[];
+  defaultScanDepth?: number;
   tokenBudget: number;
   manualQuery?: string;
 }): RecallResult {
-  const { entries, state, recentText, tokenBudget, manualQuery } = options;
+  const { entries, state, recentText, messages, defaultScanDepth = 4, tokenBudget, manualQuery } = options;
   const isManual = Boolean(manualQuery);
   const queryText = isManual ? manualQuery! : recentText;
 
-  // 1. Filter eligible dynamic entries (physical EraGate + enabled + cooldown + oneShot)
+  // Cache per-depth message slices when messages[] is supplied (supports @@scan_depth N)
+  const depthTextCache = new Map<number, string>();
+  const getHaystackForEntry = (entry: CompiledLoreEntry): string => {
+    if (isManual || !messages || messages.length === 0 || !entry.scanDepthOverride) {
+      return queryText;
+    }
+    const d = Math.max(1, entry.scanDepthOverride);
+    let cached = depthTextCache.get(d);
+    if (cached === undefined) {
+      cached = messages.slice(-d).map(extractMsgText).join("\n");
+      depthTextCache.set(d, cached);
+    }
+    return cached;
+  };
+  void defaultScanDepth;
+
+  // 1. Filter eligible dynamic entries (live loreOverrides + physical EraGate + cooldown + oneShot)
   const eligible = entries.filter((e) => {
-    if (!e.enabled || !e.content) return false;
+    const effectiveEnabled = state.loreOverrides[e.id] ?? e.enabled;
+    if (!effectiveEnabled || !e.content) return false;
     if (e.constant && !isManual) return false;
     if (e.manualRecallOnly && !isManual) return false;
     if (!evaluateGate(e.gate, state)) return false;
@@ -131,6 +191,7 @@ export function recallLoreWithGraphPpr(options: {
   if (eligible.length === 0) {
     return {
       selected: [],
+      activatedIds: [],
       nextSticky: { ...state.loreSticky },
       nextCooldown: { ...state.loreCooldown },
       nextConsumedOneShots: Array.from(state.loreConsumedOneShots),
@@ -179,6 +240,7 @@ export function recallLoreWithGraphPpr(options: {
   // 3. Build lightweight Entity -> Entry adjacency graph & run 2-hop Personalized PageRank
   const entityToEntries = new Map<string, Set<string>>();
   const entryToEntities = new Map<string, Set<string>>();
+  const eligibleById = new Map(eligible.map((e) => [e.id, e]));
 
   for (const e of eligible) {
     const ents = new Set<string>();
@@ -188,7 +250,6 @@ export function recallLoreWithGraphPpr(options: {
       if (!entityToEntries.has(norm)) entityToEntries.set(norm, new Set());
       entityToEntries.get(norm)!.add(e.id);
     }
-    // Also detect co-mentioned entities from other entries inside this entry's content (unless noGraphSpread)
     entryToEntities.set(e.id, ents);
   }
 
@@ -205,8 +266,12 @@ export function recallLoreWithGraphPpr(options: {
     }
   }
 
-  // Seed entity scores from queryText + presentNpcs + current location
-  const seedContext = `${queryText}\n${state.location}\n${state.presentNpcs.join(" ")}`.toLowerCase();
+  // Seed entity scores from queryText + presentNpcs + current location + recently touched fact entities
+  const recentFactEntities = getActiveFacts(state)
+    .slice(0, 6)
+    .flatMap((f) => f.entities)
+    .filter((ent) => ent && queryText.toLowerCase().includes(ent.toLowerCase()));
+  const seedContext = `${queryText}\n${state.location}\n${state.presentNpcs.join(" ")}\n${recentFactEntities.join(" ")}`.toLowerCase();
   const seedEntities = new Map<string, number>();
   for (const ent of allEntityNames) {
     if (seedContext.includes(ent)) {
@@ -214,28 +279,42 @@ export function recallLoreWithGraphPpr(options: {
     }
   }
 
-  // 2-hop PPR power iteration: Entity -> Entry -> Entity -> Entry
+  // Pre-evaluate direct key hits & sticky status so regex-triggered entries ALSO seed 2-hop PPR!
+  const directHitMap = new Map<string, boolean>();
+  const stickyActiveMap = new Map<string, boolean>();
+  for (const e of eligible) {
+    const haystack = getHaystackForEntry(e);
+    directHitMap.set(e.id, matchesWorldInfoKeys(haystack, e));
+    stickyActiveMap.set(e.id, !isManual && (state.loreSticky[e.id] ?? 0) > 0);
+  }
+
+  // 2-hop PPR power iteration: (Entity + Direct/Sticky Triggers) -> Entry -> Entity -> Entry
   const pprEntryScores = new Map<string, number>();
-  if (seedEntities.size > 0) {
-    const damping = 0.85;
-    // Hop 1: seed entities -> entries
-    const hop1Entry = new Map<string, number>();
-    for (const [ent, weight] of seedEntities.entries()) {
-      const neighbors = entityToEntries.get(ent);
-      if (!neighbors || neighbors.size === 0) continue;
-      const share = weight / neighbors.size;
-      for (const entryId of neighbors) {
-        hop1Entry.set(entryId, (hop1Entry.get(entryId) ?? 0) + share);
-      }
+  const damping = 0.85;
+  const hop1Entry = new Map<string, number>();
+
+  for (const [ent, weight] of seedEntities.entries()) {
+    const neighbors = entityToEntries.get(ent);
+    if (!neighbors || neighbors.size === 0) continue;
+    const share = weight / neighbors.size;
+    for (const entryId of neighbors) {
+      hop1Entry.set(entryId, (hop1Entry.get(entryId) ?? 0) + share);
     }
+  }
+  for (const e of eligible) {
+    if (directHitMap.get(e.id) || stickyActiveMap.get(e.id)) {
+      hop1Entry.set(e.id, (hop1Entry.get(e.id) ?? 0) + 1.0);
+    }
+  }
+
+  if (hop1Entry.size > 0) {
     for (const [id, s] of hop1Entry.entries()) {
       pprEntryScores.set(id, s);
     }
 
-    // Hop 2: hop1 entries (that allow spread) -> entities -> connected entries
     const hop2Entity = new Map<string, number>();
     for (const [entryId, weight] of hop1Entry.entries()) {
-      const entry = eligible.find((x) => x.id === entryId);
+      const entry = eligibleById.get(entryId);
       if (!entry || entry.noGraphSpread) continue;
       const ents = entryToEntities.get(entryId);
       if (!ents || ents.size === 0) continue;
@@ -258,18 +337,24 @@ export function recallLoreWithGraphPpr(options: {
   const activated: Array<{ entry: CompiledLoreEntry; score: number; directTrigger: boolean }> = [];
 
   for (const e of eligible) {
-    const isStickyActive = !isManual && (state.loreSticky[e.id] ?? 0) > 0;
-    const directHit = matchesWorldInfoKeys(queryText, e);
+    const haystack = getHaystackForEntry(e);
+    const isStickyActive = stickyActiveMap.get(e.id) ?? false;
+    const directHit = directHitMap.get(e.id) ?? false;
     const ppr = pprEntryScores.get(e.id) ?? 0;
     const bm25 = bm25Scores.get(e.id) ?? 0;
 
-    // Hard-enforce NOT_ANY / NOT_ALL secondary exclusion keys even for PPR & BM25 recall
-    if (!isStickyActive && !isManual && e.selective && e.secondaryKeys.length > 0) {
-      if (e.selectiveLogic === "NOT_ANY" && e.secondaryKeys.some((k) => matchKey(queryText, k, e))) {
+    // Hard-enforce @@exclude_keys and NOT_ANY / NOT_ALL even for PPR & BM25 recall
+    if (!isStickyActive && !isManual) {
+      if (e.excludeKeys.length > 0 && e.excludeKeys.some((k) => matchWorldInfoKey(haystack, k, e))) {
         continue;
       }
-      if (e.selectiveLogic === "NOT_ALL" && e.secondaryKeys.every((k) => matchKey(queryText, k, e))) {
-        continue;
+      if (e.selective && e.secondaryKeys.length > 0) {
+        if (e.selectiveLogic === "NOT_ANY" && e.secondaryKeys.some((k) => matchWorldInfoKey(haystack, k, e))) {
+          continue;
+        }
+        if (e.selectiveLogic === "NOT_ALL" && e.secondaryKeys.every((k) => matchWorldInfoKey(haystack, k, e))) {
+          continue;
+        }
       }
     }
 
@@ -287,7 +372,6 @@ export function recallLoreWithGraphPpr(options: {
 
     if (!triggered) continue;
 
-    // Probability check (skipped when already sticky or manual recall)
     if (!isStickyActive && !isManual && e.useProbability && e.probability < 100) {
       const roll = deterministicPercent(`${state.turn}:${e.id}`);
       if (roll >= e.probability) continue;
@@ -333,7 +417,6 @@ export function recallLoreWithGraphPpr(options: {
       afterGroup.push(members[0]!);
       continue;
     }
-    // Weighted deterministic pick
     const totalWeight = members.reduce((acc, m) => acc + Math.max(1, m.entry.groupWeight), 0);
     const pick = deterministicPercent(`${state.turn}:group:${groupName}`) % totalWeight;
     let cursor = 0;
@@ -366,13 +449,15 @@ export function recallLoreWithGraphPpr(options: {
     (a, b) => b.depthHint - a.depthHint || b.priority - a.priority || a.id.localeCompare(b.id),
   );
 
-  // 7. Compute next sticky / cooldown / oneShot runtime maps (persisted at turn_end)
+  // 7. Compute next sticky / cooldown / oneShot runtime maps (persisted at settled turn_end)
   const nextSticky: Record<string, number> = { ...state.loreSticky };
   const nextCooldown: Record<string, number> = { ...state.loreCooldown };
   const nextConsumed = new Set(state.loreConsumedOneShots);
+  const activatedIds: string[] = [];
 
   if (!isManual) {
     for (const e of selected) {
+      activatedIds.push(e.id);
       if (e.stickyPermanent) {
         nextSticky[e.id] = 999_999;
       } else if (e.stickyTurns > 0 && (nextSticky[e.id] ?? 0) === 0) {
@@ -386,6 +471,7 @@ export function recallLoreWithGraphPpr(options: {
 
   return {
     selected,
+    activatedIds,
     nextSticky,
     nextCooldown,
     nextConsumedOneShots: Array.from(nextConsumed),
@@ -394,11 +480,15 @@ export function recallLoreWithGraphPpr(options: {
   };
 }
 
-/** Advance sticky & cooldown counters by 1 turn at `turn_end`. */
+/**
+ * Advance sticky & cooldown counters by 1 turn at `turn_end`.
+ * Fixes the classic bug where `sticky === 0 && cooldown > 0` never entered cooldown!
+ */
 export function tickLoreRuntime(
   entries: CompiledLoreEntry[],
   sticky: Record<string, number>,
   cooldown: Record<string, number>,
+  activatedIds: string[] = [],
 ): { sticky: Record<string, number>; cooldown: Record<string, number> } {
   const byId = new Map(entries.map((e) => [e.id, e]));
   const nextSticky: Record<string, number> = {};
@@ -414,9 +504,17 @@ export function tickLoreRuntime(
     } else if (rem > 1) {
       nextSticky[id] = rem - 1;
     } else {
-      // Sticky just expired -> enter cooldown if configured
       const cd = byId.get(id)?.cooldownTurns ?? 0;
       if (cd > 0) nextCooldown[id] = cd;
+    }
+  }
+
+  // Non-sticky entries that activated this turn immediately enter cooldown if configured
+  for (const id of activatedIds) {
+    const entry = byId.get(id);
+    if (!entry) continue;
+    if (!entry.stickyPermanent && entry.stickyTurns <= 0 && entry.cooldownTurns > 0 && !nextSticky[id]) {
+      nextCooldown[id] = entry.cooldownTurns;
     }
   }
 

@@ -1,19 +1,16 @@
 /**
- * Dual-mode workspace & global library persistence for pi-rp-engine:
- *  - Mode A (Project World): `<cwd>/.pi/rp/` (cards/, presets/, lore/, personas.json, world.json)
- *  - Mode B (Global Library): `~/.pi/agent/rp-library/` (shared cards/, presets/, personas.json)
+ * Passive asset library storage for pi-rp-engine (ZERO auto-activation across sessions!):
+ *  - Project Asset Library: `<cwd>/.pi/rp/` (cards/, presets/, personas.json)
+ *  - Global Asset Library:  `~/.pi/agent/rp-library/` (shared cards/, presets/, personas.json)
+ *
+ * IMPORTANT: Storing a card in `.pi/rp/` NEVER auto-activates RP mode in other sessions.
+ * Only an explicit `bind` event inside a specific session's branch activates RP mode there.
  */
 
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type {
-  CompiledCard,
-  CompiledLoreBook,
-  CompiledPreset,
-  PersonaProfile,
-  ProjectWorldConfig,
-} from "../types.js";
+import type { CompiledCard, CompiledLoreBook, CompiledPreset, PersonaProfile } from "../types.js";
 import type { UnpackedAsset } from "../parser/unpack.js";
 import { sanitizeZipEntryPath } from "../parser/unpack.js";
 
@@ -42,19 +39,6 @@ function readJsonSafe<T>(filePath: string): T | null {
 function writeJson(filePath: string, data: unknown): void {
   ensureDir(path.dirname(filePath));
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
-}
-
-export function loadProjectWorldConfig(cwd: string): { worldDir: string; config: ProjectWorldConfig } | null {
-  const worldDir = getProjectRpDir(cwd);
-  const config = readJsonSafe<ProjectWorldConfig>(path.join(worldDir, "world.json"));
-  if (!config || !config.defaultCardSlug) return null;
-  return { worldDir, config };
-}
-
-export function saveProjectWorldConfig(cwd: string, config: ProjectWorldConfig): string {
-  const worldDir = getProjectRpDir(cwd);
-  writeJson(path.join(worldDir, "world.json"), config);
-  return worldDir;
 }
 
 export function saveCompiledCard(options: {
@@ -105,19 +89,105 @@ export function listCardSlugs(baseDir: string): string[] {
     .sort();
 }
 
+export interface CardSummaryEntry {
+  slug: string;
+  name: string;
+  specOrigin: string;
+  loreCount: number;
+  tags: string[];
+  source: "project" | "library";
+  baseDir: string;
+}
+
+/** List all available cards across project and global library with rich human-readable metadata. */
+export function listAllCardSummaries(cwd: string): CardSummaryEntry[] {
+  const results: CardSummaryEntry[] = [];
+  const seen = new Set<string>();
+  const dirs: Array<{ baseDir: string; source: "project" | "library" }> = [
+    { baseDir: getProjectRpDir(cwd), source: "project" },
+    { baseDir: getGlobalLibraryDir(), source: "library" },
+  ];
+
+  for (const { baseDir, source } of dirs) {
+    for (const slug of listCardSlugs(baseDir)) {
+      const key = `${source}:${slug}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const card = loadCompiledCard(baseDir, slug);
+      if (!card) continue;
+      results.push({
+        slug,
+        name: card.identity.name,
+        specOrigin: card.specOrigin,
+        loreCount: card.loreBook.entries.length,
+        tags: card.meta.tags.slice(0, 3),
+        source,
+        baseDir,
+      });
+    }
+  }
+  return results;
+}
+
+/** Auto-discover importable `.png`, `.charx`, `.json` files in `cwd` (depth <= 2) for 1-click import. */
+export function discoverImportableFiles(cwd: string, limit = 20): string[] {
+  const found: string[] = [];
+  const skipDirs = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage"]);
+  const validExts = new Set([".png", ".charx", ".json"]);
+
+  const scan = (dir: string, depth: number) => {
+    if (depth > 2 || found.length >= limit) return;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (found.length >= limit) break;
+      if (ent.name.startsWith(".") && ent.name !== ".pi") continue;
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        if (skipDirs.has(ent.name)) continue;
+        // Skip already-compiled internal card folders
+        if (full.includes(`${path.sep}.pi${path.sep}rp${path.sep}cards`)) continue;
+        scan(full, depth + 1);
+      } else if (ent.isFile()) {
+        const ext = path.extname(ent.name).toLowerCase();
+        if (!validExts.has(ext)) continue;
+        if (
+          ent.name === "package.json" ||
+          ent.name === "package-lock.json" ||
+          ent.name === "tsconfig.json" ||
+          ent.name === "personas.json" ||
+          ent.name === "card.compiled.json" ||
+          ent.name === "card.raw.json"
+        ) {
+          continue;
+        }
+        found.push(path.relative(cwd, full));
+      }
+    }
+  };
+
+  scan(cwd, 0);
+  return found.sort();
+}
+
 /** Resolve a card by slug from project `.pi/rp/` first, then global library. */
 export function resolveCardBySlug(
   cwd: string,
   slug: string,
+  preferredSource?: "project" | "library",
 ): { card: CompiledCard; baseDir: string; source: "project" | "library" } | null {
-  const projDir = getProjectRpDir(cwd);
-  const projCard = loadCompiledCard(projDir, slug);
-  if (projCard) return { card: projCard, baseDir: projDir, source: "project" };
+  const order: Array<"project" | "library"> =
+    preferredSource === "library" ? ["library", "project"] : ["project", "library"];
 
-  const libDir = getGlobalLibraryDir();
-  const libCard = loadCompiledCard(libDir, slug);
-  if (libCard) return { card: libCard, baseDir: libDir, source: "library" };
-
+  for (const source of order) {
+    const baseDir = source === "project" ? getProjectRpDir(cwd) : getGlobalLibraryDir();
+    const card = loadCompiledCard(baseDir, slug);
+    if (card) return { card, baseDir, source };
+  }
   return null;
 }
 
@@ -171,7 +241,7 @@ export function loadPersonas(cwd: string): PersonaProfile[] {
   return Array.from(byId.values());
 }
 
-export function savePersona(cwd: string, persona: PersonaProfile, scope: "project" | "library" = "project"): void {
+export function savePersona(cwd: string, persona: PersonaProfile, scope: "project" | "library" = "library"): void {
   const baseDir = scope === "project" ? getProjectRpDir(cwd) : getGlobalLibraryDir();
   const filePath = path.join(baseDir, "personas.json");
   const list = readJsonSafe<PersonaProfile[]>(filePath) ?? [];

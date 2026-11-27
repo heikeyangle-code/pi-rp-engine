@@ -1,89 +1,126 @@
 /**
- * 100% Official Pi ExtensionUIContext HUD renderer (`setStatus` + `setWidget`).
- * Renders identically on desktop Pi TUI and mobile `pi-android` with zero custom app hooks.
+ * Refined Minimal & Full HUD renderer using Pi official `ctx.ui.setStatus` and `ctx.ui.setWidget`.
+ *
+ * Design principles:
+ *  - Minimal mode: clean, calm single-line status (`◆ 角色 · 幕次 · 时间 · 地点 · T12`)
+ *  - Full mode: crisp framed telemetry strip above the editor with visual clock bars (`▓▓░░`),
+ *    bounded stats, active director notes, and subtle keybinding cues.
+ *  - Dormant / Exit: 100% clean teardown (`clearRpHud`) leaving zero UI artifacts.
  */
 
-import type { CompiledCard, PiExtensionContext, SessionRpState } from "../types.js";
-import { getActiveFacts } from "../memory/bitemporal.js";
+import type { CompiledCard, PacingMode, PiExtensionContext, SessionRpState } from "../types.js";
+import { renderProgressBar } from "./renderers.js";
 
-export const RP_STATUS_KEY = "rp";
-export const RP_WIDGET_KEY = "rp-hud";
+const PACING_LABEL: Record<PacingMode, string> = {
+  relaxed: "舒缓",
+  balanced: "均衡",
+  dramatic: "紧张",
+};
 
-export function clearRpHud(ctx?: PiExtensionContext): void {
-  if (!ctx?.ui) return;
-  ctx.ui.setStatus(RP_STATUS_KEY, undefined);
-  ctx.ui.setWidget(RP_WIDGET_KEY, undefined);
+export function formatRpStatusLine(state: SessionRpState, card: CompiledCard | null): string {
+  const charName = card ? card.identity.nickname || card.identity.name : state.cardSlug ?? "RP";
+  const parts = [`◆ ${charName}`, state.era, state.worldTimeLabel];
+  if (state.location) parts.push(state.location);
+  parts.push(`T${state.turn}`);
+  if (state.pacingMode !== "balanced") {
+    parts.push(`节奏:${PACING_LABEL[state.pacingMode]}`);
+  }
+  if (state.notes.length > 0) {
+    parts.push(`指令:${state.notes.length}`);
+  }
+  return parts.join(" · ");
 }
 
-export function renderRpHud(
-  ctx: PiExtensionContext | undefined,
+function formatBoundedStat(
   state: SessionRpState,
-  card: CompiledCard | null,
-): void {
+  actor: string,
+  key: string,
+  value: number | string | boolean,
+): string {
+  const bounds = state.statBounds[actor]?.[key];
+  if (typeof value === "number" && bounds && typeof bounds.max === "number" && bounds.max > 0) {
+    return `${key} ${renderProgressBar(value - (bounds.min ?? 0), bounds.max - (bounds.min ?? 0), 5)} ${value}/${bounds.max}`;
+  }
+  return `${key}:${String(value)}`;
+}
+
+export function renderRpHud(ctx: PiExtensionContext, state: SessionRpState, card: CompiledCard | null): void {
   if (!ctx?.ui) return;
-  if (!state.active || !card || state.hudMode === "off") {
+
+  if (!state.active || state.hudMode === "off") {
     clearRpHud(ctx);
     return;
   }
 
-  const charName = card.identity.nickname || card.identity.name;
-  const statusParts = [
-    `🎭 ${charName}`,
-    state.era,
-    state.worldTimeLabel,
-    state.location || null,
-    `T${state.turn}`,
-  ].filter(Boolean);
+  ctx.ui.setStatus("rp", formatRpStatusLine(state, card));
 
-  ctx.ui.setStatus(RP_STATUS_KEY, statusParts.join(" · "));
-
-  if (state.hudMode === "minimal") {
+  if (state.hudMode === "full") {
+    const charName = card ? card.identity.nickname || card.identity.name : state.cardSlug ?? "RP";
     const lines: string[] = [];
-    const clocks = Object.values(state.clocks).filter((c) => !c.completed);
-    if (clocks.length > 0) {
-      lines.push(`⏱ ${clocks.map((c) => `${c.label} ${c.value}/${c.max}`).join(" | ")}`);
-    }
-    const playerStats = state.stats.player ?? state.stats[charName];
-    if (playerStats && Object.keys(playerStats).length > 0) {
-      const pairs = Object.entries(playerStats)
-        .slice(0, 5)
-        .map(([k, v]) => `${k}:${v}`);
-      lines.push(`📊 ${pairs.join(" · ")}`);
-    }
-    if (state.notes.length > 0) {
-      lines.push(`📌 导演便签: ${state.notes.map((n) => n.text).join(" / ").slice(0, 60)}`);
-    }
-    ctx.ui.setWidget(RP_WIDGET_KEY, lines.length > 0 ? lines : undefined);
-    return;
-  }
 
-  // Full HUD mode
-  const lines: string[] = [
-    `🎭 ${charName} · 玩家: ${state.currentPersona.name} · 时代: ${state.era} (${state.worldTimeLabel}, T${state.turn})`,
-  ];
-  if (state.location) {
-    lines.push(`📍 ${state.location}${state.presentNpcs.length ? ` · 在场: ${state.presentNpcs.join(", ")}` : ""}`);
-  }
-  for (const [actor, stats] of Object.entries(state.stats)) {
-    const entries = Object.entries(stats);
-    if (entries.length > 0) {
-      lines.push(`📊 ${actor}: ${entries.map(([k, v]) => `${k}=${v}`).join(" · ")}`);
+    const headerParts = [
+      `╭─ ◆ ${charName}`,
+      `${state.era} · ${state.worldTimeLabel} · T${state.turn}`,
+      state.location ? `地点:${state.location}` : null,
+      state.presentNpcs.length > 0 ? `在场:${state.presentNpcs.join("、")}` : null,
+    ].filter(Boolean);
+    lines.push(headerParts.join("  │  "));
+
+    const metaParts = [
+      `扮演:${state.currentPersona.name}`,
+      `节奏:${PACING_LABEL[state.pacingMode]}`,
+      `结算:${state.settlementMode}`,
+      state.activeCharacters.length > 1 ? `共演:${state.activeCharacters.length}卡` : null,
+      state.rawPassthrough ? "原味直通" : null,
+    ].filter(Boolean);
+    lines.push(`│ ${metaParts.join("  ·  ")}`);
+
+    const statSnippets: string[] = [];
+    for (const [actor, stats] of Object.entries(state.stats)) {
+      const pairs = Object.entries(stats)
+        .slice(0, 4)
+        .map(([k, v]) => formatBoundedStat(state, actor, k, v));
+      if (pairs.length > 0) {
+        statSnippets.push(`${actor}〔${pairs.join(" · ")}〕`);
+      }
     }
-  }
-  for (const [actor, inv] of Object.entries(state.inventory)) {
-    const items = Object.entries(inv);
-    if (items.length > 0) {
-      lines.push(`🎒 ${actor}: ${items.map(([k, v]) => `${k}×${v}`).join(", ")}`);
+    if (statSnippets.length > 0) {
+      lines.push(`│ 数值  ${statSnippets.slice(0, 2).join("   ")}`);
     }
+
+    const activeClocks = Object.values(state.clocks).filter((c) => !c.completed);
+    if (activeClocks.length > 0) {
+      lines.push(
+        `│ 时钟  ${activeClocks
+          .slice(0, 3)
+          .map((c) => `${c.label} ${renderProgressBar(c.value, c.max, 6)} ${c.value}/${c.max}`)
+          .join("   ")}`,
+      );
+    }
+
+    if (state.notes.length > 0) {
+      lines.push(
+        `│ 导演  ${state.notes
+          .slice(0, 2)
+          .map((n) => `${n.text.slice(0, 30)}${n.remainingTurns !== null ? ` (${n.remainingTurns}轮)` : ""}`)
+          .join("  /  ")}`,
+      );
+    }
+
+    lines.push("╰─ Alt+R 菜单 · Ctrl+Shift+R 面板 · Alt+K 续写 · Alt+G 掷骰 · Alt+N 导演 · Alt+Shift+X 退出");
+
+    ctx.ui.setWidget("rp-hud", lines, { placement: "aboveEditor" });
+  } else {
+    ctx.ui.setWidget("rp-hud", undefined);
   }
-  const clocks = Object.values(state.clocks);
-  if (clocks.length > 0) {
-    lines.push(`⏱ 时钟: ${clocks.map((c) => `${c.label} ${c.value}/${c.max}`).join(" | ")}`);
+}
+
+export function clearRpHud(ctx: PiExtensionContext): void {
+  if (!ctx?.ui) return;
+  try {
+    ctx.ui.setStatus("rp", undefined);
+    ctx.ui.setWidget("rp-hud", undefined);
+  } catch {
+    // Ignore in headless/test environments
   }
-  const openHooks = Array.from(state.foresights.values()).filter((h) => h.status === "open");
-  lines.push(`🧠 有效事实 ${getActiveFacts(state).length} · 未收伏笔 ${openHooks.length} · 结算: ${state.settlementMode}`);
-  if (state.notes.length > 0) {
-    lines.push(`📌 便签: ${state.notes.map((n) => n.text).join(" / ")}`);
-  }
-  ctx.ui.setWidget(RP_WIDGET_KEY, lines);
 }

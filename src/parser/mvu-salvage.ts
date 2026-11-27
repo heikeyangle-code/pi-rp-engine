@@ -1,7 +1,7 @@
 /**
  * MvuSchemaSalvager: extracts initial RPG/SLG variable schemas (HP, affection, money,
- * location, clothing, schedule, etc.) from MVU / tavern_helper / <UpdateVariable> /
- * {{setvar}} blocks so they can be promoted cleanly into the L1 deterministic FSM.
+ * location, clothing, schedule, etc.) from RAW MVU / tavern_helper / <UpdateVariable> /
+ * _.set(...) / YAML InitVar / {{setvar}} blocks BEFORE frontend stripping.
  */
 
 import type { SalvagedVariable } from "../types.js";
@@ -18,6 +18,7 @@ function flattenObject(
     if (k.startsWith("$") || k.startsWith("_")) continue;
     const fullKey = prefix ? `${prefix}.${k}` : k;
     if (typeof v === "number" || typeof v === "string" || typeof v === "boolean") {
+      if (typeof v === "string" && v.length > 160) continue;
       out.push({ key: fullKey, value: v });
     } else if (v && typeof v === "object" && !Array.isArray(v)) {
       flattenObject(v as Record<string, unknown>, fullKey, out, depth + 1);
@@ -27,43 +28,59 @@ function flattenObject(
 }
 
 function parseLooseScalar(raw: string): number | string | boolean {
-  const trimmed = raw.trim().replace(/^["']|["']$/g, "");
+  const trimmed = raw.trim().replace(/,$/, "").replace(/^["']|["']$/g, "");
   if (trimmed === "true") return true;
   if (trimmed === "false") return false;
   if (/^-?\d+(?:\.\d+)?$/.test(trimmed)) return Number(trimmed);
   return trimmed;
 }
 
-/** Salvage variables from raw card fields, extensions, and constant lore entries. */
+/** Salvage variables from RAW card fields, extensions, and RAW constant lore entries. */
 export function salvageMvuVariables(sources: {
   firstMes?: string;
   description?: string;
   systemPrompt?: string;
   postHistory?: string;
   extensions?: Record<string, unknown>;
-  constantLoreContents?: string[];
+  rawConstantLoreContents?: string[];
 }): SalvagedVariable[] {
   const byKey = new Map<string, SalvagedVariable>();
 
   const register = (v: SalvagedVariable) => {
-    if (!v.key || v.key.length > 80) return;
-    if (!byKey.has(v.key)) {
-      byKey.set(v.key, v);
+    const cleanKey = v.key.trim();
+    if (!cleanKey || cleanKey.length > 80) return;
+    if (!byKey.has(cleanKey)) {
+      byKey.set(cleanKey, { ...v, key: cleanKey });
     }
   };
 
-  // 1. Scan _.set('path', value) calls across text blobs
   const scanText = (text: string | undefined, source: SalvagedVariable["source"]) => {
     if (!text) return;
-    const lodashSetRe = /_\.set\(\s*[^,]+,\s*["']([^"']+)["']\s*,\s*([^)]+)\)/g;
+
+    // 1. _.set(stat_data, 'path', value) or _.set('path', value[, min, max])
+    const lodash3Re = /_\.set\(\s*[^,"']+\s*,\s*["']([^"']+)["']\s*,\s*([^,)]+)/g;
     let m: RegExpExecArray | null;
-    while ((m = lodashSetRe.exec(text)) !== null) {
+    while ((m = lodash3Re.exec(text)) !== null) {
       const key = m[1]!.trim();
       const val = parseLooseScalar(m[2]!);
       register({ key, initialValue: val, source });
     }
+    const lodash2Re = /_\.set\(\s*["']([^"']+)["']\s*,\s*([^,)]+)(?:\s*,\s*([^,)]+))?(?:\s*,\s*([^,)]+))?\s*\)/g;
+    while ((m = lodash2Re.exec(text)) !== null) {
+      const key = m[1]!.trim();
+      const val = parseLooseScalar(m[2]!);
+      const minRaw = m[3] ? parseLooseScalar(m[3]) : undefined;
+      const maxRaw = m[4] ? parseLooseScalar(m[4]) : undefined;
+      register({
+        key,
+        initialValue: val,
+        min: typeof minRaw === "number" ? minRaw : undefined,
+        max: typeof maxRaw === "number" ? maxRaw : undefined,
+        source,
+      });
+    }
 
-    // 2. Scan JSON blocks inside <UpdateVariable> or fenced ```json
+    // 2. JSON blocks inside <UpdateVariable> or fenced ```json
     const jsonBlockRe = /(?:<UpdateVariable[^>]*>|```json)\s*([\s\S]*?)(?:<\/UpdateVariable>|```)/gi;
     while ((m = jsonBlockRe.exec(text)) !== null) {
       const candidate = m[1]!.trim();
@@ -78,7 +95,21 @@ export function salvageMvuVariables(sources: {
       }
     }
 
-    // 3. Scan {{setvar::k::v}} macros
+    // 3. YAML-like InitVar blocks inside ```yaml / [InitVar] constant lore entries
+    const yamlBlockRe = /```(?:ya?ml)\s*\n([\s\S]*?)```/gi;
+    while ((m = yamlBlockRe.exec(text)) !== null) {
+      const body = m[1]!;
+      for (const line of body.split("\n")) {
+        const kv = /^\s*([a-zA-Z0-9_\u4e00-\u9fa5.-]{1,40})\s*:\s*([^\n#]+)$/.exec(line);
+        if (!kv) continue;
+        const val = parseLooseScalar(kv[2]!);
+        if (typeof val === "number" || typeof val === "boolean" || (typeof val === "string" && val.length <= 48)) {
+          register({ key: kv[1]!, initialValue: val, source });
+        }
+      }
+    }
+
+    // 4. {{setvar::k::v}} / {{getvar::k}} / {{addvar::k::n}} macros
     for (const mv of extractMacroVariables(text)) {
       register({ key: mv.key, initialValue: mv.initialValue, source: "macro" });
     }
@@ -88,11 +119,11 @@ export function salvageMvuVariables(sources: {
   scanText(sources.description, "mvu");
   scanText(sources.systemPrompt, "mvu");
   scanText(sources.postHistory, "mvu");
-  for (const lore of sources.constantLoreContents ?? []) {
+  for (const lore of sources.rawConstantLoreContents ?? []) {
     scanText(lore, "constant_lore");
   }
 
-  // 4. Scan known MVU / tavern_helper extension payloads
+  // 5. Known MVU / tavern_helper extension payloads
   const ext = sources.extensions;
   if (ext && typeof ext === "object") {
     for (const extKey of ["mvu", "MVU", "tavern_helper", "TavernHelper_scripts", "era"]) {
@@ -101,7 +132,6 @@ export function salvageMvuVariables(sources: {
         scanText(val, "mvu");
       } else if (val && typeof val === "object" && !Array.isArray(val)) {
         for (const item of flattenObject(val as Record<string, unknown>)) {
-          if (typeof item.value === "string" && item.value.length > 160) continue;
           register({ key: item.key, initialValue: item.value, source: "mvu" });
         }
       }

@@ -1,233 +1,303 @@
 /**
- * Dual-track `/rp` command:
- *  - Mobile-first: `/rp` (no args) opens a clean `ctx.ui.select()` menu covering all high-frequency workflows.
- *  - Power-user: `/rp <subcommand> [args]` with `getArgumentCompletions`.
+ * Humanized `/rp` command palette, categorized quick launcher, and smart autocompletions.
+ * Keeps every core capability 1-2 clicks away in both dormant and active RP sessions.
  */
 
-import type { HudMode, PiCommandDefinition, PiExtensionContext, SettlementMode } from "../types.js";
-import { RP_ENTRY_TYPE, applyRpTx } from "../engine/state-replay.js";
+import type { PiExtensionAPI, PiExtensionContext } from "../types.js";
+import { listAllCardSummaries, listPresetIds } from "../storage/workspace-store.js";
 import {
-  type RpActionRuntime,
+  type RpRuntimeHandle,
   actionBookmarkGoto,
   actionBookmarkSave,
   actionContinue,
   actionDirectorNote,
+  actionExitRp,
+  actionGreeting,
+  actionIdeas,
   actionImportFile,
   actionLoadCard,
   actionManageCast,
-  actionManagePersona,
   actionManualRoll,
   actionOoc,
-  actionSelectPreset,
-  actionShowInfo,
-  actionSuggestPlayerMoves,
-  actionSwitchGreeting,
-  actionTimeSkip,
+  actionPersona,
+  actionPreset,
+  actionSelectPacing,
+  actionSetHud,
+  actionSetSettlementMode,
+  actionShowShortcuts,
+  actionSkipMontage,
   actionToggleHide,
+  actionToggleRawPassthrough,
 } from "./actions.js";
+import { openRpDashboard, type DashboardRuntime } from "./dashboard.js";
 
 const SUBCOMMANDS: Array<{ value: string; description: string }> = [
-  { value: "import", description: "导入角色卡(.png/.charx/.json)、世界书或 ST 预设" },
-  { value: "load", description: "加载已导入的角色卡" },
-  { value: "c", description: "无缝续写下一段剧情" },
-  { value: "act", description: "生成 3 个玩家行动灵感并回填输入框" },
-  { value: "note", description: "添加/清空导演便签 (--ttl N)" },
-  { value: "ooc", description: "发送场外沟通（不污染记忆与账本）" },
-  { value: "persona", description: "切换或编辑玩家马甲" },
-  { value: "greet", description: "切换开场白 (alternate_greetings)" },
-  { value: "preset", description: "切换或关闭 SillyTavern 预设" },
-  { value: "save", description: "在当前节点保存剧情书签" },
-  { value: "goto", description: "回档至已保存的剧情书签" },
-  { value: "hide", description: "非破坏性屏蔽旧楼层" },
-  { value: "unhide", description: "恢复已屏蔽楼层" },
-  { value: "roll", description: "手动掷骰 (如 1d20+3)" },
+  { value: "import", description: "打开文件浏览器导入角色卡 / 世界书 / 预设（支持批量）" },
+  { value: "load", description: "从角色库加载角色卡（仅绑定当前会话）" },
+  { value: "panel", description: "打开实时世界面板与状态/世界书编辑器" },
+  { value: "continue", description: "让角色无缝续写剧情 (Alt+K)" },
+  { value: "act", description: "生成 3 个符合当下情境的行动建议 (Alt+A)" },
+  { value: "roll", description: "打开快捷掷骰检定器，支持优势/劣势/DC (Alt+G)" },
+  { value: "note", description: "管理导演指令 (Alt+N)" },
+  { value: "ooc", description: "发起场外 OOC 讨论，不推进剧情 (Alt+O)" },
+  { value: "pace", description: "切换叙事节奏 (relaxed / balanced / dramatic)" },
+  { value: "save", description: "保存剧情书签 (Alt+B)" },
+  { value: "goto", description: "跳转或分叉至已保存的剧情书签" },
+  { value: "hide", description: "交互式隐藏对话楼层（不发给模型，不删记录）" },
+  { value: "unhide", description: "恢复已隐藏的对话楼层" },
+  { value: "persona", description: "切换或新建玩家人设（不破坏缓存）" },
+  { value: "greet", description: "切换/重发角色开场白" },
+  { value: "cast", description: "交互式管理多角色同场共演" },
   { value: "skip", description: "时间推进 / 幕间蒙太奇" },
-  { value: "cast", description: "管理多角色同场卡组 (add/remove/list)" },
-  { value: "hud", description: "切换 HUD 密度 (minimal|full|off)" },
-  { value: "mode", description: "切换结算档位 (off|tool-assisted|sidecar-light)" },
-  { value: "raw", description: "无损直通开关 (on|off)" },
-  { value: "info", description: "查看当前世界与导入审计信息" },
-  { value: "off", description: "退出 RP 模式并恢复原编程工具集" },
+  { value: "preset", description: "加载或关闭酒馆预设" },
+  { value: "hud", description: "切换 HUD 显示模式 (minimal / full / off)" },
+  { value: "mode", description: "切换后台结算模式 (tool-assisted / sidecar-light / off)" },
+  { value: "raw", description: "切换原味直通模式（跳过酒馆前端壳剥离）" },
+  { value: "keys", description: "查看全部 RP 快捷键速查表" },
+  { value: "exit", description: "彻底退出当前会话 RP 模式，恢复编程助手 (Alt+Shift+X)" },
 ];
 
-export function createRpCommand(rt: RpActionRuntime): PiCommandDefinition {
+export function makeDashboardRuntime(rt: RpRuntimeHandle): DashboardRuntime {
   return {
-    description: "RP 角色扮演与世界引擎总入口（无参数弹快捷菜单）",
+    getState: () => rt.getState(),
+    getCard: () => rt.getCard(),
+    getExtraCastCards: () => rt.getExtraCastCards(),
+    commitTx: (tx) => rt.commitTx(tx),
+    refreshHud: (ctx) => rt.refreshHud(ctx),
+    exitRp: (ctx, askConfirm) => actionExitRp(rt, ctx, askConfirm),
+  };
+}
+
+/** Open the context-aware `/rp` main menu (Dormant Launcher vs Active RP Control Center). */
+export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
+  const state = rt.getState();
+
+  if (!state.active) {
+    const cards = listAllCardSummaries(ctx.cwd);
+    const pick = await ctx.ui.select("🎭 RP 引擎启动器（仅在当前会话生效，绝不影响其他会话）", [
+      `🎭 加载已有角色卡（角色库共 ${cards.length} 张）`,
+      "📥 浏览并导入角色卡 / 世界书 / 预设（自动识别 Downloads 与当前目录）",
+      "⌨️ 查看快捷键速查表",
+      "✕ 关闭",
+    ]);
+    if (!pick || pick.startsWith("✕")) return;
+    if (pick.startsWith("🎭")) await actionLoadCard(rt, ctx, "");
+    else if (pick.startsWith("📥")) await actionImportFile(rt, ctx, "");
+    else if (pick.startsWith("⌨️")) await actionShowShortcuts(ctx);
+    return;
+  }
+
+  const card = rt.getCard();
+  const title = `🎭 ${card?.identity.name ?? state.cardSlug ?? "RP"} · ${state.era} · T${state.turn}（Alt+R）`;
+  const pick = await ctx.ui.select(title, [
+    "📊 打开世界面板 & 实时状态/世界书编辑器 (Ctrl+Shift+R)",
+    "▶ 续写剧情 (Alt+K)    /    💡 行动建议 (Alt+A)",
+    "🎲 快捷掷骰检定 (Alt+G)",
+    "🎬 导演指令与叙事节奏 (Alt+N)",
+    "💬 OOC 场外讨论 (Alt+O)",
+    "🔖 剧情书签：保存 / 跳转 / 分叉 (Alt+B)",
+    "⏳ 幕间蒙太奇 / 推进时间 (/rp skip)",
+    "🙈 隐藏或恢复对话楼层 (/rp hide)",
+    "🧑 切换玩家人设 / 👥 同场共演 / 🎭 切换角色或开场白",
+    "📥 导入新的角色卡 / 世界书 / 预设",
+    "⚙ 引擎设置（HUD / 预设 / 结算模式 / 原味直通 / 快捷键）",
+    "🚪 彻底退出本会话 RP 模式 (Alt+Shift+X)",
+    "✕ 关闭",
+  ]);
+  if (!pick || pick.startsWith("✕")) return;
+
+  if (pick.startsWith("📊")) {
+    await openRpDashboard(makeDashboardRuntime(rt), ctx);
+  } else if (pick.startsWith("▶")) {
+    const sub = await ctx.ui.select("剧情推进", ["▶ 无缝续写 (Alt+K)", "💡 生成 3 个行动建议 (Alt+A)", "← 返回"]);
+    if (sub?.startsWith("▶")) await actionContinue(rt, ctx);
+    else if (sub?.startsWith("💡")) await actionIdeas(rt, ctx);
+  } else if (pick.startsWith("🎲")) {
+    await actionManualRoll(rt, ctx, "");
+  } else if (pick.startsWith("🎬")) {
+    const sub = await ctx.ui.select("导演台", ["📝 管理导演指令", "🎚 切换叙事节奏 (relaxed/balanced/dramatic)", "← 返回"]);
+    if (sub?.startsWith("📝")) await actionDirectorNote(rt, ctx, "");
+    else if (sub?.startsWith("🎚")) await actionSelectPacing(rt, ctx, "");
+  } else if (pick.startsWith("💬")) {
+    await actionOoc(rt, ctx, "");
+  } else if (pick.startsWith("🔖")) {
+    const sub = await ctx.ui.select("剧情书签与时间线", ["🔖 保存当前节点为书签 (Alt+B)", "⏪ 跳转 / 分叉至已有书签 (/rp goto)", "← 返回"]);
+    if (sub?.startsWith("🔖")) await actionBookmarkSave(rt, ctx, "");
+    else if (sub?.startsWith("⏪")) await actionBookmarkGoto(rt, ctx, "");
+  } else if (pick.startsWith("⏳")) {
+    await actionSkipMontage(rt, ctx, "");
+  } else if (pick.startsWith("🙈")) {
+    await actionToggleHide(rt, ctx, "", true);
+  } else if (pick.startsWith("🧑")) {
+    const sub = await ctx.ui.select("角色与人设", [
+      "🧑 切换/新建玩家人设 (Persona)",
+      "👥 管理同场共演角色卡 (Cast)",
+      "💬 重发/切换开场白 (Greeting)",
+      "🎭 切换其他主角色卡 (Load)",
+      "← 返回",
+    ]);
+    if (sub?.startsWith("🧑")) await actionPersona(rt, ctx, "");
+    else if (sub?.startsWith("👥")) await actionManageCast(rt, ctx, "");
+    else if (sub?.startsWith("💬")) await actionGreeting(rt, ctx);
+    else if (sub?.startsWith("🎭")) await actionLoadCard(rt, ctx, "");
+  } else if (pick.startsWith("📥")) {
+    await actionImportFile(rt, ctx, "");
+  } else if (pick.startsWith("⚙")) {
+    const sub = await ctx.ui.select("引擎设置", [
+      `🖥 切换 HUD 模式（当前：${state.hudMode} · Alt+H）`,
+      `🎛 切换酒馆预设（当前：${state.presetId ?? "无"}）`,
+      `⚙️ 切换结算模式（当前：${state.settlementMode}）`,
+      `🛡 原味直通模式（当前：${state.rawPassthrough ? "开" : "关"}）`,
+      "⌨️ 查看全部快捷键",
+      "← 返回",
+    ]);
+    if (sub?.startsWith("🖥")) await actionSetHud(rt, ctx, "");
+    else if (sub?.startsWith("🎛")) await actionPreset(rt, ctx, "");
+    else if (sub?.startsWith("⚙️")) await actionSetSettlementMode(rt, ctx, "");
+    else if (sub?.startsWith("🛡")) await actionToggleRawPassthrough(rt, ctx, "");
+    else if (sub?.startsWith("⌨️")) await actionShowShortcuts(ctx);
+  } else if (pick.startsWith("🚪")) {
+    await actionExitRp(rt, ctx, true);
+  }
+}
+
+export function registerRpCommands(pi: PiExtensionAPI, rt: RpRuntimeHandle): void {
+  pi.registerCommand("rp", {
+    description: "角色扮演引擎控制台（仅当前会话生效，输入 /rp 或按 Alt+R 打开菜单）",
     getArgumentCompletions(prefix: string) {
-      const p = prefix.trim().toLowerCase();
-      if (p.includes(" ")) return null;
-      return SUBCOMMANDS.filter((s) => s.value.startsWith(p)).map((s) => ({
-        value: s.value,
-        label: s.value,
-        description: s.description,
-      }));
+      const lower = prefix.trimStart().toLowerCase();
+      if (!lower.includes(" ")) {
+        return SUBCOMMANDS.filter((c) => c.value.startsWith(lower)).map((c) => ({
+          value: c.value,
+          label: c.value,
+          description: c.description,
+        }));
+      }
+      const [sub, ...restParts] = lower.split(/\s+/);
+      const rest = restParts.join(" ");
+      if (sub === "load") {
+        const cards = listAllCardSummaries(process.cwd());
+        return cards
+          .filter((c) => c.slug.toLowerCase().includes(rest) || c.name.toLowerCase().includes(rest))
+          .map((c) => ({ value: `load ${c.slug}`, label: c.name, description: `${c.source} · ${c.specOrigin}` }));
+      }
+      if (sub === "preset") {
+        const ids = ["off", ...listPresetIds(process.cwd())];
+        return ids.filter((id) => id.toLowerCase().includes(rest)).map((id) => ({ value: `preset ${id}`, label: id }));
+      }
+      if (sub === "hud") {
+        return ["minimal", "full", "off"]
+          .filter((m) => m.startsWith(rest))
+          .map((m) => ({ value: `hud ${m}`, label: m }));
+      }
+      if (sub === "pace") {
+        return ["relaxed", "balanced", "dramatic"]
+          .filter((m) => m.startsWith(rest))
+          .map((m) => ({ value: `pace ${m}`, label: m }));
+      }
+      if (sub === "mode") {
+        return ["tool-assisted", "sidecar-light", "off"]
+          .filter((m) => m.startsWith(rest))
+          .map((m) => ({ value: `mode ${m}`, label: m }));
+      }
+      return null;
     },
-    async handler(rawArgs: string, ctx: PiExtensionContext) {
-      const trimmed = rawArgs.trim();
+    async handler(args: string, ctx: PiExtensionContext) {
+      const trimmed = args.trim();
       if (!trimmed) {
-        await openQuickMenu(rt, ctx);
+        await openRpMenu(rt, ctx);
         return;
       }
 
-      const spaceIdx = trimmed.search(/\s+/);
-      const sub = (spaceIdx >= 0 ? trimmed.slice(0, spaceIdx) : trimmed).toLowerCase();
-      const rest = spaceIdx >= 0 ? trimmed.slice(spaceIdx).trim() : "";
+      const spIdx = trimmed.indexOf(" ");
+      const sub = (spIdx === -1 ? trimmed : trimmed.slice(0, spIdx)).toLowerCase();
+      const rest = spIdx === -1 ? "" : trimmed.slice(spIdx + 1).trim();
 
       switch (sub) {
         case "import":
           await actionImportFile(rt, ctx, rest);
-          break;
+          return;
         case "load":
           await actionLoadCard(rt, ctx, rest);
-          break;
+          return;
+        case "panel":
+        case "info":
+        case "stats":
+        case "report":
+          await openRpDashboard(makeDashboardRuntime(rt), ctx);
+          return;
         case "c":
         case "continue":
-          actionContinue(rt, ctx);
-          break;
+          await actionContinue(rt, ctx);
+          return;
         case "act":
-          await actionSuggestPlayerMoves(rt, ctx, rest);
-          break;
+        case "ideas":
+          await actionIdeas(rt, ctx);
+          return;
         case "note":
           await actionDirectorNote(rt, ctx, rest);
-          break;
+          return;
         case "ooc":
           await actionOoc(rt, ctx, rest);
-          break;
+          return;
         case "persona":
-          await actionManagePersona(rt, ctx);
-          break;
+          await actionPersona(rt, ctx, rest);
+          return;
         case "greet":
-          await actionSwitchGreeting(rt, ctx);
-          break;
+          await actionGreeting(rt, ctx);
+          return;
         case "preset":
-          await actionSelectPreset(rt, ctx, rest || undefined);
-          break;
+          await actionPreset(rt, ctx, rest);
+          return;
         case "save":
           await actionBookmarkSave(rt, ctx, rest);
-          break;
+          return;
         case "goto":
-          await actionBookmarkGoto(rt, ctx);
-          break;
+          await actionBookmarkGoto(rt, ctx, rest);
+          return;
         case "hide":
-          await actionToggleHide(rt, ctx, true);
-          break;
+          await actionToggleHide(rt, ctx, rest, true);
+          return;
         case "unhide":
-          await actionToggleHide(rt, ctx, false);
-          break;
+          await actionToggleHide(rt, ctx, rest, false);
+          return;
         case "roll":
-          actionManualRoll(rt, ctx, rest);
-          break;
+          await actionManualRoll(rt, ctx, rest);
+          return;
         case "skip":
         case "montage":
-          await actionTimeSkip(rt, ctx, rest);
-          break;
+          await actionSkipMontage(rt, ctx, rest);
+          return;
         case "cast":
           await actionManageCast(rt, ctx, rest);
-          break;
-        case "hud": {
-          const mode = (rest || (await ctx.ui.select("HUD 显示模式", ["minimal", "full", "off"]))) as HudMode | undefined;
-          if (mode === "minimal" || mode === "full" || mode === "off") {
-            const tx = { kind: "config_patch" as const, hudMode: mode };
-            rt.pi.appendEntry(RP_ENTRY_TYPE, tx);
-            applyRpTx(rt.getState(), tx);
-            rt.refreshHud(ctx);
-            ctx.ui.notify(`HUD 模式已切换为 ${mode}`, "info");
-          }
-          break;
-        }
-        case "mode": {
-          const mode = (rest ||
-            (await ctx.ui.select("回合结算模式", ["tool-assisted", "off", "sidecar-light"]))) as
-            | SettlementMode
-            | undefined;
-          if (mode === "off" || mode === "tool-assisted" || mode === "sidecar-light") {
-            const tx = { kind: "config_patch" as const, settlementMode: mode };
-            rt.pi.appendEntry(RP_ENTRY_TYPE, tx);
-            applyRpTx(rt.getState(), tx);
-            rt.refreshHud(ctx);
-            ctx.ui.notify(`结算模式已切换为 ${mode}`, "info");
-          }
-          break;
-        }
-        case "raw": {
-          const next = rest === "on" ? true : rest === "off" ? false : !rt.getState().rawPassthrough;
-          const tx = { kind: "config_patch" as const, rawPassthrough: next };
-          rt.pi.appendEntry(RP_ENTRY_TYPE, tx);
-          applyRpTx(rt.getState(), tx);
-          ctx.ui.notify(`无损直通模式已${next ? "开启" : "关闭"}`, "info");
-          break;
-        }
-        case "info":
-        case "panel":
-          actionShowInfo(rt, ctx);
-          break;
-        case "off": {
-          const tx = { kind: "unbind" as const };
-          rt.pi.appendEntry(RP_ENTRY_TYPE, tx);
-          applyRpTx(rt.getState(), tx);
-          rt.restoreOriginalTools();
-          rt.refreshHud(ctx);
-          ctx.ui.notify("已退出 RP 模式，原编程工具集已恢复。", "info");
-          break;
-        }
+          return;
+        case "pace":
+        case "pacing":
+          await actionSelectPacing(rt, ctx, rest);
+          return;
+        case "hud":
+          await actionSetHud(rt, ctx, rest);
+          return;
+        case "mode":
+          await actionSetSettlementMode(rt, ctx, rest);
+          return;
+        case "raw":
+          await actionToggleRawPassthrough(rt, ctx, rest);
+          return;
+        case "keys":
+        case "hotkeys":
+        case "shortcuts":
+          await actionShowShortcuts(ctx);
+          return;
+        case "exit":
+        case "off":
+        case "quit":
+        case "leave":
+          await actionExitRp(rt, ctx, false);
+          return;
         default:
-          ctx.ui.notify(`未知子命令 "/rp ${sub}"，输入 /rp 打开交互菜单。`, "warning");
+          ctx.ui.notify(`未知子命令：${sub}。输入 /rp 或按 Alt+R 打开交互菜单。`, "warning");
       }
     },
-  };
-}
-
-async function openQuickMenu(rt: RpActionRuntime, ctx: PiExtensionContext): Promise<void> {
-  const active = rt.getState().active;
-  const menu = active
-    ? [
-        "▶ 无缝续写 (/rp c)",
-        "💡 帮我想 3 个行动灵感 (/rp act)",
-        "📌 导演便签 / 临时引导 (/rp note)",
-        "💬 场外 OOC 沟通 (/rp ooc)",
-        "👤 切换玩家马甲 (/rp persona)",
-        "🎛 切换 SillyTavern 预设 (/rp preset)",
-        "📖 切换开场白 (/rp greet)",
-        "🔖 保存书签 (/rp save)",
-        "⏪ 书签回档 (/rp goto)",
-        "🎲 手动掷骰 (/rp roll)",
-        "⏳ 时间推进 / 幕间蒙太奇 (/rp skip)",
-        "🙈 屏蔽旧楼层 (/rp hide)",
-        "📥 导入角色卡 / 世界书 / 预设 (/rp import)",
-        "🔄 更换角色卡 (/rp load)",
-        "📊 查看世界状态总览 (/rp info)",
-        "🛑 退出 RP 模式 (/rp off)",
-      ]
-    : [
-        "📥 导入角色卡 / 世界书 / 预设 (/rp import)",
-        "📂 加载已有角色卡 (/rp load)",
-        "📊 查看状态 (/rp info)",
-      ];
-
-  const choice = await ctx.ui.select(active ? "🎭 RP 引擎快捷菜单" : "🎭 RP 引擎（当前静默休眠）", menu);
-  if (!choice) return;
-
-  if (choice.includes("/rp c")) actionContinue(rt, ctx);
-  else if (choice.includes("/rp act")) await actionSuggestPlayerMoves(rt, ctx, "");
-  else if (choice.includes("/rp note")) await actionDirectorNote(rt, ctx, "");
-  else if (choice.includes("/rp ooc")) await actionOoc(rt, ctx, "");
-  else if (choice.includes("/rp persona")) await actionManagePersona(rt, ctx);
-  else if (choice.includes("/rp preset")) await actionSelectPreset(rt, ctx);
-  else if (choice.includes("/rp greet")) await actionSwitchGreeting(rt, ctx);
-  else if (choice.includes("/rp save")) await actionBookmarkSave(rt, ctx, "");
-  else if (choice.includes("/rp goto")) await actionBookmarkGoto(rt, ctx);
-  else if (choice.includes("/rp roll")) actionManualRoll(rt, ctx, "1d20");
-  else if (choice.includes("/rp skip")) await actionTimeSkip(rt, ctx, "");
-  else if (choice.includes("/rp hide")) await actionToggleHide(rt, ctx, true);
-  else if (choice.includes("/rp import")) await actionImportFile(rt, ctx, "");
-  else if (choice.includes("/rp load")) await actionLoadCard(rt, ctx);
-  else if (choice.includes("/rp info")) actionShowInfo(rt, ctx);
-  else if (choice.includes("/rp off")) {
-    const tx = { kind: "unbind" as const };
-    rt.pi.appendEntry(RP_ENTRY_TYPE, tx);
-    applyRpTx(rt.getState(), tx);
-    rt.restoreOriginalTools();
-    rt.refreshHud(ctx);
-    ctx.ui.notify("已退出 RP 模式，原编程工具集已恢复。", "info");
-  }
+  });
 }

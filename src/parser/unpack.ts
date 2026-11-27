@@ -1,7 +1,7 @@
 /**
  * Zero-dependency container unpacker for SillyTavern / RisuAI / Chub formats:
  *  - PNG character cards: scans tEXt / iTXt / zTXt chunks, strictly preferring `ccv3` over `chara`.
- *  - .charx (CCV3 ZIP): parses ZIP End-of-Central-Directory & Central Directory via Node built-in zlib,
+ *  - .charx (CCV3 ZIP): parses ZIP EOCD & Central Directory via Node built-in zlib,
  *    with strict Zip-Slip protection, entry count & total uncompressed size caps, and `embeded://` rewriting.
  *  - Standalone JSON: auto-sniffs CCV3, CCV2, V1, Standalone Lorebook (array or dict), and ST OpenAI Preset.
  */
@@ -94,7 +94,6 @@ export function extractPngCardJson(buf: Buffer): {
         if (key === "ccv3" || key === "chara") {
           const compressionFlag = chunkData[nul + 1];
           const compressionMethod = chunkData[nul + 2];
-          // Skip language tag (\0) and translated keyword (\0)
           const langEnd = chunkData.indexOf(0, nul + 3);
           const transEnd = langEnd >= 0 ? chunkData.indexOf(0, langEnd + 1) : -1;
           if (transEnd >= 0) {
@@ -115,7 +114,7 @@ export function extractPngCardJson(buf: Buffer): {
       break;
     }
 
-    offset = dataEnd + 4; // skip 4-byte CRC
+    offset = dataEnd + 4;
   }
 
   const chosenKey: "ccv3" | "chara" | null = found.has("ccv3")
@@ -129,12 +128,7 @@ export function extractPngCardJson(buf: Buffer): {
   }
 
   const payload = found.get(chosenKey)!.trim();
-  let jsonText: string;
-  if (payload.startsWith("{")) {
-    jsonText = payload;
-  } else {
-    jsonText = Buffer.from(payload, "base64").toString("utf8");
-  }
+  const jsonText = payload.startsWith("{") ? payload : Buffer.from(payload, "base64").toString("utf8");
 
   const parsed = JSON.parse(jsonText);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
@@ -149,7 +143,10 @@ export function sanitizeZipEntryPath(entryName: string): string {
   if (!normalized || normalized.includes("\0")) {
     throw new Error(`Unsafe ZIP entry path: "${entryName}"`);
   }
-  const segments = normalized.split("/");
+  const segments = normalized.split("/").filter((s) => s.length > 0);
+  if (segments.length === 0) {
+    throw new Error(`Unsafe ZIP entry path: "${entryName}"`);
+  }
   for (const seg of segments) {
     if (seg === ".." || seg === ".") {
       throw new Error(`Zip-Slip traversal detected in entry: "${entryName}"`);
@@ -163,7 +160,6 @@ export function sanitizeZipEntryPath(entryName: string): string {
  * with strict Zip-Slip, entry count, and uncompressed byte limits.
  */
 export function readZipEntries(buf: Buffer): Map<string, Buffer> {
-  // Locate End of Central Directory (EOCD) signature 0x06054b50 from end of file.
   const minEocd = 22;
   if (buf.length < minEocd) {
     throw new Error("Invalid ZIP/CHARX buffer: too short");
@@ -210,7 +206,7 @@ export function readZipEntries(buf: Buffer): Map<string, Buffer> {
     const rawName = buf.subarray(pos + 46, pos + 46 + nameLen).toString("utf8");
     pos += 46 + nameLen + extraLen + commentLen;
 
-    if (rawName.endsWith("/")) continue; // directory entry
+    if (rawName.endsWith("/")) continue;
 
     const safeName = sanitizeZipEntryPath(rawName);
     totalUncompressed += uncompressedSize;
@@ -263,26 +259,32 @@ export function sniffJsonInput(obj: Record<string, unknown>): UnpackedInput {
   if (spec === "chara_card_v2") {
     return { kind: "card", specOrigin: "v2", rawJson: obj, assets: [], warnings: [] };
   }
-  // SillyTavern OpenAI / Chat Completion Preset
-  if (Array.isArray(obj.prompts) && (Array.isArray(obj.prompt_order) || typeof obj.temperature === "number" || typeof obj.openai_max_context === "number")) {
+  if (
+    Array.isArray(obj.prompts) &&
+    (Array.isArray(obj.prompt_order) ||
+      typeof obj.temperature === "number" ||
+      typeof obj.openai_max_context === "number")
+  ) {
     return { kind: "preset", rawJson: obj, warnings: [] };
   }
-  // Standalone Lorebook / World Info (entries as array or keyed object dictionary)
-  if (obj.entries !== undefined && (Array.isArray(obj.entries) || (typeof obj.entries === "object" && obj.entries !== null))) {
+  if (
+    obj.entries !== undefined &&
+    (Array.isArray(obj.entries) || (typeof obj.entries === "object" && obj.entries !== null))
+  ) {
     return { kind: "lorebook", rawJson: obj, warnings: [] };
   }
-  // V1 character card (flat fields at root)
   if (typeof obj.name === "string" && (typeof obj.description === "string" || typeof obj.first_mes === "string")) {
     return { kind: "card", specOrigin: "v1", rawJson: obj, assets: [], warnings: [] };
   }
-  throw new Error("Unrecognized JSON schema: expected CCV3/CCV2/V1 card, standalone lorebook, or SillyTavern preset");
+  throw new Error(
+    "无法识别的 JSON 格式：请提供 V1/V2/V3 角色卡、独立世界书（含 entries）或 SillyTavern 对话预设（含 prompts）。",
+  );
 }
 
 /** Unpack a file from disk (`.png`, `.charx`, `.zip`, `.json`) or buffer with filename hint. */
 export function unpackBuffer(buf: Buffer, filename = "input.json"): UnpackedInput {
   const ext = path.extname(filename).toLowerCase();
 
-  // PNG magic bytes take precedence
   if (buf.length >= 8 && buf.subarray(0, 8).equals(PNG_SIGNATURE)) {
     const { rawJson, chunkKey, warnings } = extractPngCardJson(buf);
     const specOrigin: CardSpecOrigin =
@@ -301,12 +303,11 @@ export function unpackBuffer(buf: Buffer, filename = "input.json"): UnpackedInpu
     };
   }
 
-  // ZIP / .charx magic bytes (PK\x03\x04)
   if (ext === ".charx" || ext === ".zip" || (buf.length >= 4 && buf.readUInt32LE(0) === 0x04034b50)) {
     const entries = readZipEntries(buf);
     const cardBuf = entries.get("card.json");
     if (!cardBuf) {
-      throw new Error(".charx archive is missing root card.json");
+      throw new Error(".charx 压缩包缺少根目录 card.json");
     }
     const rawJson = JSON.parse(cardBuf.toString("utf8")) as Record<string, unknown>;
     const assets: UnpackedAsset[] = [];
@@ -323,11 +324,10 @@ export function unpackBuffer(buf: Buffer, filename = "input.json"): UnpackedInpu
     };
   }
 
-  // JSON
   const text = buf.toString("utf8").replace(/^\uFEFF/, "").trim();
   const parsed = JSON.parse(text);
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("JSON input must be an object");
+    throw new Error("JSON 文件顶层必须是对象");
   }
   return sniffJsonInput(parsed as Record<string, unknown>);
 }
@@ -336,3 +336,47 @@ export function unpackFile(filePath: string): UnpackedInput {
   const buf = fs.readFileSync(filePath);
   return unpackBuffer(buf, path.basename(filePath));
 }
+
+/**
+ * Fast, non-compiling asset sniffer for the interactive file picker.
+ * Verifies PNG `ccv3`/`chara` chunks (never decodes pixels), `.charx` archives,
+ * and JSON character cards / worldbooks / presets.
+ */
+export function inspectImportFileQuick(
+  filePath: string,
+): { kind: "card" | "lorebook" | "preset"; badge: string } | null {
+  const ext = path.extname(filePath).toLowerCase();
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile()) return null;
+
+    if (ext === ".charx") {
+      return { kind: "card", badge: "[角色卡 CHARX]" };
+    }
+    if (ext === ".png") {
+      if (stat.size > 35 * 1024 * 1024) return null;
+      const buf = fs.readFileSync(filePath);
+      if (buf.length < 8 || !buf.subarray(0, 8).equals(PNG_SIGNATURE)) return null;
+      const { chunkKey, rawJson } = extractPngCardJson(buf);
+      const isV3 = chunkKey === "ccv3" || rawJson.spec === "chara_card_v3";
+      return { kind: "card", badge: isV3 ? "[角色卡 V3]" : "[角色卡 V2]" };
+    }
+    if (ext === ".json") {
+      if (stat.size > 12 * 1024 * 1024) return null;
+      const text = fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, "").trim();
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const sniffed = sniffJsonInput(parsed as Record<string, unknown>);
+      if (sniffed.kind === "preset") return { kind: "preset", badge: "[酒馆预设]" };
+      if (sniffed.kind === "lorebook") return { kind: "lorebook", badge: "[世界书]" };
+      return {
+        kind: "card",
+        badge: sniffed.specOrigin === "v3" ? "[角色卡 V3]" : sniffed.specOrigin === "v2" ? "[角色卡 V2]" : "[角色卡 V1]",
+      };
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+

@@ -1,60 +1,77 @@
-# pi-rp-engine · 下一代通用 Agentic 角色扮演与世界模拟器（Pi 扩展施工蓝图）
+# pi-rp-engine v2 · 新时代通用 Agentic 角色扮演与世界模拟器（官方 Pi SDK 扩展）
 
-> **定位**：基于官方 **Pi SDK（`@earendil-works/pi-coding-agent`）** 构建的 **100% 标准单扩展通用底座**（零 App 魔改、桌面端 Pi CLI/TUI 与移动端 `pi-android` 1:1 通用），以「确定性代码状态机 + 双时态事实图谱 + 物理时代门禁 + KV-Cache 零碎裂三区上下文 + 无损保真 V2/V3 角色卡兼容」取代传统 SillyTavern 1.0 时代纯文本拼接与前端套壳范式。
+> **定位**：100% 基于官方 **Pi SDK（`@earendil-works/pi-coding-agent` 1.6.1+）** 构建的 **零第三方运行时依赖、纯 TypeScript/ESM 单扩展通用底座**（桌面端 Pi CLI/TUI 与移动端 `pi-android` 1:1 通用）。以「确定性代码状态机（CFSM）+ 双时态事实图谱（Graphiti）+ 物理时代门禁（TimeChara/NCP-Bench）+ DREAM ABC 人物信念 + 本地 HippoRAG 2 跳 PPR 联想召回 + EverMemOS 伏笔/幕间归并 + KV-Cache 零碎裂三区上下文 + 无损保真 V1/V2/V3/.charx 兼容」全面取代传统 SillyTavern 1.0 时代纯文本拼接与前端套壳范式。
 
 ---
 
-## 一、四个最关键的架构定调（开工前先拍板）
+## 一、核心原则与 v2 全面重做亮点
 
-### 1. 界面怎么做？会破坏 `pi-android` 与官方 Pi 的 1:1 吗？
-**完全不会，零侵入、零破坏，100% 只用官方 Pi 扩展通用 UI 接口！**
-- 之前提到的“手机原生 HUD”并非去魔改 `pi-android` 客户端代码，而是指 **`pi-android` 已经 1:1 实现了官方 Pi SDK 的全套 `ExtensionUIContext` 接口**，并用原生 Jetpack Compose 渲染：
-  - `ctx.ui.setStatus(key, text)` → 桌面端渲染在底栏状态条，`pi-android` 原生渲染在输入框上方可横滑胶囊；
-  - `ctx.ui.setWidget(key, linesOrFactory)` / `setHeader` / `setFooter` → 桌面端渲染在 TUI 面板，`pi-android` 原生渲染为可折叠 Compose 卡片（自动跟随 12 套主题）；
-  - `ctx.ui.custom(factory)` → 桌面端是 TUI 交互弹层，`pi-android` 原生渲染为底部交互抽屉面板（自带按键条）；
-  - `ctx.ui.select / confirm / input / editor / notify` → 原生选项弹窗、确认框、输入框、提示条；
-  - `pi.registerTool({ renderCall, renderResult })` / `pi.registerEntryRenderer` / `pi.registerMessageRenderer` → 官方组件渲染链，桌面与手机 1:1 一致。
-- **硬性红线**：本扩展 **严禁** 依赖任何 `pi-android` 私有接口，也不要求修改 `pi-android` 一行代码；安装后在 Linux/macOS/Windows 桌面 `pi` 与 `pi-android` 上运行效果完全一致。
+### 1. 严格单会话存活 & 彻底干净退出（零跨会话污染）
+- **绝不连带项目中的其他会话**：已彻底移除任何项目级 `world.json` 自动绑定机制！把角色卡存进 `.pi/rp/` 或全局角色库 `~/.pi/agent/rp-library/`，**永远只是静态素材库**，绝不会自动触发任何其他会话的 RP 模式。
+- **只在显式开启的当前会话存活**：只有当你在某个会话内主动执行 `/rp load` 或 `/rp import -> 立即开启` 后，当前会话分支写入 `rp:tx (bind)` 才激活 RP 模式；其他普通编程会话保持 100% 休眠（0 工具 Token、0 Prompt 改动、0 HUD）。
+- **退出即彻底退出**：执行 `/rp exit`、`/rp off` 或按 **`Alt+Shift+X`** 后，写入 `unbind` 事件，瞬间清空所有内存态（角色卡、共演卡、预设、OOC 标志、瞬态世界书缓存），**100% 恢复原有编程工具集并清空全部状态栏与 Widget**，不留一丝痕迹。
 
-### 2. 角色卡按「项目（Project）」还是按「对话（Session）」组织？
-**结论：扩展全局只装一次，平时完全静默（0 Token、0 HUD、不干扰写代码）；玩法层同时支持「一世界一项目」为主、「单库按对话切卡」为辅，状态永远绑定在 Pi 原生会话树里。**
+### 2. 极致人性化导入与全套交互式体验
+- **全新交互式文件浏览器（告别手敲路径！）**：直接输入 `/rp import`（无需传参）即可：
+  - **自动扫描并实时嗅探类型**：自动发现当前工作区、上次导入目录、`~/Downloads`（及 Android `/sdcard/Download`）、桌面与文档中的 `.png` / `.charx` / `.json`，提前验出并标注 `[角色卡 V3]`、`[角色卡 V2]`、`[CHARX]`、`[世界书]`、`[酒馆预设]`，过滤无关 JSON；
+  - **自由浏览子目录 & 一键批量导入**：点击文件夹自由穿梭，同目录多张卡支持「一键批量导入」；也支持拖拽粘贴带引号/转义空格路径；
+  - **导入后一键无缝开玩**：导入角色卡后当场给出审计报告，并可一键选择「立即开局 / 加入当前同场共演 / 仅存库」。
+- **100% 官方 Pi UI 的精致编辑质感渲染**：
+  - 全套细线框编辑感 TUI 卡片（`╭─ [OPENING] / [CHECK] / [ERA] / [OOC]`），支持中英文双宽折行与主题色自适应；
+  - 完整 HUD 与 `/rp panel` 世界面板支持可视化进度条（`▓▓▓▓░░ 4/6`）、有界属性条、世界书单条实时开关、数值/背包/地点/Flags 实时编辑器、事实与信念账本、时钟与伏笔管理。
 
-| 层级 | 职责 | 为什么这是最优解 |
+### 3. 10 个防终端冲突快捷键（桌面端 & 移动端通用）
+> 严格避开 `Ctrl+I/M/J/H/C/Z/D/L/R/O` 等终端保留键位，且在未开启 RP 的编程会话中除 `Alt+R` 外完全不打扰。
+
+| 快捷键 | 功能 | 对应命令 |
 | :--- | :--- | :--- |
-| **扩展代码本身** | 全局安装一次（`~/.pi/agent/extensions/pi-rp-engine` 或 `pi install`） | 所有工具注册为 `defaultActive: false`；未激活 RP 模式时，写代码/日常聊天 **0 开销、0 污染** |
-| **推荐主模式：一长篇大卡 / 一世界观 = 一个项目（Workspace）** | 项目 `.pi/rp/` 存放卡资产（`.charx` 解包立绘/背景图）、清洗后的标准卡包、外挂世界书、自定义时代/规则模板 | ① 文件与立绘归属清晰，在 `pi-android`「项目与文件」里一目了然；② 同一个项目里开多个「新对话」，就是同一个世界的多条攻略线 / 不同 `alternate_greetings` 开局，共享世界书与立绘；③ 切回编程项目瞬间退出 RP 模式 |
-| **轻量兼容模式：统一角色库项目 + 按对话绑定卡** | 在同一个“酒馆/短打”项目里，每个对话通过 `/rp load <card>` 或 `/rp import <file>` 单独绑定一张卡 | 适合一次性短打小卡，不必每张轻卡都新建文件夹；绑定记录写入 `pi.appendEntry("rp:bind", ...)`，各对话互不串台 |
-| **局内状态 / 存档 / 路线分叉 = 会话树（Session Tree）** | 所有 FSM 状态跃迁、双时态事实、伏笔、进度时钟、时代解锁都通过 `pi.appendEntry("rp:tx", delta)` 写入当前对话 JSONL 树 | 在 Pi / `pi-android` 的「会话树」里任意回退到 30 轮前或分叉重选，**世界状态、背包、好感、时代锁 100% 自动随分支回滚，零脱节** |
+| **`Alt+R`** | 打开 RP 主菜单 / 休眠启动器 | `/rp` |
+| **`Ctrl+Shift+R`** | 打开实时世界面板与状态/世界书编辑器 | `/rp panel` |
+| **`Alt+K`** | 让角色无缝续写剧情 | `/rp continue` |
+| **`Alt+A`** | 生成 3 个当下情境行动建议 | `/rp act` |
+| **`Alt+N`** | 管理导演指令与常用模板 | `/rp note` |
+| **`Alt+O`** | 发起场外 OOC 讨论（不推进剧情与时钟） | `/rp ooc` |
+| **`Alt+G`** | 打开快捷掷骰检定器（标准/优势/劣势/百分骰/DC） | `/rp roll` |
+| **`Alt+B`** | 保存当前剧情节点书签 | `/rp save` |
+| **`Alt+H`** | 循环切换 HUD 模式（极简 → 完整 → 隐藏） | `/rp hud` |
+| **`Alt+Shift+X`** | 确认后彻底退出当前会话 RP 模式 | `/rp exit` |
 
-### 3. 存量角色卡兼容的「绝对保真红线」
-- **绝不精简 `mes_example`（对话实例）**：一字不删、完整进入冻结前缀（Zone 1），锁死角色语感、口癖、节奏与文风。
-- **绝不阉割 `system_prompt`、`post_history_instructions`、`depth_prompt`（含破甲/文风/视角/作者规则）**：原样保留、绝不做内容审查。
-- **只剥离新时代彻底无用的 1.0 前端壳子**：`<script>`、`<style>`、`<iframe>`、HTML/CSS 状态栏排版代码、`tavern_helper` / JS-Slash-Runner 前端 DOM 脚本、纯前端渲染型 `regex_scripts`、Web 专属 `live2d`/`vrm` 二进制。
-- **仅合并跨字段完全重复的防越权/防抢话套话**：不重复的规则与设定绝不剥离；且内置 **「无损直通开关（Raw Passthrough）」**，一键可关闭任何去重与状态接管。
-
-### 4. 所有类型的角色卡都能用吗？
-详见 [`docs/04-CARD-COMPATIBILITY-AND-MILESTONES.md`](./docs/04-CARD-COMPATIBILITY-AND-MILESTONES.md)：
-- **7 大主流卡型 100% 原生支持且体验显著超越酒馆**：纯文字 1v1 / 陪伴卡、大型世界观 / 跑团 TRPG 卡、数值养成 / SLG / MVU 状态栏卡、多角色 / 群像 / 后宫模拟卡、多时代 / 悬疑推理 / 剧本杀卡、强文风 / 文学小说 / 重破甲卡、V3 `.charx` 富媒体立绘卡。
-- **唯一诚实划界的 1 类**：把核心玩法本身写成浏览器 JS 小游戏 / Canvas 交互网页的“伪前端网页卡”（剥离 JS 后失去定制 Canvas UI，仅能退化为纯文本+状态机交互）。
+### 4. 酒馆官方规格 100% 对齐 & 2025–2026 前沿 RP 架构
+- **绝对保真红线**：`mes_example` 100% 原样保留进冻结前缀（Zone 1），绝不截断或改写；`system_prompt` / `depth_prompt` / `post_history_instructions` 完整保留；仅用**平衡括号深度解析器**外科式剥离嵌套 HTML 状态栏、`<script>`、`<style>`、`<UpdateVariable>`，并在剥离**之前**从原始常驻世界书/YAML `InitVar` / `_.set()` 中抢救数值 Schema。
+- **SillyTavern 官方 `world-info.js` / `macros.js` / `regex` 逐行对齐**：
+  - 完整 CCV3 `@@` 装饰器 + 真正的 `@@@` 仅失败回退语义 + 独立 `@@exclude_keys`（绝不污染 `selectiveLogic`）；
+  - 行内 `/regex/flags` 关键词触发 + 2 跳 HippoRAG PPR 扩散 + 修复非粘滞条目的 `cooldown` 冷却触发；
+  - 完整 `{{random:a,b}}`、确定性 `{{pick}}`、`{{trim}}`、`{{outlet::name}}`、`{{persona}}`、`{{group}}`、`{{lastUserMessage}}`、`{{roll:d20}}`；
+  - 严格遵守 `regex_scripts` 的 `placement`（仅对 `2=AI_OUTPUT` 渲染展示层）、`trimStrings` 与 `substituteRegex (0/1/2)`。
+- **官方 Pi SDK 1.6.1+ 深度契约修复**：
+  - `turn_end` 自动识别并跳过工具调用中间步（`stopReason === "toolUse"` / `toolCall`），杜绝回合数与 TTL 双倍消耗；
+  - `session_before_compact` 严格返回 `{ compaction: { summary, firstKeptEntryId, tokensBefore, details } }`；
+  - `/rp goto` 通过官方 `ctx.sessionManager.getLabel(id)` + `type === "label"` 双轨解析书签并支持回溯/分叉；
+  - `/rp hide` 采用 `entryId` + 确定性消息指纹双匹配，在 `AgentMessage[]` 上 100% 可靠生效。
 
 ---
 
-### 5. 要不要按角色拆「多 Agent」？前端卡 vs 纯文字卡怎么选？
-- **结论：默认坚决单主脑 + 确定性代码引擎，绝不按角色全量拆多 Agent。**
-  - 2025–2026 实测与研究均证实：全量多 Agent（导演→角色A→角色B→叙述者）会让每轮延迟飙升 3~5 倍、Token 成倍暴涨、彻底击穿 KV Cache，且多轮摘要交接会造成文风割裂与细节损耗（Lossy Handoff）。
-  - **三档执行模型**：① **默认档** = 单主 Agent（统一执笔文风与同场群戏）+ 0ms TypeScript 确定性状态/记忆引擎；② **可选后台边车** = 在 Pi `agent_settled` 钩子异步运行轻量模型记账，**零首字延迟**；③ **可选按需隔离 Sub-agent（`rp_npc_deliberate`）** = 仅在强「信息不对称 / 密室推理 / 反派暗算」场景下按需调用 `ctx.modelRegistry.complete()` 做单次视角隔离思考，绝不常驻。
-- **纯文字卡 vs 前端卡**：**纯文字卡（含纯文字世界书）是新时代 Agent 引擎的天生绝配**（高信噪比、文字归模型、状态与界面归引擎）；重度前端卡本质是 1.0 时代弥补酒馆残缺的补丁，带 HTML 状态栏/MVU 的中度前端卡会抢救其变量结构转原生 HUD，纯 H5 点按钮小游戏卡明确不兼容。
+## 二、快速上手
 
-### 6. 酒馆高频实战功能与 Pi 1.6.1 真实 API 对齐（100% 实测核验）
-- **彻底抛弃** STscript 伪编程语言（`/let`、`/if`、管道 `|`、DOM 脚本）；
-- **直接复用 Pi 原生更强能力**：树状分叉存档（`Session Tree`）、多版本抽卡（`fork`）、上下文压缩（`session_before_compact`）、模型/思考等级切换；
-- **全量补齐 11 项酒馆最高频实战手感**，统一收口到**「单入口 `/rp` 交互菜单 + 自动补全短子命令」**双轨体验（开场白切换、玩家马甲 Persona、导演便签/临时引导、无缝续写、行动灵感代写回填输入框、场外 OOC 隔离、楼层屏蔽、书签回档、掷骰与跳时间、多角色同场群戏、正文标签净化），并已逐条核对 **`@earendil-works/pi-coding-agent@1.6.1` `types.d.ts`** 与 **`pi-android` `docs/sdk-host/protocol.md`**，**100% 一一对应且零第三方运行时依赖**（直接走 Pi `VIRTUAL_MODULES`）。
+```bash
+# 编译与测试（零第三方运行时依赖）
+npm run typecheck
+npm test
+```
 
-## 二、施工文档导航
+在 Pi 中加载本扩展后：
+1. 按 **`Alt+R`** 或输入 **`/rp`** 打开启动器；
+2. 选择「浏览并导入角色卡 / 世界书 / 预设」，直接点选自动识别的 `.png` / `.charx` / `.json` 文件；
+3. 选择「立即在本会话开启角色扮演」，开始沉浸式互动；
+4. 随时按 **`Ctrl+Shift+R`** 打开实时世界面板微调数值/世界书/伏笔，或按 **`Alt+Shift+X`** 彻底退出回归纯净编程助手。
+
+---
+
+## 三、架构与设计文档导航
 
 | 文档 | 内容 |
 | :--- | :--- |
-| [`docs/01-RESEARCH-AND-ARCHITECTURE.md`](./docs/01-RESEARCH-AND-ARCHITECTURE.md) | 2025–2026 前沿 9 项论文与工程机制深度综述、三层存储与 KV-Cache 零碎裂三区架构、低延迟双轨闭环 |
-| [`docs/02-CARD-SPEC-AND-PARSER.md`](./docs/02-CARD-SPEC-AND-PARSER.md) | SillyTavern V1/V2/V3 角色卡（PNG / `.charx` / JSON）+ World Info 30+ 扩展字段 + Decorators + `extensions` + 宏的全量解析/保留/剥离施工规范 |
-| [`docs/03-PI-EXTENSION-DESIGN.md`](./docs/03-PI-EXTENSION-DESIGN.md) | 基于官方 Pi SDK 的完整工程设计：TypeScript 数据结构、Hook 时序、静态工具集、会话树事务回放、通用 Pi UI 交互、项目/对话双模式生命周期 |
-| [`docs/04-CARD-COMPATIBILITY-AND-MILESTONES.md`](./docs/04-CARD-COMPATIBILITY-AND-MILESTONES.md) | 8 大角色卡类型兼容性矩阵、分阶段施工路线图（Phase 0 → Phase 4）、目录结构、自动化测试与验收标准 |
+| [`docs/01-RESEARCH-AND-ARCHITECTURE.md`](./docs/01-RESEARCH-AND-ARCHITECTURE.md) | 2025–2026 前沿论文综述（CoSER / CFSM / DREAM / Graphiti / HippoRAG 2 / EverMemOS / FANToM / TimeChara）与 KV-Cache 零碎裂三区架构 |
+| [`docs/02-CARD-SPEC-AND-PARSER.md`](./docs/02-CARD-SPEC-AND-PARSER.md) | SillyTavern V1/V2/V3 角色卡（PNG / `.charx` / JSON）+ World Info 30+ 字段 + CCV3 Decorators + 宏 + `regex_scripts` 解析与保真规范 |
+| [`docs/03-PI-EXTENSION-DESIGN.md`](./docs/03-PI-EXTENSION-DESIGN.md) | 基于官方 Pi SDK 1.6.1+ 的工程设计：严格单会话生命周期、Hook 时序、6 个静态工具、编辑感 TUI 渲染器、交互式文件浏览器与 10 组快捷键 |
+| [`docs/04-CARD-COMPATIBILITY-AND-MILESTONES.md`](./docs/04-CARD-COMPATIBILITY-AND-MILESTONES.md) | 8 大角色卡类型兼容性矩阵、实际代码目录结构与全套自动化验收清单 |

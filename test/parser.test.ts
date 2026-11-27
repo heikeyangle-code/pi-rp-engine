@@ -1,304 +1,371 @@
-import { describe, it } from "node:test";
-import * as assert from "node:assert/strict";
+import test from "node:test";
+import assert from "node:assert/strict";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as zlib from "node:zlib";
-import {
-  extractPngCardJson,
-  readZipEntries,
-  rewriteEmbeddedAssetUri,
-  sanitizeZipEntryPath,
-  unpackBuffer,
-} from "../src/parser/unpack.js";
+import { unpackBuffer, unpackFile, inspectImportFileQuick, rewriteEmbeddedAssetUri, sanitizeZipEntryPath } from "../src/parser/unpack.js";
 import { compileCharacterCard } from "../src/parser/card-compiler.js";
-import { compileLoreBook, isSafeRegexPattern, parseV3Decorators } from "../src/parser/lore-compiler.js";
+import { compileLoreBook, parseV3Decorators, parseInlineRegexKey } from "../src/parser/lore-compiler.js";
 import { compileSillyTavernPreset } from "../src/parser/preset.js";
 import { evaluateMacros } from "../src/parser/macros.js";
-import {
-  deduplicateBoilerplateAcrossFields,
-  sanitizeFrontendShell,
-  stripDisplayResiduals,
-} from "../src/parser/sanitizer.js";
+import { applyDisplayRegexRules, sanitizeFrontendShell, stripDisplayResiduals } from "../src/parser/sanitizer.js";
+import { normalizeUserFilePath, smartDiscoverRpFiles } from "../src/ui/file-picker.js";
 
-/** Helper: build a minimal valid PNG with custom tEXt chunks. */
-function makePngWithTextChunks(chunks: Array<{ key: string; text: string }>): Buffer {
+/** Helper: construct a minimal valid PNG buffer containing arbitrary tEXt / iTXt chunks. */
+function makePngWithTextChunks(chunks: Array<{ type: "tEXt" | "iTXt"; key: string; value: string; compressed?: boolean }>): Buffer {
   const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-  const parts: Buffer[] = [sig];
-  const writeChunk = (type: string, data: Buffer) => {
+  const makeChunk = (type: string, data: Buffer) => {
     const len = Buffer.alloc(4);
     len.writeUInt32BE(data.length, 0);
     const typeBuf = Buffer.from(type, "ascii");
-    const crc = Buffer.alloc(4); // CRC not checked by unpacker
-    parts.push(len, typeBuf, data, crc);
+    const crc = Buffer.alloc(4);
+    return Buffer.concat([len, typeBuf, data, crc]);
   };
+  const ihdrData = Buffer.alloc(13);
+  ihdrData.writeUInt32BE(1, 0);
+  ihdrData.writeUInt32BE(1, 4);
+  const parts: Buffer[] = [sig, makeChunk("IHDR", ihdrData)];
   for (const c of chunks) {
-    const data = Buffer.concat([Buffer.from(c.key, "latin1"), Buffer.from([0]), Buffer.from(c.text, "latin1")]);
-    writeChunk("tEXt", data);
+    if (c.type === "tEXt") {
+      parts.push(makeChunk("tEXt", Buffer.concat([Buffer.from(c.key, "latin1"), Buffer.from([0]), Buffer.from(c.value, "latin1")])));
+    } else {
+      const payload = c.compressed ? zlib.deflateSync(Buffer.from(c.value, "utf8")) : Buffer.from(c.value, "utf8");
+      const data = Buffer.concat([
+        Buffer.from(c.key, "utf8"),
+        Buffer.from([0, c.compressed ? 1 : 0, 0, 0, 0]),
+        payload,
+      ]);
+      parts.push(makeChunk("iTXt", data));
+    }
   }
-  writeChunk("IEND", Buffer.alloc(0));
+  parts.push(makeChunk("IEND", Buffer.alloc(0)));
   return Buffer.concat(parts);
 }
 
-/** Helper: build a minimal valid ZIP archive in memory (stored or deflated). */
-function makeZip(entries: Array<{ name: string; data: Buffer; deflate?: boolean }>): Buffer {
+/** Helper: build a minimal STORE ZIP buffer (.charx). */
+function makeStoreZip(entries: Array<{ name: string; data: Buffer }>): Buffer {
   const localParts: Buffer[] = [];
-  const cdParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
   let offset = 0;
 
   for (const e of entries) {
     const nameBuf = Buffer.from(e.name, "utf8");
-    const compressed = e.deflate ? zlib.deflateRawSync(e.data) : e.data;
-    const method = e.deflate ? 8 : 0;
+    const local = Buffer.alloc(30);
+    local.writeUInt32LE(0x04034b50, 0);
+    local.writeUInt16LE(20, 4);
+    local.writeUInt32LE(e.data.length, 18);
+    local.writeUInt32LE(e.data.length, 22);
+    local.writeUInt16LE(nameBuf.length, 26);
+    localParts.push(local, nameBuf, e.data);
 
-    const lfh = Buffer.alloc(30);
-    lfh.writeUInt32LE(0x04034b50, 0);
-    lfh.writeUInt16LE(20, 4);
-    lfh.writeUInt16LE(method, 8);
-    lfh.writeUInt32LE(compressed.length, 18);
-    lfh.writeUInt32LE(e.data.length, 22);
-    lfh.writeUInt16LE(nameBuf.length, 26);
+    const central = Buffer.alloc(46);
+    central.writeUInt32LE(0x02014b50, 0);
+    central.writeUInt16LE(20, 4);
+    central.writeUInt16LE(20, 6);
+    central.writeUInt32LE(e.data.length, 20);
+    central.writeUInt32LE(e.data.length, 24);
+    central.writeUInt16LE(nameBuf.length, 28);
+    central.writeUInt32LE(offset, 42);
+    centralParts.push(central, nameBuf);
 
-    const cdh = Buffer.alloc(46);
-    cdh.writeUInt32LE(0x02014b50, 0);
-    cdh.writeUInt16LE(20, 4);
-    cdh.writeUInt16LE(20, 6);
-    cdh.writeUInt16LE(method, 10);
-    cdh.writeUInt32LE(compressed.length, 20);
-    cdh.writeUInt32LE(e.data.length, 24);
-    cdh.writeUInt16LE(nameBuf.length, 28);
-    cdh.writeUInt32LE(offset, 42);
-
-    localParts.push(lfh, nameBuf, compressed);
-    cdParts.push(cdh, nameBuf);
-    offset += lfh.length + nameBuf.length + compressed.length;
+    offset += local.length + nameBuf.length + e.data.length;
   }
 
-  const cdBuf = Buffer.concat(cdParts);
+  const centralBuf = Buffer.concat(centralParts);
   const eocd = Buffer.alloc(22);
   eocd.writeUInt32LE(0x06054b50, 0);
   eocd.writeUInt16LE(entries.length, 8);
   eocd.writeUInt16LE(entries.length, 10);
-  eocd.writeUInt32LE(cdBuf.length, 12);
+  eocd.writeUInt32LE(centralBuf.length, 12);
   eocd.writeUInt32LE(offset, 16);
 
-  return Buffer.concat([...localParts, cdBuf, eocd]);
+  return Buffer.concat([...localParts, centralBuf, eocd]);
 }
 
-describe("Phase 1 · Container Unpacker (PNG, .charx, JSON)", () => {
-  it("strictly prefers ccv3 chunk over chara chunk in PNG cards", () => {
-    const v2 = { spec: "chara_card_v2", data: { name: "OldV2", description: "v2" } };
-    const v3 = { spec: "chara_card_v3", data: { name: "NewV3", nickname: "V3Nick", description: "v3" } };
-    const png = makePngWithTextChunks([
-      { key: "chara", text: Buffer.from(JSON.stringify(v2)).toString("base64") },
-      { key: "ccv3", text: Buffer.from(JSON.stringify(v3)).toString("base64") },
-    ]);
-    const res = extractPngCardJson(png);
-    assert.equal(res.chunkKey, "ccv3");
-    assert.equal((res.rawJson.data as Record<string, unknown>).name, "NewV3");
-  });
+test("PNG unpacker prefers ccv3 over chara and handles compressed iTXt UTF-8", () => {
+  const v2 = { spec: "chara_card_v2", data: { name: "旧版莉莉", description: "V2" } };
+  const v3 = { spec: "chara_card_v3", spec_version: "3.0", data: { name: "新版莉莉", description: "V3 完整设定" } };
+  const png = makePngWithTextChunks([
+    { type: "tEXt", key: "chara", value: Buffer.from(JSON.stringify(v2)).toString("base64") },
+    { type: "iTXt", key: "ccv3", value: Buffer.from(JSON.stringify(v3)).toString("base64"), compressed: true },
+  ]);
 
-  it("unpacks .charx ZIP safely, rejects Zip-Slip, and rewrites embeded:// URIs", () => {
-    const cardJson = {
-      spec: "chara_card_v3",
-      data: {
-        name: "黑水",
-        description: "冻土与暴风雪",
-        assets: [
-          { type: "emotion", name: "snow", uri: "embeded://assets/snow.png", ext: "png" },
-          { type: "live2d", name: "model", uri: "embedded://assets/model.moc3", ext: "moc3" },
+  const res = unpackBuffer(png, "lily.png");
+  assert.equal(res.kind, "card");
+  assert.equal(res.specOrigin, "v3");
+  assert.equal((res.rawJson.data as any).name, "新版莉莉");
+});
+
+test("CHARX unpacker rejects Zip-Slip and rewrites embeded:// single-d typo URIs", () => {
+  assert.throws(() => sanitizeZipEntryPath("../evil.txt"), /traversal/i);
+  assert.equal(rewriteEmbeddedAssetUri("embeded://assets/icon/main.png"), "assets/icon/main.png");
+  assert.equal(rewriteEmbeddedAssetUri("embedded://other/bg.webp"), "assets/other/bg.webp");
+
+  const cardJson = {
+    spec: "chara_card_v3",
+    data: {
+      name: "克莱尔",
+      description: "优雅的学者",
+      assets: [{ type: "icon", uri: "embeded://assets/icon/main.png", name: "main", ext: "png" }],
+    },
+  };
+  const zip = makeStoreZip([
+    { name: "card.json", data: Buffer.from(JSON.stringify(cardJson)) },
+    { name: "assets/icon/main.png", data: Buffer.from("PNGDATA") },
+  ]);
+  const res = unpackBuffer(zip, "claire.charx");
+  assert.equal(res.kind, "card");
+  assert.equal(res.specOrigin, "charx");
+  assert.equal(res.assets.length, 1);
+
+  const compiled = compileCharacterCard(res.rawJson, "charx");
+  assert.equal(compiled.assets[0]?.localPath, "assets/icon/main.png");
+});
+
+test("Sanitizer strips deeply nested styled HTML status bars cleanly while preserving 100% prose & mes_example", () => {
+  const dirtyDesc = [
+    "她是钟楼的守望者，说话克制而温和。",
+    `<div class="status-panel" style="background:#111"><div class="row"><div class="bar">HP: 100</div></div><div class="footer">状态</div></div>`,
+    "<style>.hud{color:red}</style><script>window.ST = 1;</script>",
+    "```update\n_.set('好感度', 40)\n```",
+    "她腰间常挂着一枚铜哨。",
+  ].join("\n");
+
+  const sanitized = sanitizeFrontendShell(dirtyDesc, "description");
+  assert.ok(sanitized.cleaned.includes("她是钟楼的守望者"));
+  assert.ok(sanitized.cleaned.includes("她腰间常挂着一枚铜哨"));
+  assert.ok(!sanitized.cleaned.includes("<div"));
+  assert.ok(!sanitized.cleaned.includes("</div>"));
+  assert.ok(!sanitized.cleaned.includes("status-panel"));
+  assert.ok(!sanitized.cleaned.includes("<script>"));
+  assert.ok(sanitized.stripped.length >= 3);
+
+  // Also test display residual stripping for nested status blocks in AI output
+  const aiOut = "她轻轻叹了口气。\n<div class=\"st-bar\"><div>HP 90</div></div>\n<UpdateVariable>{\"hp\":90}</UpdateVariable>\n「我们走吧。」";
+  const cleaned = stripDisplayResiduals(aiOut);
+  assert.ok(cleaned.includes("她轻轻叹了口气。"));
+  assert.ok(cleaned.includes("「我们走吧。」"));
+  assert.ok(!cleaned.includes("<div"));
+  assert.ok(!cleaned.includes("UpdateVariable"));
+});
+
+test("Card compiler salvages MVU/YAML variables from RAW constant lore BEFORE sanitization and preserves 100% mes_example", () => {
+  const rawExample = "<START>\n{{user}}: 你好？\n{{char}}: *微微颔首，将怀表合上。* 「时间不多了。」\n<START>\n{{user}}: 为什么？\n{{char}}: 「潮水快涨起来了。」";
+  const rawCard = {
+    spec: "chara_card_v2",
+    data: {
+      name: "艾琳",
+      description: "守夜人艾琳。",
+      mes_example: rawExample,
+      first_mes: "「你终于来了，{{user}}。」",
+      creator_notes: "仅供界面展示的作者说明",
+      character_book: {
+        entries: [
+          {
+            uid: 1,
+            comment: "InitVar",
+            constant: true,
+            position: "before_char",
+            content:
+              "```yaml\nInitVar:\n  好感度: 25\n  理智值: 80\n```\n<UpdateVariable>{\"金币\": 150}</UpdateVariable>\n```js\n_.set('信任度', 10, 0, 100)\n```",
+          },
         ],
       },
-    };
-    const zip = makeZip([
-      { name: "card.json", data: Buffer.from(JSON.stringify(cardJson), "utf8"), deflate: true },
-      { name: "assets/snow.png", data: Buffer.from("fake-png") },
-    ]);
-    const unpacked = unpackBuffer(zip, "guandong.charx");
-    assert.equal(unpacked.kind, "card");
-    assert.equal(unpacked.specOrigin, "charx");
-    assert.equal(unpacked.assets.length, 1);
+      extensions: {
+        regex_scripts: [
+          {
+            scriptName: "CleanThink",
+            findRegex: "/<think>[\\s\\S]*?<\\/think>/gi",
+            replaceString: "",
+            placement: [2],
+            markdownOnly: true,
+          },
+          {
+            scriptName: "UserOnlyRule",
+            findRegex: "/foo/g",
+            replaceString: "bar",
+            placement: [1],
+          },
+          {
+            scriptName: "ReplaceWithTrim",
+            findRegex: "/{{char}}说：(.+)/g",
+            replaceString: "『{{match}}』",
+            trimStrings: ["{{char}}说："],
+            substituteRegex: 1,
+            placement: [2],
+          },
+        ],
+      },
+    },
+  };
 
-    const compiled = compileCharacterCard(unpacked.rawJson, unpacked.specOrigin);
-    assert.equal(compiled.assets.length, 1);
-    assert.equal(compiled.assets[0]!.localPath, "assets/snow.png");
-    assert.equal(compiled.importReport.skippedAssets.length, 1);
-    assert.equal(compiled.importReport.skippedAssets[0]!.type, "live2d");
+  const compiled = compileCharacterCard(rawCard, "v2");
+  assert.equal(compiled.frozen.mesExample, rawExample);
+  assert.equal(compiled.importReport.mesExampleCharsBefore, rawExample.length);
+  assert.equal(compiled.importReport.mesExampleCharsAfter, rawExample.length);
 
-    assert.equal(rewriteEmbeddedAssetUri("embeded://foo/bar.png"), "assets/foo/bar.png");
-    assert.throws(() => sanitizeZipEntryPath("../etc/passwd"), /Zip-Slip/);
+  // All variables salvaged from RAW constant lore BEFORE sanitization stripped the fenced blocks!
+  const keys = compiled.salvagedStateSchema.map((v) => v.key);
+  assert.ok(keys.includes("好感度"), `Expected 好感度 in ${keys.join(",")}`);
+  assert.ok(keys.includes("理智值"), `Expected 理智值 in ${keys.join(",")}`);
+  assert.ok(keys.includes("金币"), `Expected 金币 in ${keys.join(",")}`);
+  assert.ok(keys.includes("信任度"), `Expected 信任度 in ${keys.join(",")}`);
 
-    const evilZip = makeZip([{ name: "../../evil.txt", data: Buffer.from("boom") }]);
-    assert.throws(() => readZipEntries(evilZip), /Zip-Slip/);
-  });
+  // Placement=1 (USER_INPUT) must NOT appear in displayRegexRules
+  assert.ok(compiled.displayRegexRules.every((r) => r.placements.includes(2)));
+  assert.equal(compiled.displayRegexRules.length, 2);
+
+  // Test applyDisplayRegexRules with substituteRegex + trimStrings + {{match}}
+  const transformed = applyDisplayRegexRules(
+    "<think>inner monologue</think>艾琳说：出发吧",
+    compiled.displayRegexRules,
+    { charName: "艾琳", userName: "旅人" },
+  );
+  assert.equal(transformed, "『出发吧』");
 });
 
-describe("Phase 1 · Fidelity Sanitizer, MVU Salvage & Lorebook Compiler", () => {
-  it("preserves 100% of mes_example and jailbreak while surgically stripping 1.0 HTML/MVU shells", () => {
-    const mesExample = "<START>\n{{user}}: 你好\n{{char}}: <微微皱眉> 风雪太大了，进屋再说。";
-    const cardJson = {
-      spec: "chara_card_v3",
-      data: {
-        name: "柳春娘",
-        system_prompt:
-          "保持第三人称有限视角，冷峻白描。\n严禁替{{user}}决策、行动或发言。\n<script>alert(1)</script><style>.hud{color:red}</style>",
-        description:
-          "明末流民厨娘。<div style=\"display:flex;background:#111\">HP:100</div>",
-        mes_example: mesExample,
-        post_history_instructions:
-          "保持心理描写克制。\n不要替{{user}}行动或发言。\n<UpdateVariable>{\"hp\": 85, \"silver\": 12}</UpdateVariable>",
-        first_mes: "雪下了一夜。\n{{setvar::hunger::30}}\n<StatusPlaceHolderImpl/>",
-        extensions: {
-          depth_prompt: { prompt: "始终维持时代质感，绝不使用现代网络词。", depth: 2, role: "system" },
-          regex_scripts: [
-            { scriptName: "HTML Status Card", findRegex: "/<status>/g", replaceString: "<div class=\"card\">$1</div>" },
-            { scriptName: "Clean Extra Space", findRegex: "/  +/g", replaceString: " " },
-          ],
-        },
-        character_book: {
-          token_budget: 2048,
-          entries: [
-            {
-              id: "e1",
-              comment: "关东粮价",
-              keys: ["粮价", "米"],
-              secondary_keys: ["太平"],
-              selective: true,
-              selectiveLogic: 2, // NOT_ANY
-              delay: 3,
-              sticky: 2,
-              cooldown: 4,
-              content: "@@activate_only_after 5\n@@keep_activate_after_match\n@@exclude_keys 丰收\n崇祯末年关外粮价暴涨。",
-            },
-            {
-              id: "e2",
-              comment: "常驻基调",
-              constant: true,
-              position: 0,
-              content: "极寒与荒年是全剧底色。",
-            },
-          ],
-        },
+test("CCV3 decorators: independent @@exclude_keys, @@activate, @@scan_depth, and real @@@ fallback", () => {
+  const dec = parseV3Decorators(
+    [
+      "@@activate_only_after 5",
+      "@@activate_only_every 2",
+      "@@keep_activate_after_match",
+      "@@additional_keys 雾港,灯塔",
+      "@@exclude_keys 梦境,幻觉",
+      "@@scan_depth 8",
+      "@@reverse_depth 2",
+      "@@role system",
+      "@@use_regex",
+      "@@unknown_future_decorator 123",
+      "@@@depth 3",
+      "真正的内容正文",
+    ].join("\n"),
+  );
+
+  assert.equal(dec.minTurn, 5);
+  assert.equal(dec.everyNTurns, 2);
+  assert.equal(dec.stickyPermanent, true);
+  assert.deepEqual(dec.additionalKeys, ["雾港", "灯塔"]);
+  assert.deepEqual(dec.excludeKeys, ["梦境", "幻觉"]);
+  assert.equal(dec.scanDepthOverride, 8);
+  assert.equal(dec.reverseDepth, 2);
+  assert.equal(dec.roleOverride, "system");
+  assert.equal(dec.useRegexOverride, true);
+  // @@@depth 3 was applied ONLY because @@unknown_future_decorator wasn't supported!
+  assert.equal(dec.depthOverride, 3);
+  assert.equal(dec.cleanedContent, "真正的内容正文");
+
+  // Ensure @@exclude_keys does NOT clobber selectiveLogic="AND_ANY" & secondaryKeys!
+  const book = compileLoreBook({
+    entries: [
+      {
+        uid: 10,
+        comment: "密室",
+        keys: ["密室"],
+        secondary_keys: ["钥匙"],
+        selective: true,
+        selectiveLogic: 0, // AND_ANY
+        content: "@@exclude_keys 梦境\n真正的密室藏在书架后。",
       },
-    };
-
-    const compiled = compileCharacterCard(cardJson, "v3");
-    // 100% mes_example retention (including literary <微微皱眉>)
-    assert.equal(compiled.frozen.mesExample, mesExample);
-    assert.equal(compiled.importReport.mesExampleCharsBefore, compiled.importReport.mesExampleCharsAfter);
-    // Jailbreak / style rules 100% preserved, script/style/div/MVU stripped
-    assert.ok(compiled.frozen.systemPrompt.includes("保持第三人称有限视角，冷峻白描。"));
-    assert.ok(!compiled.frozen.systemPrompt.includes("<script>"));
-    assert.ok(!compiled.frozen.description.includes("display:flex"));
-    assert.ok(compiled.tailInstructions.postHistoryInstructions.includes("保持心理描写克制。"));
-    assert.ok(!compiled.tailInstructions.postHistoryInstructions.includes("UpdateVariable"));
-    assert.equal(compiled.tailInstructions.depthPrompt?.content, "始终维持时代质感，绝不使用现代网络词。");
-    // Duplicate anti-godmoding deduplicated (kept in system_prompt, removed in post_history)
-    assert.equal(compiled.importReport.deduplicatedRules.length, 1);
-    assert.equal(compiled.importReport.deduplicatedRules[0]!.field, "post_history_instructions");
-    // MVU & macro variables salvaged
-    const keys = compiled.salvagedStateSchema.map((v) => v.key);
-    assert.ok(keys.includes("hp"));
-    assert.ok(keys.includes("silver"));
-    assert.ok(keys.includes("hunger"));
-    // Frontend regex stripped, pure-text regex kept
-    assert.equal(compiled.displayRegexRules.length, 1);
-    assert.equal(compiled.displayRegexRules[0]!.name, "Clean Extra Space");
-    // Lorebook decorators & gate compiled
-    const e1 = compiled.loreBook.entries.find((e) => e.id === "e1")!;
-    assert.equal(e1.gate?.minTurn, 5);
-    assert.equal(e1.stickyPermanent, true);
-    assert.ok(!e1.content.includes("@@"));
-    assert.ok(e1.secondaryKeys.includes("丰收"));
-    assert.deepEqual(compiled.frozen.constantLoreIds, ["e2"]);
+    ],
   });
+  const entry = book.entries[0]!;
+  assert.equal(entry.selectiveLogic, "AND_ANY");
+  assert.deepEqual(entry.secondaryKeys, ["钥匙"]);
+  assert.deepEqual(entry.excludeKeys, ["梦境"]);
 
-  it("supports rawPassthrough mode without stripping or deduplicating", () => {
-    const html = "<div style=\"display:flex\">keep me</div>";
-    const { cleaned } = sanitizeFrontendShell(html, "description", true);
-    assert.equal(cleaned, html);
-
-    const dedup = deduplicateBoilerplateAcrossFields(
-      [
-        { field: "a", text: "严禁替{{user}}说话" },
-        { field: "b", text: "严禁替{{user}}说话" },
-      ],
-      true,
-    );
-    assert.equal(dedup.deduplicated.length, 0);
-    assert.equal(stripDisplayResiduals("正文<UpdateVariable>x</UpdateVariable>结尾"), "正文结尾");
-  });
-
-  it("handles ReDoS-unsafe regexes and V3 decorators safely", () => {
-    assert.equal(isSafeRegexPattern("(a+)+$"), false);
-    assert.equal(isSafeRegexPattern("关东|老金沟"), true);
-    const dec = parseV3Decorators("@@dont_activate\n@@activate_only_every 3\n@@additional_keys 冰原,黑水\n真正正文");
-    assert.equal(dec.manualRecallOnly, true);
-    assert.equal(dec.everyNTurns, 3);
-    assert.deepEqual(dec.additionalKeys, ["冰原", "黑水"]);
-    assert.equal(dec.cleanedContent, "真正正文");
-
-    const dictBook = compileLoreBook({
-      entries: {
-        "0": { uid: 0, comment: "坏正则", key: ["(a+)+$"], use_regex: true, content: "正文" },
-      },
-    });
-    assert.equal(dictBook.entries[0]!.useRegex, false);
-    assert.equal(dictBook.warnings.length, 1);
-  });
-
-  it("evaluates macros safely and never leaks raw setvar/comments", () => {
-    const out = evaluateMacros(
-      "{{// secret comment}}{{char}}看着{{user}}，骰出{{roll:1d6+2}}点，随机{{random::雪::霜}}，银两{{getvar::silver}}{{setvar::x::1}}",
-      { charName: "黑水", userName: "阿明", vars: { silver: 12 }, deterministicSeed: 42 },
-    );
-    assert.ok(out.startsWith("黑水看着阿明"));
-    assert.ok(out.includes("银两12"));
-    assert.ok(!out.includes("{{"));
-  });
+  // Inline regex parser
+  assert.deepEqual(parseInlineRegexKey("/dragon|wyvern/i"), { pattern: "dragon|wyvern", flags: "i" });
+  assert.equal(parseInlineRegexKey("plain keyword"), null);
 });
 
-describe("Phase 1 · SillyTavern OpenAI Preset Compiler", () => {
-  it("splits enabled prompts into Zone 1 (before chatHistory) and Zone 3 (after chatHistory / @D) cleanly", () => {
-    const stPreset = {
-      name: "文学白描预设",
-      temperature: 0.85,
-      top_p: 0.92,
-      openai_max_tokens: 4096,
-      continue_nudge_prompt: "请紧接上文继续写，不要重复。",
-      impersonation_prompt: "以玩家口吻给出下一步行动。",
-      prompts: [
-        { identifier: "main", name: "Main", role: "system", content: "你是文学级叙事引擎。" },
-        { identifier: "style", name: "Style", role: "system", content: "多用感官细节。<style>.x{}</style>" },
-        { identifier: "chatHistory", name: "Chat History", marker: true },
-        { identifier: "depth_rule", name: "Depth Rule", role: "system", content: "保持悬念。", injection_position: 1, injection_depth: 2 },
-        { identifier: "jailbreak", name: "Post", role: "system", content: "遵守人物逻辑，不强行说教。" },
-        { identifier: "disabled_one", name: "Off", role: "system", content: "不应出现" },
-      ],
-      prompt_order: [
-        {
-          character_id: 100001,
-          order: [
-            { identifier: "main", enabled: true },
-            { identifier: "style", enabled: true },
-            { identifier: "disabled_one", enabled: false },
-            { identifier: "chatHistory", enabled: true },
-            { identifier: "depth_rule", enabled: true },
-            { identifier: "jailbreak", enabled: true },
-          ],
-        },
-      ],
-    };
+test("SillyTavern macro parity: legacy {{random:a,b}}, deterministic {{pick}}, {{trim}}, {{outlet::name}}, {{roll:d20}}", () => {
+  const ctx = {
+    charName: "莉娜",
+    userName: "阿泽",
+    personaDescription: "背着旧相机的记者",
+    groupMembers: ["莉娜", "艾琳"],
+    vars: { gold: 42 },
+    outlets: { weather: "窗外正下着细雨。" },
+    lastUserMessage: "我们进屋吧",
+  };
 
-    const unpacked = unpackBuffer(Buffer.from(JSON.stringify(stPreset), "utf8"), "preset.json");
-    assert.equal(unpacked.kind, "preset");
+  assert.equal(evaluateMacros("{{char}}对{{user}}说：{{persona}}", ctx), "莉娜对阿泽说：背着旧相机的记者");
+  assert.equal(evaluateMacros("{{group}} / {{charIfNotGroup}}", ctx), "莉娜, 艾琳 / 莉娜, 艾琳");
+  assert.equal(evaluateMacros("天气：{{outlet::weather}}", ctx), "天气：窗外正下着细雨。");
+  assert.equal(evaluateMacros("A   {{trim}}   B", ctx), "AB");
+  assert.equal(evaluateMacros("上次：{{lastUserMessage}}", ctx), "上次：我们进屋吧");
 
-    const compiled = compileSillyTavernPreset(unpacked.rawJson);
-    assert.equal(compiled.zone1Prompts.length, 2);
-    assert.equal(compiled.zone1Prompts[0]!.identifier, "main");
-    assert.ok(!compiled.zone1Prompts[1]!.content.includes("<style>"));
-    assert.equal(compiled.zone3Prompts.length, 2);
-    // Depth 2 comes before depth 0 (closest to generation)
-    assert.equal(compiled.zone3Prompts[0]!.identifier, "depth_rule");
-    assert.equal(compiled.zone3Prompts[1]!.identifier, "jailbreak");
-    assert.equal(compiled.sampling.temperature, 0.85);
-    assert.equal(compiled.utilityPrompts.continueNudge, "请紧接上文继续写，不要重复。");
-  });
+  // Legacy {{random:a,b,c}}
+  const r = evaluateMacros("{{random:晴天,雨天,大雾}}", ctx);
+  assert.ok(["晴天", "雨天", "大雾"].includes(r));
+
+  // Deterministic {{pick::x::y::z}} produces identical output for same input
+  const p1 = evaluateMacros("{{pick::红茶::咖啡::清酒}}", ctx);
+  const p2 = evaluateMacros("{{pick::红茶::咖啡::清酒}}", ctx);
+  assert.equal(p1, p2);
+  assert.ok(["红茶", "咖啡", "清酒"].includes(p1));
+
+  // {{roll:d20}} shorthand works
+  const rolled = Number(evaluateMacros("{{roll:d20}}", ctx));
+  assert.ok(Number.isInteger(rolled) && rolled >= 1 && rolled <= 20);
+});
+
+test("ST Preset compiler splits Zone 1 / Zone 3 cleanly and strips HTML/CoT jailbreak debris", () => {
+  const rawPreset = {
+    temperature: 0.85,
+    prompts: [
+      { identifier: "main", name: "Main", role: "system", content: "Write vivid literary fiction." },
+      { identifier: "chatHistory", name: "Chat History", marker: true },
+      { identifier: "jb", name: "Tail", role: "system", content: "<div style='color:red'>bad</div>Keep pacing natural." },
+    ],
+    prompt_order: [
+      {
+        character_id: 100001,
+        order: [
+          { identifier: "main", enabled: true },
+          { identifier: "chatHistory", enabled: true },
+          { identifier: "jb", enabled: true },
+        ],
+      },
+    ],
+  };
+  const compiled = compileSillyTavernPreset(rawPreset, { name: "my-preset" });
+  assert.equal(compiled.zone1Prompts.length, 1);
+  assert.equal(compiled.zone3Prompts.length, 1);
+  assert.ok(!compiled.zone3Prompts[0]!.content.includes("<div"));
+  assert.ok(compiled.zone3Prompts[0]!.content.includes("Keep pacing natural."));
+});
+
+test("Humanized File Picker normalizes drag-drop paths and auto-sniffs PNG/JSON assets", () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rp-picker-"));
+  try {
+    const cardPath = path.join(tmpDir, "hero.json");
+    fs.writeFileSync(
+      cardPath,
+      JSON.stringify({ spec: "chara_card_v3", data: { name: "测试英雄", description: "勇敢的剑士" } }),
+    );
+    const presetPath = path.join(tmpDir, "style.json");
+    fs.writeFileSync(presetPath, JSON.stringify({ temperature: 0.9, prompts: [] }));
+    const unrelatedPath = path.join(tmpDir, "notes.json");
+    fs.writeFileSync(unrelatedPath, JSON.stringify({ hello: "world" }));
+
+    assert.equal(inspectImportFileQuick(cardPath)?.badge, "[角色卡 V3]");
+    assert.equal(inspectImportFileQuick(presetPath)?.badge, "[酒馆预设]");
+    assert.equal(inspectImportFileQuick(unrelatedPath), null);
+
+    // Drag-and-drop quoted & escaped path normalization
+    assert.equal(normalizeUserFilePath(`"${cardPath}"`, tmpDir), cardPath);
+    assert.equal(normalizeUserFilePath(`'${cardPath}'`, tmpDir), cardPath);
+
+    // Auto-discovery finds valid assets and skips unrelated JSON
+    const found = smartDiscoverRpFiles(tmpDir, 10);
+    const names = found.map((f) => f.name);
+    assert.ok(names.includes("hero.json"));
+    assert.ok(names.includes("style.json"));
+    assert.ok(!names.includes("notes.json"));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });

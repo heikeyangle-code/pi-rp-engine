@@ -4,17 +4,19 @@
  * Guarantees:
  *  - 100% verbatim preservation of `mes_example`, `system_prompt`, `post_history_instructions`, `depth_prompt`
  *    (except surgical removal of 1.0 HTML/JS/MVU frontend shells unless `rawPassthrough: true`).
- *  - Automatic MVU variable schema salvage for L1 FSM onboarding.
+ *  - Pre-sanitization MVU variable schema salvage (scans RAW card & RAW constant lore BEFORE stripping!).
+ *  - Official SillyTavern `regex_scripts` placement / markdownOnly / promptOnly / trimStrings / substituteRegex parsing.
  *  - Full transparent `ImportAuditReport`.
  */
 
 import * as crypto from "node:crypto";
-import type { CardSpecOrigin, CompiledCard, ImportAuditReport } from "../types.js";
-import { compileLoreBook } from "./lore-compiler.js";
+import type { CardSpecOrigin, CompiledCard, CompiledRegexRule, ImportAuditReport } from "../types.js";
+import { compileLoreBook, extractRawLoreEntries, isSafeRegexPattern } from "./lore-compiler.js";
 import { salvageMvuVariables } from "./mvu-salvage.js";
 import {
   deduplicateBoilerplateAcrossFields,
   isFrontendRegexScript,
+  parseStRegexString,
   sanitizeFrontendShell,
   type StrippedRecord,
 } from "./sanitizer.js";
@@ -80,7 +82,6 @@ export function compileCharacterCard(
   const rawPostHistory = asString(data.post_history_instructions);
   const rawFirstMes = asString(data.first_mes);
 
-  // Depth prompt from extensions.depth_prompt
   const rawDepthPromptObj =
     extensions.depth_prompt && typeof extensions.depth_prompt === "object"
       ? (extensions.depth_prompt as Record<string, unknown>)
@@ -91,11 +92,29 @@ export function compileCharacterCard(
   const depthPromptRole: "system" | "user" | "assistant" =
     rawDepthRole === "user" || rawDepthRole === "assistant" ? rawDepthRole : "system";
 
+  // 0. Salvage MVU / macro / YAML variables from RAW pre-sanitization content (including RAW constant lore!)
+  const rawBook =
+    data.character_book && typeof data.character_book === "object"
+      ? (data.character_book as Record<string, unknown>)
+      : null;
+  const rawConstantLoreContents = extractRawLoreEntries(rawBook)
+    .filter((entry) => Boolean(entry.constant))
+    .map((entry) => asString(entry.content))
+    .filter(Boolean);
+
+  const salvagedStateSchema = salvageMvuVariables({
+    firstMes: rawFirstMes,
+    description: rawDescription,
+    systemPrompt: rawSystemPrompt,
+    postHistory: rawPostHistory,
+    extensions,
+    rawConstantLoreContents,
+  });
+
   // 1. Surgically strip frontend HTML/JS shells while keeping 100% of narrative, mes_example, and jailbreaks
   const cleanedSystemPrompt = sanitizeField("system_prompt", rawSystemPrompt);
   const cleanedDescription = sanitizeField("description", rawDescription);
   const cleanedPersonalityRaw = sanitizeField("personality", rawPersonality);
-  // Only drop personality if literally identical to description
   const cleanedPersonality =
     !rawPassthrough && cleanedPersonalityRaw && cleanedPersonalityRaw === cleanedDescription
       ? ""
@@ -119,11 +138,7 @@ export function compileCharacterCard(
   const finalDepthContent = dedup.fields[1]!.text;
   const finalPostHistory = dedup.fields[2]!.text;
 
-  // 3. Compile embedded character_book (30+ fields + V3 @@ decorators)
-  const rawBook =
-    data.character_book && typeof data.character_book === "object"
-      ? (data.character_book as Record<string, unknown>)
-      : null;
+  // 3. Compile embedded character_book (30+ fields + full V3 @@ decorators)
   const loreBook = compileLoreBook(rawBook, {
     rawPassthrough,
     staticScan: {
@@ -138,27 +153,17 @@ export function compileCharacterCard(
 
   const constantLoreIds = loreBook.entries
     .filter((e) => e.enabled && e.constant && e.content.length > 0 && [0, 1, 5, 6].includes(e.position))
-    .sort((a, b) => a.position - b.position || b.priority - a.priority)
+    .sort((a, b) => a.position - b.position || b.priority - a.priority || a.id.localeCompare(b.id))
     .map((e) => e.id);
 
-  // 4. Salvage MVU / macro variables for L1 FSM
-  const rawConstantLoreTexts = loreBook.entries.filter((e) => e.constant).map((e) => e.content);
-  const salvagedStateSchema = salvageMvuVariables({
-    firstMes: rawFirstMes,
-    description: rawDescription,
-    systemPrompt: rawSystemPrompt,
-    postHistory: rawPostHistory,
-    extensions,
-    constantLoreContents: rawConstantLoreTexts,
-  });
-
-  // 5. Filter extensions.regex_scripts: strip frontend HTML/JS scripts, retain safe text-only display rules
-  const displayRegexRules: CompiledCard["displayRegexRules"] = [];
+  // 4. Filter extensions.regex_scripts: respect official ST placement, promptOnly, markdownOnly, trimStrings, substituteRegex
+  const displayRegexRules: CompiledRegexRule[] = [];
   if (Array.isArray(extensions.regex_scripts)) {
     for (const item of extensions.regex_scripts) {
       if (!item || typeof item !== "object") continue;
       const rec = item as Record<string, unknown>;
       if (rec.disabled === true) continue;
+
       if (isFrontendRegexScript(rec)) {
         strippedAll.push({
           field: "extensions.regex_scripts",
@@ -168,28 +173,44 @@ export function compileCharacterCard(
         });
         continue;
       }
+
+      const placements = Array.isArray(rec.placement)
+        ? rec.placement.filter((p): p is number => typeof p === "number")
+        : [2];
+      const promptOnly = Boolean(rec.promptOnly);
+      const markdownOnly = Boolean(rec.markdownOnly);
+
+      // Skip rules that never affect AI output display (e.g. USER_INPUT-only or promptOnly)
+      if (promptOnly || (placements.length > 0 && !placements.includes(2))) {
+        continue;
+      }
+
       const rawFind = asString(rec.findRegex);
       const replaceString = asString(rec.replaceString);
-      if (rawFind && rawFind.length <= 200) {
-        const m = /^\/([\s\S]+)\/([gimsuy]*)$/.exec(rawFind);
-        const pattern = m ? m[1]! : rawFind;
-        const flags = m ? m[2]! : "g";
-        try {
-          new RegExp(pattern, flags);
-          displayRegexRules.push({
-            name: asString(rec.scriptName) || "regex",
-            pattern,
-            flags,
-            replacement: replaceString,
-          });
-        } catch {
-          warnings.push(`Skipped invalid display regex script "${asString(rec.scriptName)}"`);
-        }
+      const parsedRe = parseStRegexString(rawFind);
+      if (parsedRe && isSafeRegexPattern(parsedRe.pattern)) {
+        const subRaw = typeof rec.substituteRegex === "number" ? rec.substituteRegex : 0;
+        const substituteRegex: 0 | 1 | 2 = subRaw === 1 ? 1 : subRaw === 2 ? 2 : 0;
+        displayRegexRules.push({
+          name: asString(rec.scriptName) || "regex",
+          pattern: parsedRe.pattern,
+          flags: parsedRe.flags,
+          replacement: replaceString,
+          placements,
+          trimStrings: asStringArray(rec.trimStrings),
+          substituteRegex,
+          markdownOnly,
+          promptOnly,
+          minDepth: typeof rec.minDepth === "number" ? rec.minDepth : undefined,
+          maxDepth: typeof rec.maxDepth === "number" ? rec.maxDepth : undefined,
+        });
+      } else if (rawFind) {
+        warnings.push(`跳过非法或不安全的展示正则脚本「${asString(rec.scriptName) || rawFind.slice(0, 24)}」`);
       }
     }
   }
 
-  // 6. V3 assets: keep static images, skip Web-only Live2D/VRM/Risu binaries
+  // 5. V3 assets: keep static images, skip Web-only Live2D/VRM/Risu binaries
   const assets: CompiledCard["assets"] = [];
   const skippedAssets: ImportAuditReport["skippedAssets"] = [];
   if (Array.isArray(data.assets)) {
@@ -201,7 +222,7 @@ export function compileCharacterCard(
       const ext = asString(rec.ext).toLowerCase() || "png";
       const uri = asString(rec.uri);
       if (WEB_ONLY_ASSET_TYPES.has(type) || type.startsWith("x-risu-")) {
-        skippedAssets.push({ type, name: assetName, reason: "Web-only asset type not supported in standard Pi extension" });
+        skippedAssets.push({ type, name: assetName, reason: "Web 专有资产格式，标准 Pi 扩展跳过" });
         continue;
       }
       if (uri) {

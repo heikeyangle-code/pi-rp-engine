@@ -19,11 +19,11 @@
 
 ---
 
-## 二、标准仓库与扩展目录规划（后续开工直接按此落盘）
+## 二、实际代码目录结构（v2 完整落盘）
 
 ```text
 pi-rp-engine/
-├── package.json                     # 标准 Pi 扩展包声明（零重型原生依赖，纯 TS/ESM）
+├── package.json                     # 标准 Pi 扩展包声明（零运行时依赖，纯 TS/ESM）
 ├── tsconfig.json
 ├── README.md
 ├── docs/
@@ -32,76 +32,53 @@ pi-rp-engine/
 │   ├── 03-PI-EXTENSION-DESIGN.md
 │   └── 04-CARD-COMPATIBILITY-AND-MILESTONES.md
 ├── src/
-│   ├── index.ts                     # Pi 扩展唯一入口：注册钩子、5 个静态工具、/rp 命令与渲染器
-│   ├── types.ts                     # 全量 TS 数据结构与事务事件类型
+│   ├── index.ts                     # Pi 扩展唯一入口：严格单会话生命周期、全部 Hook、6 工具、渲染器与 10 快捷键
+│   ├── types.ts                     # 全量 TS 数据结构、Pi SDK 1.6.1 结构化契约与事务事件类型
 │   ├── parser/
-│   │   ├── unpack.ts                # PNG (ccv3 > chara) / .charx (Zip-Slip安全解压) / JSON 嗅探
-│   │   ├── sanitizer.ts             # 前端壳外科剥离 + 重复防越权合并（严禁删 mes_example/破甲）
-│   │   ├── mvu-salvage.ts           # MVU / 宏变量 Schema 自动抢救提取器
-│   │   ├── lore-compiler.ts         # 30+ 世界书字段 + V3 @@ Decorators 编译为门禁知识库
-│   │   └── macros.ts                # 宏替换与安全求值
+│   │   ├── unpack.ts                # PNG (ccv3 > chara) / .charx (Zip-Slip安全解压) / JSON 嗅探 + 快速文件分类器
+│   │   ├── card-compiler.ts         # 端到端 V1/V2/V3/.charx 编译器（剥离前打捞 MVU + 完整 regex_scripts）
+│   │   ├── sanitizer.ts             # 平衡深度 HTML 状态栏剥离 + 重复防越权合并 + ST AI_OUTPUT 展示正则引擎
+│   │   ├── mvu-salvage.ts           # MVU / _.set(k,v,min,max) / YAML InitVar / 宏变量抢救提取器
+│   │   ├── lore-compiler.ts         # 30+ 世界书字段 + 全套 CCV3 @@/@@@ 装饰器 + 独立 excludeKeys 编译
+│   │   ├── preset.ts                # SillyTavern OpenAI/Chat Completion Preset 三区编译器
+│   │   └── macros.ts                # SillyTavern 宏引擎（含 random/pick/trim/outlet/roll/persona/group）
 │   ├── engine/
-│   │   ├── state-replay.ts          # 从 Pi 会话树 branch 确定性重放 L1 世界状态（Event Sourcing）
-│   │   ├── cfsm.ts                  # 通用 CFSM / CPFSM 状态机与数值边界校验器
-│   │   ├── gates.ts                 # EraGate 物理隔离 + Epistemic 认知域过滤
-│   │   ├── dice.ts                  # 确定性/真随机 XdY 检定引擎
-│   │   └── settlement.ts            # 回合后结算（纯代码 + 可选 sidecar-light binary_q / 事实抽取）
+│   │   ├── state-replay.ts          # 严格单会话分支事件溯源重放 + 消息指纹生成器
+│   │   ├── cfsm.ts                  # 通用 CFSM 状态机与数值/背包上下界强校验器
+│   │   ├── gates.ts                 # EraGate 物理隔离 + FANToM 认知域过滤
+│   │   ├── dice.ts                  # crypto.randomInt 掷骰引擎（支持 d20 简写、2d20kh1 优势、2d20kl1 劣势）
+│   │   └── settlement.ts            # 工具中间步过滤 + 确定性 turn_end 结算 + 零首字延迟 sidecar-light
 │   ├── memory/
 │   │   ├── bitemporal.ts            # 双时态事实账本 + 非破坏性失效（Graphiti 模式）
 │   │   ├── foresight.ts             # 伏笔 / 进度时钟 / 契诃夫之枪管理（EverMemOS 模式）
-│   │   ├── graph-ppr.ts             # 零依赖本地 BM25 + 实体别名图 + 2 跳 PPR 联想召回（HippoRAG 2）
-│   │   └── compaction.ts            # session_before_compact 幕间 MemScene 归并器
+│   │   ├── graph-ppr.ts             # 零依赖本地 BM25 + 行内正则 + 2 跳 PPR 联想召回（HippoRAG 2）
+│   │   └── compaction.ts            # session_before_compact 幕间 MemScene 归并器（合规 CompactionResult）
 │   ├── context/
-│   │   ├── zone-builder.ts          # Zone 1 冻结前缀 + Zone 3 瞬态尾部帧确定性装配器
+│   │   ├── zone-builder.ts          # Zone 1 冻结前缀（含位置常驻世界书/静态 outlet）+ Zone 3 瞬态尾部帧
 │   │   └── token-budget.ts          # 中英混合 Token 估算与优先级预算裁剪器
 │   ├── storage/
-│   │   └── workspace-store.ts       # 项目级 .pi/rp/ 与共享角色库读写（双模式绑定解析）
+│   │   └── workspace-store.ts       # 纯被动素材库管理（全局 rp-library 与项目 .pi/rp/，绝不跨会话自动激活）
 │   ├── tools/
-│   │   └── rp-tools.ts              # 6 个静态工具实现（含按需 rp_npc_deliberate）+ 官方 renderCall / renderResult
+│   │   └── rp-tools.ts              # 6 个静态工具（defaultActive: false）+ 编辑感 renderCall / renderResult 微卡
 │   └── ui/
-│       ├── hud.ts                   # 官方 setStatus / setWidget 紧凑状态与进度时钟面板
-│       ├── dashboard.ts             # 官方 ctx.ui.custom 交互式总控台（状态/世界书/事实/伏笔）
-│       ├── commands.ts              # /rp 单入口菜单 + 短子命令 + 参数自动补全 + 导入审计报告
-│       └── actions.ts               # 开场白/Persona/导演便签/续写/行动灵感(setEditorText)/OOC/楼层屏蔽/书签回档
+│       ├── renderers.ts             # 细线框编辑感 TUI 卡片渲染器（rp:greeting/event/ooc/era）+ 进度条 + CJK 折行
+│       ├── hud.ts                   # 官方 setStatus / setWidget 精致状态栏与完整可视化仪表条
+│       ├── file-picker.ts           # 交互式文件浏览器（自动扫描 Downloads/工作区 + 资产类型嗅探 + 批量导入）
+│       ├── dashboard.ts             # `/rp panel` 交互总控台（世界总览/实时状态编辑/世界书开关/事实信念/时钟伏笔）
+│       ├── actions.ts               # 全部人性化交互流程（快速开局/掷骰器/书签跳转分叉/指纹隐藏/彻底退出）
+│       ├── commands.ts              # `/rp` 分类主菜单 + 短子命令 + 智能自动补全
+│       └── shortcuts.ts             # 10 组防终端冲突快捷键注册与休眠态保护
 └── test/
-    ├── parser.test.ts               # V1/V2/V3 PNG + .charx + 独立 Lorebook + 保真红线单测
-    ├── sanitizer.test.ts            # 验证 mes_example/破甲 0 丢失 + 前端 HTML/MVU 精准剥离
-    ├── replay-branch.test.ts        # 会话树分叉/回溯状态 100% 一致性测试
-    ├── kv-cache-invariants.test.ts  # 验证 Zone 1 字节级冻结 & Zone 2 零回改（KV Cache 守卫！）
-    ├── gates-epistemic.test.ts      # 时代物理隔离与多角色认知盲区防穿帮测试
-    └── graph-ppr.test.ts            # 代词/多跳联想召回 + sticky/cooldown/selectiveLogic 矩阵测试
+    ├── parser.test.ts               # PNG/CHARX/嵌套HTML/剥离前MVU打捞/CCV3装饰器/ST宏/正则/文件嗅探器单测
+    └── engine.test.ts               # 单会话隔离/彻底退出/工具步防重计/行内正则PPR/KV不变性/Pi SDK 契约全套单测
 ```
 
 ---
 
-## 三、分阶段施工路线与硬性验收标准
+## 三、v2 验收标准（已全部自动化测试通过）
 
-### Phase 0 · 骨架与契约守卫（1–2 天）
-- 搭建标准 Pi 扩展工程、`node:test` 测试框架与 `src/types.ts`；
-- 实现「非 RP 项目/会话 100% 静默休眠」守卫（工具 `defaultActive: false`、0 UI、0 上下文改动）；
-- **验收**：挂载到真实 Pi SDK / `pi-android` 后，打开普通代码项目零感知。
+1. **单会话严格隔离与彻底退出**：项目 `.pi/rp/` 存在角色卡时，新建会话 100% 休眠；`/rp exit` 后编程工具、HUD、上下文钩子全部复原清零；重新绑定新卡不残留旧数值。
+2. **解析保真红线**：`mes_example` 字符保留率 **100%**；嵌套 `<div>` 状态栏剥离后零残余标签；常驻世界书 YAML / `_.set(k, v, min, max)` 在剥离前 100% 打捞成功；`@@exclude_keys` 不破坏 `selectiveLogic`。
+3. **KV-Cache 零碎裂**：连续 20 轮含状态变更、信念更新、节奏切换、中途换人设，Zone 1 字节 100% 一致；历史消息不回改，楼层隐藏通过消息指纹可靠生效。
+4. **官方 Pi SDK 1.6.1+ 契约**：`turn_end` 自动跳过工具中间步；`session_before_compact` 返回完整 `{ summary, firstKeptEntryId, tokensBefore, details }`；`/rp goto` 通过 `sessionManager.getLabel(id)` 解析书签；6 工具 + 4 渲染器 + 10 快捷键全部就绪。
 
-### Phase 1 · 无损保真 V1/V2/V3 角色卡与世界书编译器（3–4 天）
-- 完成 PNG（`ccv3 > chara`）、`.charx`（Zip-Slip 安全解包 + `embeded://` 重写）、独立 JSON 世界书解析；
-- 完成 `FrontendSanitizer`（仅剥前端壳）、`DuplicateRuleMerger`（仅合并重复防越权）、`MvuSchemaSalvager`（变量 Schema 抢救）、30+ 世界书字段 & V3 `@@` Decorators 编译；
-- **硬性验收**：
-  - 跑真实社区复杂卡（含厚重 `mes_example`、破甲、`depth_prompt`、MVU 状态栏、100+ 词条世界书）；
-  - 断言 `mes_example` 字符保留率 **100%**、破甲与非重复写作指令保留率 **100%**、前端 `<script>`/`<style>`/HTML 状态栏残留 **0%**。
-
-### Phase 2 · L1 确定性世界引擎 + 会话树事件溯源 + 三区 KV-Cache 管线（4–5 天）
-- 实现 `rp:tx` / `rp:bind` / `rp:persona` / `rp:note` / `rp:hide` / `rp:cast` 事件溯源重放（真实 Pi 1.6.1 `session_start(reason)` + `session_tree`）；
-- 实现 `CfsmMachine`、多尺度时钟、进度时钟、双时态事实账本、Foresight 伏笔队列、`EraGate` 物理门禁；
-- 实现 `before_agent_start`（Zone 1 冻结并隔离编程系统提示词）+ `input`（OOC 通道）+ `context`（楼层屏蔽 + Zone 3 瞬态尾部帧）+ 6 个静态工具与叙事卡片渲染；
-- **硬性验收**：
-  - **KV-Cache 字节不变性测试**：连续 20 轮对话中，Zone 1 哈希 100% 相同、历史消息 `messages[0..t-1]` 字节 100% 不被篡改；
-  - **分支回滚测试**：第 20 轮回溯到第 8 轮分叉，HP/背包/时代锁/双时态事实/sticky 计数全部精确回到第 8 轮状态；
-  - **门禁物理隔离测试**：Act I 期间，Act II 设定与未解锁秘密在组装给模型的最终 payload 中出现次数严格为 `0`。
-
-### Phase 3 · 本地 HippoRAG PPR 联想召回 + 幕间归并 + 可选 `sidecar-light` 结算（3–4 天）
-- 实现零外部依赖本地 BM25 + 实体别名邻接图 + 2 跳 PPR 召回器（单次召回 < 5ms）；
-- 实现 `session_before_compact` 幕间 MemScene 归并与 `/rp montage` 跨时间推进；
-- 实现回合后 3 档结算模式（`off` / `tool-assisted` / 挂载 `agent_settled` 的零延迟 `sidecar-light`）与按需视角隔离工具 `rp_npc_deliberate`（均直用 `ctx.modelRegistry.complete()`，复用已有凭证）。
-
-### Phase 4 · 100% 官方 Pi UI 打磨与桌面/手机双端实机联调（2–3 天）
-- 完成 `setStatus`、`setWidget`、`ctx.ui.custom` 总控台、`registerMarkdownTransformer` 正文净化、单入口 `/rp` 交互菜单 + 11 项实战功能与导入审计报告界面；
-- 同时在 **桌面端官方 `pi` CLI/TUI** 与 **手机端 `pi-android`** 真机实测 7 类代表性角色卡（检验窄屏折行、深浅 12 主题可读性、长会话流畅度与 KV Cache 命中统计）。
