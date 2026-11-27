@@ -57,11 +57,12 @@ pi-rp-engine/
 │   ├── storage/
 │   │   └── workspace-store.ts       # 项目级 .pi/rp/ 与共享角色库读写（双模式绑定解析）
 │   ├── tools/
-│   │   └── rp-tools.ts              # 5 个静态工具实现 + 官方 renderCall / renderResult 叙事卡
+│   │   └── rp-tools.ts              # 6 个静态工具实现（含按需 rp_npc_deliberate）+ 官方 renderCall / renderResult
 │   └── ui/
 │       ├── hud.ts                   # 官方 setStatus / setWidget 紧凑状态与进度时钟面板
 │       ├── dashboard.ts             # 官方 ctx.ui.custom 交互式总控台（状态/世界书/事实/伏笔）
-│       └── commands.ts              # /rp 命令家族 + 参数自动补全 + 导入审计报告交互
+│       ├── commands.ts              # /rp 单入口菜单 + 短子命令 + 参数自动补全 + 导入审计报告
+│       └── actions.ts               # 开场白/Persona/导演便签/续写/行动灵感(setEditorText)/OOC/楼层屏蔽/书签回档
 └── test/
     ├── parser.test.ts               # V1/V2/V3 PNG + .charx + 独立 Lorebook + 保真红线单测
     ├── sanitizer.test.ts            # 验证 mes_example/破甲 0 丢失 + 前端 HTML/MVU 精准剥离
@@ -88,9 +89,9 @@ pi-rp-engine/
   - 断言 `mes_example` 字符保留率 **100%**、破甲与非重复写作指令保留率 **100%**、前端 `<script>`/`<style>`/HTML 状态栏残留 **0%**。
 
 ### Phase 2 · L1 确定性世界引擎 + 会话树事件溯源 + 三区 KV-Cache 管线（4–5 天）
-- 实现 `rp:tx` 事件溯源重放（`session_start` / `session_switch` / `session_fork` / `session_tree`）；
+- 实现 `rp:tx` / `rp:bind` / `rp:persona` / `rp:note` / `rp:hide` / `rp:cast` 事件溯源重放（真实 Pi 1.6.1 `session_start(reason)` + `session_tree`）；
 - 实现 `CfsmMachine`、多尺度时钟、进度时钟、双时态事实账本、Foresight 伏笔队列、`EraGate` 物理门禁；
-- 实现 `before_agent_start`（Zone 1 冻结）+ `context`（Zone 3 瞬态尾部帧）+ 5 个静态工具与叙事卡片渲染；
+- 实现 `before_agent_start`（Zone 1 冻结并隔离编程系统提示词）+ `input`（OOC 通道）+ `context`（楼层屏蔽 + Zone 3 瞬态尾部帧）+ 6 个静态工具与叙事卡片渲染；
 - **硬性验收**：
   - **KV-Cache 字节不变性测试**：连续 20 轮对话中，Zone 1 哈希 100% 相同、历史消息 `messages[0..t-1]` 字节 100% 不被篡改；
   - **分支回滚测试**：第 20 轮回溯到第 8 轮分叉，HP/背包/时代锁/双时态事实/sticky 计数全部精确回到第 8 轮状态；
@@ -99,8 +100,8 @@ pi-rp-engine/
 ### Phase 3 · 本地 HippoRAG PPR 联想召回 + 幕间归并 + 可选 `sidecar-light` 结算（3–4 天）
 - 实现零外部依赖本地 BM25 + 实体别名邻接图 + 2 跳 PPR 召回器（单次召回 < 5ms）；
 - 实现 `session_before_compact` 幕间 MemScene 归并与 `/rp montage` 跨时间推进；
-- 实现回合后 3 档结算模式（`off` / `tool-assisted` / `sidecar-light` 轻量 `binary_q` 与事实抽取）。
+- 实现回合后 3 档结算模式（`off` / `tool-assisted` / 挂载 `agent_settled` 的零延迟 `sidecar-light`）与按需视角隔离工具 `rp_npc_deliberate`（均直用 `ctx.modelRegistry.complete()`，复用已有凭证）。
 
 ### Phase 4 · 100% 官方 Pi UI 打磨与桌面/手机双端实机联调（2–3 天）
-- 完成 `setStatus`、`setWidget`、`ctx.ui.custom` 总控台、`/rp` 命令补全与导入审计报告界面；
+- 完成 `setStatus`、`setWidget`、`ctx.ui.custom` 总控台、`registerMarkdownTransformer` 正文净化、单入口 `/rp` 交互菜单 + 11 项实战功能与导入审计报告界面；
 - 同时在 **桌面端官方 `pi` CLI/TUI** 与 **手机端 `pi-android`** 真机实测 7 类代表性角色卡（检验窄屏折行、深浅 12 主题可读性、长会话流畅度与 KV Cache 命中统计）。
