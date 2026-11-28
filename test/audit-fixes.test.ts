@@ -1,3 +1,5 @@
+import { stripInlineDeltaStreaming } from "../src/engine/inline-delta.js";
+import { propagateSecretsOnScene } from "../src/engine/world-sim.js";
 import { extractInlineDelta, parseAndValidateInlineDelta } from "../src/engine/inline-delta.js";
 import { maybeBuildAutoSceneChapter } from "../src/memory/compaction.js";
 import { resolveCanonicalStatKey } from "../src/engine/cfsm.js";
@@ -742,4 +744,67 @@ test("v6-single-model: Primary era calendar math, [[RP_DELTA]] zero-RTT sync, Au
   const z3 = buildZone3TransientTail({ card, state: st, recalledLore: [], recentText: "运河码头 提灯先生 夜袭" });
   assert.ok(z3.includes("[STORYLET READY id=\"st_dock_ambush\"]"), "Soft-hybrid storylet must fire organically");
   assert.ok(z3.includes("[CONSEQUENCE ECHO id="), "Consequence echo must surface when entity re-enters");
+});
+
+test("v6.5-pure-text-world-sim: Spatial Graph, NPC Commitments, Rumor Propagation, Faction Heat, Encounter Frame, Chinese Fictional Era & Streaming Delta Hide", () => {
+  // 1. Universal fictional calendar with Chinese numerals
+  const fic = computeCalendarAnchor("星历九百二十年秋", 15, 0);
+  assert.ok(fic);
+  assert.equal(fic!.targetYear, 935);
+
+  // 2. Streaming-safe [[RP_DELTA]] stripper hides both full blocks and partial opening prefixes
+  assert.equal(stripInlineDeltaStreaming("雨落青石。\n[[RP_DEL"), "雨落青石。");
+  assert.equal(stripInlineDeltaStreaming("雨落青石。\n[[RP_DELTA]]\nloc: 渡口\n[[/RP_DELTA]]"), "雨落青石。");
+
+  // 3. Spatial graph auto-edge + route + commitment + faction + encounter via [[RP_DELTA]]
+  const st = createInitialRpState();
+  st.active = true;
+  st.turn = 10;
+  applyRpTx(st, { kind: "location_set", location: "河神庙", presentNpcs: ["柳春娘"] });
+  applyRpTx(st, { kind: "location_set", location: "北门集市", presentNpcs: ["疤脸河兵", "提灯先生"] });
+  assert.equal(Object.keys(st.locationGraph).length, 1, "Moving between places must auto-record spatial edge");
+
+  const deltaBlock = [
+    "route: 北门集市 <-> 运河码头 | 一刻钟",
+    "promise: 柳春娘 -> player: 三日后子时交接药方 | due: T10",
+    "faction: 漕运帮 standing=-60 heat=+4 | 暗中排查",
+    "encounter: 码头夜战 | stakes=逃脱押船 | 提灯先生(高台), 疤脸河兵(近身)",
+  ].join("\n");
+  const parsed = parseAndValidateInlineDelta(deltaBlock, st);
+  for (const tx of parsed.txs) applyRpTx(st, tx);
+  assert.equal(Object.keys(st.locationGraph).length, 2);
+  assert.equal(st.commitments.size, 1);
+  assert.equal(st.factions["漕运帮"]?.heat, 4);
+  assert.equal(st.encounter?.title, "码头夜战");
+
+  // 4. Dynamic Rumor / Epistemic Propagation among bonded present NPCs (never leaks player-only secrets!)
+  applyRpTx(st, {
+    kind: "pair_bond_upsert",
+    bond: { id: "疤脸河兵::提灯先生", actorA: "疤脸河兵", actorB: "提灯先生", stance: "上下级", tension: 40, note: "同伙", updatedTurn: 5 },
+  });
+  applyRpTx(st, {
+    kind: "fact_add",
+    fact: { id: "f_gossip", statement: "主角藏了运河暗账", entities: ["暗账"], witnessIds: ["疤脸河兵"], validFromTurn: 5, validUntilTurn: null },
+  });
+  applyRpTx(st, {
+    kind: "fact_add",
+    fact: { id: "f_player_only", statement: "主角贴身藏着一枚暗器", entities: ["暗器"], witnessIds: ["player"], validFromTurn: 5, validUntilTurn: null },
+  });
+  const spreadCount = propagateSecretsOnScene(st, (tx) => applyRpTx(st, tx));
+  assert.equal(spreadCount, 1);
+  assert.ok((st.facts.get("f_gossip")?.witnessIds as string[]).includes("提灯先生"));
+  assert.deepEqual(st.facts.get("f_player_only")?.witnessIds, ["player"]);
+
+  // 5. Zone 3 injects adjacentRoutes, Commitment Due, Faction Pressure & Encounter Frame
+  const card = compileCharacterCard(
+    { spec: "chara_card_v2", data: { name: "柳春娘", description: "运河游医", scenario: "北门集市", first_mes: "请坐。" } },
+    "v2",
+  );
+  const z3 = buildZone3TransientTail({ card, state: st, recalledLore: [], recentText: "码头" });
+  assert.ok(z3.includes("adjacentRoutes"));
+  assert.ok(z3.includes("河神庙"));
+  assert.ok(z3.includes("运河码头(一刻钟)"));
+  assert.ok(z3.includes("[COMMITMENT DUE"));
+  assert.ok(z3.includes("[FACTION PRESSURE]"));
+  assert.ok(z3.includes("<rp_encounter>"));
 });

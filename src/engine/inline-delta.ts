@@ -15,6 +15,7 @@ import {
   validateInventoryPatch,
 } from "./cfsm.js";
 import { canonicalizeActorName, isNonCharacterEntity, sanitizeNpcList } from "./entity-hygiene.js";
+import { makeRouteId, normalizePlaceName } from "./world-sim.js";
 
 const DELTA_OPEN_RE = /\[\[RP_DELTA\]\]/i;
 const DELTA_FULL_RE = /\[\[RP_DELTA\]\]([\s\S]*?)(?:\[\[\/RP_DELTA\]\]|$)/gi;
@@ -43,6 +44,14 @@ export function extractInlineDelta(text: string): ExtractedInlineDelta {
 export function stripInlineDelta(text: string): string {
   if (!text || !DELTA_OPEN_RE.test(text)) return text;
   return text.replace(DELTA_FULL_RE, "").trimEnd();
+}
+
+/** Streaming-safe stripper: hides complete [[RP_DELTA]] blocks AND any partial trailing `[[RP_DEL...` prefix. */
+export function stripInlineDeltaStreaming(text: string): string {
+  if (!text) return text;
+  let out = stripInlineDelta(text);
+  out = out.replace(/\n*\[(?:\[(?:R(?:P(?:_(?:D(?:E(?:L(?:T(?:A(?:\](?:\])?)?)?)?)?)?)?)?)?)?)?$/i, "");
+  return out;
 }
 
 export interface ParsedDeltaResult {
@@ -354,6 +363,137 @@ export function parseAndValidateInlineDelta(
         txs.push({ kind: "consequence_upsert", echo: { ...existing, status: "resolved", echoedTurn: state.turn } });
         applied.push(`echo_done:${val}`);
       }
+      continue;
+    }
+
+    if (key === "route" || key === "map") {
+      const [edgePart, travelPart] = val.split("|").map((s) => s.trim());
+      const oneWay = !edgePart?.includes("<->") && !edgePart?.includes("↔");
+      const nodes = (edgePart ?? "").split(/(?:<->|↔|->|→)/).map((s) => normalizePlaceName(s));
+      if (nodes.length >= 2 && nodes[0] && nodes[1]) {
+        const rid = makeRouteId(nodes[0], nodes[1]);
+        txs.push({
+          kind: "route_upsert",
+          edge: { id: rid, from: nodes[0], to: nodes[1], travelNote: travelPart || undefined, oneWay, discoveredTurn: state.turn },
+        });
+        applied.push(`route:${nodes[0]}↔${nodes[1]}`);
+      }
+      continue;
+    }
+
+    if (key === "promise" || key === "commitment") {
+      const m = /^(.+?)\s*(?:->|→)\s*(.+?)\s*[:：]\s*(.+)$/.exec(val);
+      if (!m) continue;
+      const actor = canonicalizeActorName(m[1]!.trim(), hctx);
+      if (!actor || isNonCharacterEntity(actor, hctx)) continue;
+      const target = m[2]!.trim();
+      const [promiseText, duePart] = m[3]!.split("|").map((s) => s.trim());
+      if (!promiseText) continue;
+      let dueTurn: number | undefined;
+      let dueLabel: string | undefined;
+      if (duePart) {
+        const tm = /T?(\d+)/i.exec(duePart);
+        if (tm) dueTurn = Number(tm[1]);
+        dueLabel = duePart.replace(/^due[:：]\s*/i, "").trim();
+      }
+      const id = `prom_t${state.turn}_d${txs.length}`;
+      txs.push({
+        kind: "commitment_upsert",
+        commitment: { id, actor, target, promise: promiseText, dueTurn, dueLabel, createdTurn: state.turn, status: "active" },
+      });
+      applied.push(`promise:${actor}`);
+      continue;
+    }
+
+    if (key === "promise_done" || key === "promise_broken") {
+      const existing = state.commitments.get(val);
+      if (existing && existing.status === "active") {
+        txs.push({
+          kind: "commitment_upsert",
+          commitment: { ...existing, status: key === "promise_done" ? "fulfilled" : "broken" },
+        });
+        applied.push(`${key}:${val}`);
+      }
+      continue;
+    }
+
+    if (key === "spread" || key === "rumor") {
+      const m = /^([^\s->→]+)\s*(?:->|→)\s*(.+)$/.exec(val);
+      if (m && state.facts.has(m[1]!.trim())) {
+        const newWitnesses = m[2]!.split(/[,，、]/).map((s) => s.trim()).filter(Boolean);
+        if (newWitnesses.length > 0) {
+          txs.push({ kind: "fact_spread", factId: m[1]!.trim(), newWitnesses, via: "inline_delta" });
+          applied.push(`spread:${m[1]!.trim()}`);
+        }
+      }
+      continue;
+    }
+
+    if (key === "faction") {
+      const [head, note] = val.split("|").map((s) => s.trim());
+      const nameMatch = /^([^\s]+)(.*)$/.exec(head ?? "");
+      if (!nameMatch) continue;
+      const name = nameMatch[1]!.trim();
+      const rest = nameMatch[2] ?? "";
+      const prev = state.factions[name];
+      let standing = prev?.standing ?? 0;
+      let heat = prev?.heat ?? 0;
+      const stM = /standing\s*=\s*([+-]?)(\d+)/i.exec(rest);
+      if (stM) {
+        const n = Number(stM[2]);
+        standing = stM[1] === "+" ? standing + n : stM[1] === "-" ? (prev ? standing - n : -n) : n;
+      }
+      const htM = /heat\s*=\s*([+-]?)(\d+)/i.exec(rest);
+      if (htM) {
+        const n = Number(htM[2]);
+        heat = htM[1] === "+" ? heat + n : htM[1] === "-" ? heat - n : n;
+      }
+      const stance = standing <= -50 ? "敌对" : standing <= -15 ? "戒备" : standing >= 50 ? "盟友" : standing >= 15 ? "友善" : "中立";
+      txs.push({
+        kind: "faction_upsert",
+        faction: { name, standing, heat, stance, note: note || prev?.note, updatedTurn: state.turn },
+      });
+      applied.push(`faction:${name}`);
+      continue;
+    }
+
+    if (key === "encounter") {
+      if (/^(?:end|off|none|结束)$/i.test(val)) {
+        txs.push({ kind: "encounter_set", encounter: null });
+        applied.push("encounter:end");
+        continue;
+      }
+      const parts = val.split("|").map((s) => s.trim()).filter(Boolean);
+      const title = parts[0] || "遭遇战";
+      let stakes = state.encounter?.stakes ?? "";
+      const combatants: Array<{ name: string; position?: string; status?: string }> = [];
+      for (const p of parts.slice(1)) {
+        if (/^stakes\s*=/i.test(p)) {
+          stakes = p.replace(/^stakes\s*=/i, "").trim();
+        } else {
+          for (const item of p.split(/[,，、]/).map((s) => s.trim()).filter(Boolean)) {
+            const cm = /^([^（(]+?)(?:[（(]([^）)]+)[）)])?$/.exec(item);
+            if (cm) combatants.push({ name: cm[1]!.trim(), position: cm[2]?.trim() });
+          }
+        }
+      }
+      txs.push({
+        kind: "encounter_set",
+        encounter: {
+          title,
+          stakes,
+          round: state.encounter?.title === title ? state.encounter.round : 1,
+          combatants: combatants.length > 0 ? combatants : (state.encounter?.combatants ?? []),
+          startedTurn: state.encounter?.startedTurn ?? state.turn,
+        },
+      });
+      applied.push(`encounter:${title}`);
+      continue;
+    }
+
+    if (key === "encounter_end") {
+      txs.push({ kind: "encounter_set", encounter: null });
+      applied.push("encounter:end");
       continue;
     }
 

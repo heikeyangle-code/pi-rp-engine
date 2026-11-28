@@ -11,6 +11,7 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { stripInlineDelta } from "../engine/inline-delta.js";
 import type {
   CompiledCard,
   CompiledLoreEntry,
@@ -3643,7 +3644,7 @@ export async function actionExportNovel(rt: RpRuntimeHandle, ctx: PiExtensionCon
     if (m.customType === "rp:ooc" || m.customType === "rp:event") continue;
     const fp = computeMessageFingerprint(m);
     if (state.hiddenEntryIds.has(e.id) || state.hiddenFingerprints.has(fp)) continue;
-    const txt = extractMsgPlain(m).trim();
+    const txt = stripInlineDelta(extractMsgPlain(m)).trim();
     if (!txt || txt.startsWith("[OOC")) continue;
 
     if (m.customType === "rp:era") {

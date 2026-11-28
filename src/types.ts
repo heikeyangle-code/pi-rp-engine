@@ -683,6 +683,48 @@ export interface ConsequenceEcho {
   echoedTurn?: number;
 }
 
+/** Spatial Memory Graph edge connecting two visited/known locations (LLM-MapRepair). */
+export interface LocationEdge {
+  id: string;
+  from: string;
+  to: string;
+  travelNote?: string;
+  oneWay?: boolean;
+  discoveredTurn: number;
+}
+
+/** Explicit NPC commitment / promise ledger so NPCs never forget what they promised. */
+export interface NpcCommitment {
+  id: string;
+  actor: string;
+  target: string;
+  promise: string;
+  dueTurn?: number;
+  dueLabel?: string;
+  createdTurn: number;
+  status: "active" | "fulfilled" | "broken";
+}
+
+/** Faction standing & Blades-in-the-Dark Heat tracker. */
+export interface FactionStanding {
+  name: string;
+  standing: number; // -100 to +100
+  heat: number;     // 0 to 6
+  stance: string;
+  note?: string;
+  updatedTurn: number;
+  lastPressureTurn?: number;
+}
+
+/** Lightweight pure-text tactical encounter state (only active during clashes/chases). */
+export interface ActiveEncounter {
+  title: string;
+  stakes: string;
+  round: number;
+  combatants: Array<{ name: string; position?: string; status?: string }>;
+  startedTurn: number;
+}
+
 export interface DirectorNote {
   id: string;
   text: string;
@@ -873,6 +915,11 @@ export type RpTxEntry =
   | { kind: "storylet_delete"; storyletId: string }
   | { kind: "foresight_upsert"; hook: ForesightHook }
   | { kind: "consequence_upsert"; echo: ConsequenceEcho }
+  | { kind: "route_upsert"; edge: LocationEdge }
+  | { kind: "commitment_upsert"; commitment: NpcCommitment }
+  | { kind: "faction_upsert"; faction: FactionStanding }
+  | { kind: "fact_spread"; factId: string; newWitnesses: string[]; via?: string }
+  | { kind: "encounter_set"; encounter: ActiveEncounter | null }
   | {
       kind: "era_advance";
       fromEra: string;
@@ -952,6 +999,10 @@ export interface SessionRpState {
   foresights: Map<string, ForesightHook>;
   consequences: Map<string, ConsequenceEcho>;
   objectiveUpdatedTurn: number;
+  locationGraph: Record<string, LocationEdge>;
+  commitments: Map<string, NpcCommitment>;
+  factions: Record<string, FactionStanding>;
+  encounter: ActiveEncounter | null;
   notes: DirectorNote[];
   hiddenEntryIds: Set<string>;
   hiddenFingerprints: Set<string>;

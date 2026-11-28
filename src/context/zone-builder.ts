@@ -36,6 +36,12 @@ import { computeMessageFingerprint } from "../engine/state-replay.js";
 import { selectFactsForZone3 } from "../memory/bitemporal.js";
 import { evaluateGate, partitionEpistemicFacts } from "../engine/gates.js";
 import { selectActiveForesights } from "../memory/foresight.js";
+import {
+  formatEncounterFrame,
+  formatLocalTopology,
+  selectDueCommitments,
+  selectFactionPressures,
+} from "../engine/world-sim.js";
 import { selectRelevantBeliefs } from "../memory/graph-ppr.js";
 import { detectRepeatedCliches, detectRuntimeSlop, type NarrativeHealthReport } from "../engine/stagnation.js";
 import { estimateTokens } from "./token-budget.js";
@@ -101,7 +107,7 @@ function buildEngineProtocol(activeToolNames?: string[]): string {
   }
   if (hasWriteTools) {
     lines.push(
-      "- Prose-first zero-interruption sync: Write uninterrupted literary prose FIRST. Whenever location, present NPCs, time, stage, scene objective, stats, items, flags, clocks, facts, beliefs, foresights, physical state, or major choice consequences change, append a compact `[[RP_DELTA]]...[[/RP_DELTA]]` block at the very end (stripped from display; omit on pure banter turns). Keys: `loc: 地点 | NPC1, NPC2`, `time:`, `stage:`, `obj:`, `stat: 角色.键 +N`, `inv: player.物 ±N`, `flag: 键=true`, `clock: ID +1`, `storylet_done: ID`, `fact: 内容 [witness: ...]`, `fact_off: ID`, `belief: A->B: 信念 | 诱因`, `hook: 伏笔 | 提示`, `hook_done: ID`, `echo: 选择 -> 潜在后果 [weight: high]`, `phys: 角色 | outfit=... | pose=... | held=...`.",
+      "- Prose-first zero-interruption sync: Write uninterrupted literary prose FIRST. Whenever location, present NPCs, time, stage, scene objective, stats, items, flags, clocks, facts, beliefs, foresights, physical state, or major choice consequences change, append a compact `[[RP_DELTA]]...[[/RP_DELTA]]` block at the very end (stripped from display; omit on pure banter turns). Keys: `loc: 地点 | NPC1, NPC2`, `time:`, `stage:`, `obj:`, `stat: 角色.键 +N`, `inv: player.物 ±N`, `flag: 键=true`, `clock: ID +1`, `storylet_done: ID`, `fact: 内容 [witness: ...]`, `fact_off: ID`, `belief: A->B: 信念 | 诱因`, `hook: 伏笔 | 提示`, `hook_done: ID`, `echo: 选择 -> 潜在后果 [weight: high]`, `promise: A->B: 承诺 | due: TN`, `route: 地A<->地B | 耗时`, `faction: 势力 standing=±N heat=+1`, `spread: factID -> NPC`, `encounter: 名称 | stakes=...` / `encounter_end`, `phys: 角色 | outfit=... | pose=... | held=...`.",
     );
   }
   if (!hasWriteTools) {
@@ -429,6 +435,7 @@ export function buildZone3TransientTail(options: {
     turn: state.turn,
     time: state.worldTimeLabel || undefined,
     location: state.location || undefined,
+    adjacentRoutes: formatLocalTopology(state) || undefined,
     objective: state.sceneObjective || undefined,
     presentNpcs: state.presentNpcs.length > 0 ? state.presentNpcs : undefined,
     milestones: sortedMilestones.length > 0 ? sortedMilestones : undefined,
@@ -578,11 +585,25 @@ export function buildZone3TransientTail(options: {
       dramaBeats.push(`[DEEP BOND] ${pb.actorA} ↔ ${pb.actorB} (${pb.stance}, tension +${pb.tension}) strongly influences their loyalties.`);
     }
   }
+  for (const prom of selectDueCommitments(state)) {
+    dramaBeats.push(
+      `[COMMITMENT DUE id="${prom.id}"] ${prom.actor} promised ${prom.target}: "${prom.promise}"${prom.dueLabel ? ` (${prom.dueLabel})` : ""} — honor, negotiate, or conspicuously break it (mark \`promise_done:\` / \`promise_broken:\` in [[RP_DELTA]]).`,
+    );
+  }
+  for (const fac of selectFactionPressures(state)) {
+    dramaBeats.push(
+      `[FACTION PRESSURE] ${fac.name} (standing ${fac.standing}, heat ${fac.heat}/6${fac.note ? `, ${fac.note}` : ""}) — let faction agents, rumors, or scrutiny press in organically.`,
+    );
+  }
   if (dramaBeats.length > 0) {
     pushSection(
-      `<rp_drama_beat>\nActive world-state triggers to weave naturally into this turn:\n${dramaBeats.slice(0, 5).map((b) => `- ${b}`).join("\n")}\n</rp_drama_beat>`,
+      `<rp_drama_beat>\nActive world-state triggers to weave naturally into this turn:\n${dramaBeats.slice(0, 6).map((b) => `- ${b}`).join("\n")}\n</rp_drama_beat>`,
       1,
     );
+  }
+  const encFrame = formatEncounterFrame(state.encounter);
+  if (encFrame) {
+    pushSection(encFrame, 1);
   }
 
   // 2. Mid-session persona switch notice (keeps Zone 1 frozen)

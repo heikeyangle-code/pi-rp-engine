@@ -12,6 +12,7 @@
  */
 
 import * as crypto from "node:crypto";
+import { makeRouteId, normalizePlaceName } from "./world-sim.js";
 import type {
   PersonaProfile,
   PhysicalSnapshot,
@@ -147,6 +148,10 @@ export function createInitialRpState(): SessionRpState {
     foresights: new Map(),
     consequences: new Map(),
     objectiveUpdatedTurn: 0,
+    locationGraph: {},
+    commitments: new Map(),
+    factions: {},
+    encounter: null,
     notes: [],
     hiddenEntryIds: new Set<string>(),
     hiddenFingerprints: new Set<string>(),
@@ -320,6 +325,10 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
             }
           }
         }
+        // Auto-tick active encounter round
+        if (state.encounter) {
+          state.encounter = { ...state.encounter, round: state.encounter.round + 1 };
+        }
         // Auto-tick & expire timed conditions (Buff/Debuff)
         for (const [cid, cond] of Object.entries(state.conditions)) {
           if (cond.remainingTurns !== null) {
@@ -351,6 +360,20 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       }
       state.location = tx.location;
       state.presentNpcs = sanitizeNpcList(tx.presentNpcs, getHygieneCtx(state));
+      // Auto-record undirected spatial graph edge when transitioning between two distinct locations (LLM-MapRepair)
+      const prevCleanPlace = normalizePlaceName(prevLoc);
+      const nextCleanPlace = normalizePlaceName(tx.location);
+      if (prevCleanPlace && nextCleanPlace && prevCleanPlace.toLowerCase() !== nextCleanPlace.toLowerCase()) {
+        const rid = makeRouteId(prevCleanPlace, nextCleanPlace);
+        if (!state.locationGraph[rid]) {
+          state.locationGraph[rid] = {
+            id: rid,
+            from: prevCleanPlace,
+            to: nextCleanPlace,
+            discoveredTurn: state.turn,
+          };
+        }
+      }
       if (!isUndoTx(tx) && (prevLoc !== tx.location || prevNpcs.join("|") !== state.presentNpcs.join("|"))) {
         const isInitialHydration = state.turn === 0 && !prevLoc && prevNpcs.length === 0;
         if (!isInitialHydration) {
@@ -762,6 +785,86 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
           summary: `因果回响(${tx.echo.status === "resolved" ? "已兑现" : tx.echo.weight}): ${tx.echo.choice.slice(0, 22)}`,
           source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
           undoTx: prev ? ({ kind: "consequence_upsert", echo: prev, reason: "undo" } as RpTxEntry) : undefined,
+        });
+      }
+      break;
+    }
+
+    case "route_upsert": {
+      const fromClean = normalizePlaceName(tx.edge.from);
+      const toClean = normalizePlaceName(tx.edge.to);
+      if (!fromClean || !toClean || fromClean.toLowerCase() === toClean.toLowerCase()) break;
+      const rid = tx.edge.id || makeRouteId(fromClean, toClean);
+      state.locationGraph[rid] = { ...tx.edge, id: rid, from: fromClean, to: toClean };
+      break;
+    }
+
+    case "commitment_upsert": {
+      const prev = state.commitments.get(tx.commitment.id);
+      state.commitments.set(tx.commitment.id, { ...tx.commitment });
+      if (!isUndoTx(tx)) {
+        state.lastMeaningfulProgressTurn = state.turn;
+        pushAudit(state, {
+          summary: `约定(${tx.commitment.status === "fulfilled" ? "已履约" : tx.commitment.status === "broken" ? "已违约" : "生效"}): ${tx.commitment.actor}→${tx.commitment.promise.slice(0, 18)}`,
+          source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
+          undoTx: prev ? ({ kind: "commitment_upsert", commitment: prev, reason: "undo" } as RpTxEntry) : undefined,
+        });
+      }
+      break;
+    }
+
+    case "faction_upsert": {
+      const key = tx.faction.name.trim();
+      if (!key) break;
+      const prev = state.factions[key];
+      const standing = Math.max(-100, Math.min(100, Math.round(tx.faction.standing)));
+      const heat = Math.max(0, Math.min(6, Math.round(tx.faction.heat)));
+      const wasPressured = prev ? (prev.heat >= 4 || prev.standing <= -50) : false;
+      const nowPressured = heat >= 4 || standing <= -50;
+      const lastPressureTurn = nowPressured
+        ? (wasPressured ? (prev?.lastPressureTurn ?? state.turn) : state.turn)
+        : undefined;
+      state.factions[key] = {
+        ...tx.faction,
+        name: key,
+        standing,
+        heat,
+        ...(lastPressureTurn !== undefined ? { lastPressureTurn } : {}),
+      };
+      if (!isUndoTx(tx)) {
+        state.lastMeaningfulProgressTurn = state.turn;
+        pushAudit(state, {
+          summary: `势力 ${key}: 声望 ${standing >= 0 ? `+${standing}` : standing} · 警戒 ${heat}/6`,
+          source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
+          undoTx: prev ? ({ kind: "faction_upsert", faction: prev, reason: "undo" } as RpTxEntry) : undefined,
+        });
+      }
+      break;
+    }
+
+    case "fact_spread": {
+      const fact = state.facts.get(tx.factId);
+      if (!fact || fact.witnessIds === "public" || tx.newWitnesses.length === 0) break;
+      const existingLow = new Set(fact.witnessIds.map((w) => w.toLowerCase()));
+      const added = tx.newWitnesses.filter((w) => w.trim() && !existingLow.has(w.trim().toLowerCase()));
+      if (added.length === 0) break;
+      state.facts.set(fact.id, { ...fact, witnessIds: [...fact.witnessIds, ...added] });
+      if (!isUndoTx(tx)) {
+        pushAudit(state, {
+          summary: `🗣 情报扩散: ${added.join("、")} 得知「${fact.statement.slice(0, 18)}」`,
+          source: "system",
+        });
+      }
+      break;
+    }
+
+    case "encounter_set": {
+      state.encounter = tx.encounter ? { ...tx.encounter } : null;
+      if (!isUndoTx(tx)) {
+        state.lastMeaningfulProgressTurn = state.turn;
+        pushAudit(state, {
+          summary: tx.encounter ? `⚔ 遭遇战开始: ${tx.encounter.title}` : "⚔ 遭遇战结束",
+          source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
         });
       }
       break;

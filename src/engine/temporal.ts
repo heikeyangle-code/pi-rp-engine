@@ -316,18 +316,21 @@ export function computeCalendarAnchor(
     }
   }
 
-  // 2. Fictional calendar year BEFORE Gregorian (e.g. "星历 2380 年", "第三纪元412年", "Year 412")
-  const ficMatch = /([\u4e00-\u9fffA-Za-z]+历|[\u4e00-\u9fffA-Za-z]*纪元|Year)\s*(\d+)\s*年?/i.exec(label);
+  // 2. Fictional calendar year BEFORE Gregorian (supports Arabic & Chinese numerals: "星历 2380 年", "天元三年", "Year 412")
+  const ficMatch = new RegExp(`([\\u4e00-\\u9fffA-Za-z]+历|[\\u4e00-\\u9fffA-Za-z]*纪元|Year)\\s*(${NUM_TOKEN})\\s*年?`, "i").exec(primaryLabel);
   if (ficMatch && !/^(?:公历|西历)$/i.test(ficMatch[1] ?? "")) {
-    const sourceYear = Number(ficMatch[2]);
-    const targetYear = sourceYear + wholeYears;
-    return {
-      system: "fictional_year",
-      sourceYear,
-      targetYear,
-      targetEraLabel: `${ficMatch[1]} ${targetYear}`,
-      exactHint: `Exact fictional calendar math: ${ficMatch[1]} ${sourceYear} + ${wholeYears} years = ${ficMatch[1]} ${targetYear}.`,
-    };
+    const parsedYear = parseFlexNumber(ficMatch[2] ?? "");
+    if (parsedYear !== null && parsedYear > 0) {
+      const sourceYear = Math.round(parsedYear);
+      const targetYear = sourceYear + wholeYears;
+      return {
+        system: "fictional_year",
+        sourceYear,
+        targetYear,
+        targetEraLabel: `${ficMatch[1]} ${targetYear}`,
+        exactHint: `Exact fictional calendar math: ${ficMatch[1]} ${sourceYear} + ${wholeYears} years = ${ficMatch[1]} ${targetYear}.`,
+      };
+    }
   }
 
   // 3. Explicit Gregorian year (e.g. "2026年", "公元1634年", "1945-08")

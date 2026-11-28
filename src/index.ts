@@ -39,7 +39,8 @@ import { loadCompiledCard, loadCompiledPreset, resolveCardBySlug } from "./stora
 import { recallLoreWithGraphPpr, recallMemoryBooks } from "./memory/graph-ppr.js";
 import { type HistoryRecallCooldown, createTurnRecallScope } from "./memory/history-recall.js";
 import { buildSemanticMemSceneCompaction, maybeBuildAutoSceneChapter } from "./memory/compaction.js";
-import { extractInlineDelta, parseAndValidateInlineDelta, stripInlineDelta } from "./engine/inline-delta.js";
+import { extractInlineDelta, parseAndValidateInlineDelta, stripInlineDelta, stripInlineDeltaStreaming } from "./engine/inline-delta.js";
+import { propagateSecretsOnScene } from "./engine/world-sim.js";
 import { getActiveFacts } from "./memory/bitemporal.js";
 import { evaluateNarrativeHealth } from "./engine/stagnation.js";
 import { estimateTokens } from "./context/token-budget.js";
@@ -499,8 +500,10 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     pi.registerMarkdownTransformer(
       (markdown: string, mdCtx?: { messageType?: string; isStreaming?: boolean }) => {
         if (!state.active || !activeCard) return markdown;
-        if (mdCtx?.isStreaming || mdCtx?.messageType === "assistant-thinking") return markdown;
-        let out = markdown;
+        if (mdCtx?.messageType === "assistant-thinking") return markdown;
+        const deltaHidden = stripInlineDeltaStreaming(markdown);
+        if (mdCtx?.isStreaming) return deltaHidden;
+        let out = deltaHidden;
         if (!state.rawPassthrough) {
           out = stripDisplayResiduals(out);
         }
@@ -1035,6 +1038,11 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       isOocTurn: thisTurnOoc,
       pendingLoreRuntime,
     });
+
+    // Dynamic Rumor / Epistemic Propagation among bonded present NPCs (zero LLM cost)
+    if (!thisTurnOoc) {
+      propagateSecretsOnScene(state, commitTx);
+    }
 
     // Automatic Episodic -> Semantic Scene Consolidation (zero LLM cost)
     if (!thisTurnOoc) {
