@@ -7,13 +7,13 @@
  *  - RoleMemo DualMem extraction: captures both objective world facts AND persona-conditioned
  *    `subjectiveInsight` + `emotionalTone` on character beliefs.
  *  - Auto-closes resolved foresights (`paidOffForesightIds`).
- *  - Fixes private-fact witness bug: includes player persona + present NPCs so player-witnessed
- *    secrets never lock out the player!
+ *  - Preserves FANToM epistemic boundaries on private facts (`witnessIds`).
  */
 
 import type {
   BiTemporalFact,
   CompiledLoreEntry,
+  PhysicalSnapshot,
   PiExtensionAPI,
   PiExtensionContext,
   PiMessage,
@@ -106,7 +106,7 @@ export async function runSidecarLightSettlement(options: {
     `"presentNpcs": string[]|null`,
     `"worldTimeLabel": string|null`,
     `"sceneObjective": string|null`,
-    `"facts": [{"statement":"...","entities":["..."],"public":true}]`,
+    `"facts": [{"statement":"...","entities":["..."],"public":true,"witnesses":["..."]}]`,
     `"invalidatedFactIds": [{"id":"...","reason":"..."}]`,
     `"beliefs": [{"actorId":"...","target":"...","activatingEvent":"...","belief":"...","subjectiveInsight":"how this character emotionally interprets it","emotionalTone":"..."}]`,
     `"foresights": [{"summary":"...","triggerHint":"...","entities":["..."]}]`,
@@ -193,7 +193,7 @@ export async function runSidecarLightSettlement(options: {
       presentNpcs?: string[] | null;
       worldTimeLabel?: string | null;
       sceneObjective?: string | null;
-      facts?: Array<{ statement?: string; entities?: string[]; public?: boolean }>;
+      facts?: Array<{ statement?: string; entities?: string[]; public?: boolean; witnesses?: string[] }>;
       invalidatedFactIds?: Array<{ id?: string; reason?: string }>;
       beliefs?: Array<{
         actorId?: string;
@@ -218,14 +218,21 @@ export async function runSidecarLightSettlement(options: {
     }>(rawText);
     if (!parsed) return 0;
 
-    // Stale-branch guard: if user exited RP, switched cards, rewound, or moved to another branch while sidecar ran, discard cleanly!
+    // Stale-branch guard (strict CAS): if user exited RP, switched cards, rewound, moved to another branch,
+    // or advanced the leaf while sidecar ran, discard cleanly!
     if (!state.active || state.turn !== startTurn || state.cardSlug !== startCardSlug) {
       return 0;
     }
-    if (startLeafId && typeof ctx.sessionManager?.getBranch === "function") {
-      const currentBranch = ctx.sessionManager.getBranch();
-      if (currentBranch.length > 0 && !currentBranch.some((e) => e.id === startLeafId)) {
+    if (startLeafId) {
+      const currentLeafId = ctx.sessionManager?.getLeafId?.() ?? null;
+      if (currentLeafId !== startLeafId) {
         return 0;
+      }
+      if (typeof ctx.sessionManager?.getBranch === "function") {
+        const currentBranch = ctx.sessionManager.getBranch();
+        if (currentBranch.length > 0 && !currentBranch.some((e) => e.id === startLeafId)) {
+          return 0;
+        }
       }
     }
 
@@ -285,7 +292,15 @@ export async function runSidecarLightSettlement(options: {
     // 3. New bi-temporal facts (includes both validFromTurn and ingestedAtTurn + eventTimeLabel!)
     for (const f of parsed.facts ?? []) {
       if (!f.statement?.trim()) continue;
-      const privateWitnesses = Array.from(new Set([state.currentPersona.name, ...state.presentNpcs].filter(Boolean)));
+      const explicitWitnesses = Array.isArray(f.witnesses)
+        ? Array.from(new Set(f.witnesses.map((w) => String(w).trim()).filter(Boolean)))
+        : [];
+      const witnessIds: string[] | "public" =
+        f.public === false
+          ? explicitWitnesses.length > 0
+            ? explicitWitnesses
+            : ["user"]
+          : "public";
       const fact: BiTemporalFact = {
         id: `fact_t${state.turn}_${committed}`,
         statement: f.statement.trim(),
@@ -294,7 +309,7 @@ export async function runSidecarLightSettlement(options: {
         validUntilTurn: null,
         ingestedAtTurn: state.turn,
         eventTimeLabel: state.worldTimeLabel || undefined,
-        witnessIds: f.public === false && privateWitnesses.length > 0 ? privateWitnesses : "public",
+        witnessIds,
       };
       commit({ kind: "fact_add", fact });
     }
@@ -421,6 +436,7 @@ export async function runSidecarLightSettlement(options: {
 
     // 8. Dynamic Scene Physical State (attire / wounds / holding / position / spatialNotes)
     const nextSpatial = typeof parsed.spatialNotes === "string" && parsed.spatialNotes.trim() ? parsed.spatialNotes.trim() : undefined;
+    let emittedAnyPhysical = false;
     for (const ph of parsed.physical ?? []) {
       const actorId = typeof ph.actorId === "string" ? ph.actorId.trim() : "";
       if (!actorId) continue;
@@ -429,14 +445,20 @@ export async function runSidecarLightSettlement(options: {
       const holding = typeof ph.holding === "string" && ph.holding.trim() ? ph.holding.trim() : undefined;
       const position = typeof ph.position === "string" && ph.position.trim() ? ph.position.trim() : undefined;
       if (!attire && !condition && !holding && !position) continue;
+      const snapshot: PhysicalSnapshot = { actorId, updatedTurn: state.turn };
+      if (attire) snapshot.attire = attire;
+      if (condition) snapshot.condition = condition;
+      if (holding) snapshot.holding = holding;
+      if (position) snapshot.position = position;
       commit({
         kind: "physical_patch",
-        snapshot: { actorId, attire, condition, holding, position, updatedTurn: state.turn },
+        snapshot,
         spatialNotes: nextSpatial,
         reason: "sidecar",
       });
+      emittedAnyPhysical = true;
     }
-    if (nextSpatial && (!parsed.physical || parsed.physical.length === 0) && nextSpatial !== state.spatialNotes) {
+    if (nextSpatial && !emittedAnyPhysical && nextSpatial !== state.spatialNotes) {
       commit({
         kind: "physical_patch",
         snapshot: { actorId: "", updatedTurn: state.turn },

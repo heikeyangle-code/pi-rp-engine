@@ -101,7 +101,13 @@ export function extractHeuristicVoiceAnchor(card: CompiledCard): VoiceAnchor | n
 
   const samples: string[] = [];
   const seen = new Set<string>();
-  const sources = [card.frozen.mesExample, card.greetings.firstMes];
+  const filteredMesExample = card.frozen.mesExample
+    ? card.frozen.mesExample
+        .split("\n")
+        .filter((line) => !/^\s*(?:\{\{user\}\}|<USER>)\s*[:：]/i.test(line))
+        .join("\n")
+    : "";
+  const sources = [filteredMesExample, card.greetings.firstMes];
   const quoteRe = /[「“"]([^「」“”"\n]{6,68})[」”"]/g;
   for (const src of sources) {
     if (!src) continue;
@@ -334,10 +340,13 @@ export function parseAnalyzeResponse(rawText: string, card: CompiledCard): Analy
       const key = asOptStr(r.key);
       const val = r.initialValue;
       if (!key || (typeof val !== "number" && typeof val !== "string" && typeof val !== "boolean")) continue;
-      const rawMin = typeof r.min === "number" ? r.min : undefined;
-      const rawMax = typeof r.max === "number" ? r.max : undefined;
-      const safeMin = typeof val === "number" && rawMin !== undefined && val < rawMin ? val : rawMin;
-      const safeMax = typeof val === "number" && rawMax !== undefined && val > rawMax ? val : rawMax;
+      let normMin = typeof r.min === "number" && Number.isFinite(r.min) ? r.min : undefined;
+      let normMax = typeof r.max === "number" && Number.isFinite(r.max) ? r.max : undefined;
+      if (normMin !== undefined && normMax !== undefined && normMin > normMax) {
+        [normMin, normMax] = [normMax, normMin];
+      }
+      const safeMin = typeof val === "number" && normMin !== undefined && val < normMin ? val : normMin;
+      const safeMax = typeof val === "number" && normMax !== undefined && val > normMax ? val : normMax;
       const rawCat = asOptStr(r.category) as SalvagedVariable["category"] | undefined;
       const category = rawCat && VALID_VAR_CATEGORIES.has(rawCat) ? rawCat : "stat";
       initialStats.push({
@@ -411,7 +420,7 @@ export function parseAnalyzeResponse(rawText: string, card: CompiledCard): Analy
       initialFacts.push({
         statement,
         entities,
-        witnessIds: Array.isArray(witnessIds) && witnessIds.length === 0 ? "public" : witnessIds,
+        witnessIds,
       });
     }
   }
@@ -509,10 +518,13 @@ export function parseAnalyzeResponse(rawText: string, card: CompiledCard): Analy
     }
   }
 
-  // Auto-enable stats/inventory/clocks modules if concrete items were extracted
+  const initialStage = asOptStr(parsed.initialStage);
+
+  // Auto-enable stats/inventory/clocks/stages modules if concrete items were extracted
   if (initialStats.length > 0) modules.stats = true;
   if (initialInventory.length > 0) modules.inventory = true;
   if (initialClocks.length > 0) modules.clocks = true;
+  if (initialStage) modules.stages = true;
 
   return {
     profile: {
@@ -520,7 +532,7 @@ export function parseAnalyzeResponse(rawText: string, card: CompiledCard): Analy
       modules,
       initialLocation: asOptStr(parsed.initialLocation),
       initialTime: asOptStr(parsed.initialTime),
-      initialStage: modules.stages ? asOptStr(parsed.initialStage) : undefined,
+      initialStage: modules.stages ? initialStage : undefined,
       initialObjective: asOptStr(parsed.initialObjective),
       initialPresentNpcs,
       initialInventory,
@@ -566,7 +578,7 @@ export function parseAnalyzeResponse(rawText: string, card: CompiledCard): Analy
  *  - Saves all 7 extracted dimensions into `card.worldProfile`
  *  - Merges `initialStats` into `card.salvagedStateSchema` (deduplicated by `actorId::key`)
  *  - Propagates `entityAliases` to card identity & lorebook entities
- *  - Optionally attaches `suggestedLoreGates` to spoiler lorebook entries
+ *  - Optionally attaches `suggestedLoreGates` to spoiler lorebook entries (merging with existing gates)
  */
 export function applyAnalyzedProfileToCard(
   card: CompiledCard,
@@ -630,8 +642,42 @@ export function applyAnalyzedProfileToCard(
     const byId = new Map(card.loreBook.entries.map((e) => [e.id, e]));
     for (const g of profile.suggestedLoreGates) {
       const entry = byId.get(g.entryId);
-      if (entry && !entry.gate) {
+      if (!entry) continue;
+      if (!entry.gate) {
         entry.gate = { ...g.gate };
+      } else {
+        const merged: GateCondition = { ...entry.gate };
+        if (g.gate.requiredFlags?.length) {
+          merged.requiredFlags = Array.from(new Set([...(merged.requiredFlags ?? []), ...g.gate.requiredFlags]));
+        }
+        if (g.gate.forbiddenFlags?.length) {
+          merged.forbiddenFlags = Array.from(new Set([...(merged.forbiddenFlags ?? []), ...g.gate.forbiddenFlags]));
+        }
+        if (g.gate.requiredMilestones?.length) {
+          merged.requiredMilestones = Array.from(
+            new Set([...(merged.requiredMilestones ?? []), ...g.gate.requiredMilestones]),
+          );
+        }
+        if (g.gate.requiredLocations?.length) {
+          merged.requiredLocations = Array.from(
+            new Set([...(merged.requiredLocations ?? []), ...g.gate.requiredLocations]),
+          );
+        }
+        if (g.gate.requiredNpcPresent?.length) {
+          merged.requiredNpcPresent = Array.from(
+            new Set([...(merged.requiredNpcPresent ?? []), ...g.gate.requiredNpcPresent]),
+          );
+        }
+        if (g.gate.minTurn !== undefined) {
+          merged.minTurn = Math.max(merged.minTurn ?? 0, g.gate.minTurn);
+        }
+        if (g.gate.requiredEra && !merged.requiredEra) {
+          merged.requiredEra = g.gate.requiredEra;
+        }
+        if (g.gate.statChecks?.length) {
+          merged.statChecks = [...(merged.statChecks ?? []), ...g.gate.statChecks];
+        }
+        entry.gate = merged;
       }
     }
   }

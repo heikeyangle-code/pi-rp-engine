@@ -31,7 +31,11 @@ export function rollDiceCheck(options: {
     );
   }
   const count = Math.min(Math.max(m[1] ? parseInt(m[1], 10) : 1, 1), 100);
-  const sides = Math.min(Math.max(parseInt(m[2]!, 10), 2), 10000);
+  const rawSides = parseInt(m[2]!, 10);
+  if (!Number.isFinite(rawSides) || rawSides < 1) {
+    throw new Error(`无效的骰子面数 "${options.expression}"（面数必须 >= 1）`);
+  }
+  const sides = Math.min(rawSides, 10000);
   const keepMode = m[3]?.toLowerCase() as "kh" | "kl" | undefined;
   const keepCount = m[4] ? Math.min(Math.max(parseInt(m[4], 10), 1), count) : count;
   const sign = m[5] === "-" ? -1 : 1;
@@ -43,8 +47,10 @@ export function rollDiceCheck(options: {
     const predetermined = options.deterministicRolls?.[i];
     const r =
       predetermined !== undefined
-        ? Math.min(Math.max(predetermined, 1), sides)
-        : crypto.randomInt(1, sides + 1);
+        ? Math.min(Math.max(Math.floor(predetermined), 1), sides)
+        : sides === 1
+          ? 1
+          : crypto.randomInt(1, sides + 1);
     rolls.push(r);
   }
 

@@ -145,15 +145,86 @@ function getTargetStorageDir(cwd: string, scope: "project" | "library"): string 
   return scope === "library" ? getGlobalLibraryDir() : getProjectRpDir(cwd);
 }
 
-async function pickGreeting(ctx: PiExtensionContext, card: CompiledCard, quickDefault = false): Promise<number> {
+let activeWorkingCount = 0;
+
+interface GuardedTaskHandle {
+  signal: AbortSignal;
+  guardedCtx: PiExtensionContext;
+  isStillValid: () => boolean;
+  cleanup: () => void;
+}
+
+/**
+ * Shared guard for async LLM actions:
+ * - Ref-counted `workingMessage` (clears only when last task finishes)
+ * - 90s timeout chained with `ctx.signal`
+ * - Session key, branch leaf & active card CAS check so late responses never pollute a switched session/branch
+ */
+function beginGuardedLlmTask(
+  rt: RpRuntimeHandle,
+  ctx: PiExtensionContext,
+  workingLabel?: string,
+  timeoutMs = 90_000,
+): GuardedTaskHandle {
+  const startSessionKey =
+    ctx.sessionManager?.getSessionId?.() ?? ctx.sessionManager?.getSessionFile?.() ?? "";
+  const startLeafId = ctx.sessionManager?.getLeafId?.() ?? null;
+  const startCardSlug = rt.getState().cardSlug;
+  const controller = new AbortController();
+  const onParentAbort = () => controller.abort();
+  if (ctx.signal) {
+    if (ctx.signal.aborted) controller.abort();
+    else ctx.signal.addEventListener("abort", onParentAbort, { once: true });
+  }
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  if (typeof (timer as { unref?: () => void }).unref === "function") {
+    (timer as { unref: () => void }).unref();
+  }
+  if (workingLabel) {
+    activeWorkingCount += 1;
+    ctx.ui.setWorkingMessage?.(workingLabel);
+  }
+  const guardedCtx: PiExtensionContext = { ...ctx, signal: controller.signal };
+  let cleaned = false;
+  return {
+    signal: controller.signal,
+    guardedCtx,
+    isStillValid: () => {
+      const curState = rt.getState();
+      if (!curState.active || curState.cardSlug !== startCardSlug) return false;
+      const curSessionKey =
+        ctx.sessionManager?.getSessionId?.() ?? ctx.sessionManager?.getSessionFile?.() ?? "";
+      if (curSessionKey !== startSessionKey) return false;
+      const curLeaf = ctx.sessionManager?.getLeafId?.() ?? null;
+      if (curLeaf !== startLeafId) return false;
+      return true;
+    },
+    cleanup: () => {
+      if (cleaned) return;
+      cleaned = true;
+      clearTimeout(timer);
+      if (ctx.signal) {
+        ctx.signal.removeEventListener("abort", onParentAbort);
+      }
+      if (workingLabel) {
+        activeWorkingCount = Math.max(0, activeWorkingCount - 1);
+        if (activeWorkingCount === 0) {
+          ctx.ui.setWorkingMessage?.(undefined);
+        }
+      }
+    },
+  };
+}
+
+async function pickGreeting(ctx: PiExtensionContext, card: CompiledCard, quickDefault = false): Promise<number | undefined> {
   const all = [card.greetings.firstMes, ...card.greetings.alternates].filter((g) => g.trim().length > 0);
   if (all.length <= 1 || quickDefault) return 0;
 
   const opts = all.map((g, i) => `${i === 0 ? "★ 主开场白" : `❖ 备选 #${i}`}  ${previewText(g, 58)}`);
   const pick = await ctx.ui.select(`🎭 选择「${card.identity.name}」的开场白（共 ${all.length} 条）`, opts);
-  if (!pick) return 0;
+  if (!pick) return undefined;
   const idx = opts.indexOf(pick);
-  return idx >= 0 ? idx : 0;
+  return idx >= 0 ? idx : undefined;
 }
 
 async function pickOrCreatePersona(ctx: PiExtensionContext, current: PersonaProfile): Promise<PersonaProfile> {
@@ -164,11 +235,10 @@ async function pickOrCreatePersona(ctx: PiExtensionContext, current: PersonaProf
     (current.id !== "default" ? current : saved[0]) ??
     current;
 
+  const others = saved.filter((p) => p.id !== preferred.id);
   const options = [
     `▶ 使用当前/默认人设：${preferred.name}${preferred.description ? ` (${previewText(preferred.description, 28)})` : ""}`,
-    ...saved
-      .filter((p) => p.id !== preferred.id)
-      .map((p) => `🧑 ${p.name}${p.description ? ` — ${previewText(p.description, 32)}` : ""}`),
+    ...others.map((p) => `🧑 ${p.name}${p.description ? ` — ${previewText(p.description, 32)}` : ""}`),
     "+ 新建玩家人设（保存到全局库，跨卡通用）",
   ];
 
@@ -179,7 +249,9 @@ async function pickOrCreatePersona(ctx: PiExtensionContext, current: PersonaProf
   if (choice.startsWith("+")) {
     const name = (await ctx.ui.input("玩家角色名称", "旅人"))?.trim();
     if (!name) return preferred;
-    const desc = (await ctx.ui.input("简短设定/外貌/身份（可留空）", ""))?.trim() ?? "";
+    const descRaw = await ctx.ui.input("简短设定/外貌/身份（可留空）", "");
+    if (descRaw === undefined) return preferred;
+    const desc = descRaw.trim();
     const profile: PersonaProfile = {
       id: name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_").slice(0, 32) || `p_${Date.now()}`,
       name,
@@ -190,7 +262,8 @@ async function pickOrCreatePersona(ctx: PiExtensionContext, current: PersonaProf
     return profile;
   }
 
-  const matched = saved.find((p) => choice.startsWith(`🧑 ${p.name}`));
+  const chosenIdx = options.indexOf(choice);
+  const matched = chosenIdx >= 1 && chosenIdx <= others.length ? others[chosenIdx - 1] : undefined;
   if (matched) {
     saveUiPrefs({ lastPersonaId: matched.id });
     return matched;
@@ -483,7 +556,7 @@ export async function bindCardToCurrentSession(
   }
 
   ctx.ui.notify(
-    `已在本会话开启角色扮演：${card.identity.name}（仅当前会话生效，按 Alt+Shift+X 或 /rp exit 可随时彻底退出）`,
+    `已在本会话开启角色扮演：${card.identity.name}（仅当前会话生效，可随时从菜单退出）`,
     "info",
   );
 }
@@ -671,6 +744,7 @@ export async function actionImportFile(rt: RpRuntimeHandle, ctx: PiExtensionCont
 
   const runAnalyzeFirst = nextPick.startsWith("✨");
   const greetingIndex = await pickGreeting(ctx, card);
+  if (greetingIndex === undefined) return;
   const persona = await pickOrCreatePersona(ctx, rt.getState().currentPersona);
   await bindCardToCurrentSession(rt, ctx, {
     card,
@@ -759,11 +833,13 @@ export async function actionLoadCard(rt: RpRuntimeHandle, ctx: PiExtensionContex
   }
 
   const greetingIndex = await pickGreeting(ctx, card);
+  if (greetingIndex === undefined) return;
   const persona = await pickOrCreatePersona(ctx, rt.getState().currentPersona);
   let presetId: string | undefined;
   if (presets.length > 0) {
     const pPick = await ctx.ui.select("🎛 是否加载酒馆预设（可选）", ["不使用预设（推荐）", ...presets]);
-    if (pPick && !pPick.startsWith("不使用")) presetId = pPick;
+    if (!pPick) return;
+    if (!pPick.startsWith("不使用")) presetId = pPick;
   }
 
   await bindCardToCurrentSession(rt, ctx, {
@@ -832,13 +908,13 @@ export async function actionIdeas(rt: RpRuntimeHandle, ctx: PiExtensionContext):
       (recent.length ? `Recent dialogue:\n${recent.join("\n")}\n` : "") +
       `Output JSON array now:`;
 
-    ctx.ui.notify("💡 正在构思 3 个贴合当下情境的行动选项…", "info");
+    const task = beginGuardedLlmTask(rt, ctx, "正在构思 3 个行动建议…");
     try {
       const raw = await completeWithRegistry(ctx, ctx.model, {
         systemPrompt,
         userPrompt,
         maxTokens: 480,
-        signal: ctx.signal,
+        signal: task.signal,
       });
       const m = /\[[\s\S]*\]/.exec(raw);
       if (m) {
@@ -846,10 +922,19 @@ export async function actionIdeas(rt: RpRuntimeHandle, ctx: PiExtensionContext):
         const choices = parsed
           .filter((x) => x && typeof x.text === "string" && x.text.trim().length > 0)
           .slice(0, 4);
+        if (!task.isStillValid()) {
+          ctx.ui.notify("会话或分支已变更，已放弃本次行动建议。", "warning");
+          return;
+        }
         if (choices.length > 0) {
+          task.cleanup();
           const opts = choices.map((c, i) => `${i + 1}. [${c.tag || "选项"}] ${previewText(c.text!, 58)}`);
-          const pick = await ctx.ui.select("💡 选择行动建议（点选直接填入输入框，不污染聊天记录）", [...opts, "✕ 取消"]);
+          const pick = await ctx.ui.select("💡 选择行动建议（点选填入输入框）", [...opts, "✕ 取消"]);
           if (!pick || pick.startsWith("✕")) return;
+          if (!task.isStillValid()) {
+            ctx.ui.notify("会话或分支已变更，已取消填入行动建议。", "warning");
+            return;
+          }
           const idx = opts.indexOf(pick);
           const chosen = choices[idx];
           if (chosen?.text) {
@@ -859,11 +944,20 @@ export async function actionIdeas(rt: RpRuntimeHandle, ctx: PiExtensionContext):
           return;
         }
       }
-    } catch {
-      // Fall back cleanly below if model call fails
+      ctx.ui.notify("未能解析行动建议，请稍后重试。", "warning");
+      return;
+    } catch (err) {
+      ctx.ui.notify(`构思行动建议失败：${(err as Error).message}`, "error");
+      return;
+    } finally {
+      task.cleanup();
     }
   }
 
+  if (ctx.isIdle?.() === false) {
+    ctx.ui.notify("当前正在生成回复，请等待本轮结束后再请求行动建议。", "warning");
+    return;
+  }
   rt.markNextTurnOoc();
   rt.pi.sendMessage(
     {
@@ -882,11 +976,19 @@ export async function actionOoc(rt: RpRuntimeHandle, ctx: PiExtensionContext, ar
     ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
     return;
   }
+  if (ctx.isIdle?.() === false) {
+    ctx.ui.notify("当前正在生成剧情回复，请等本轮结束后再发送场外讨论。", "warning");
+    return;
+  }
   let text = argsText.trim();
   if (!text) {
-    const entered = await ctx.ui.input("💬 输入 OOC 场外讨论内容（不推进剧情与时钟）", "请问角色现在对玩家是什么看法？");
+    const entered = await ctx.ui.input("💬 输入场外讨论内容（不推进剧情与时钟）", "请问角色现在对玩家是什么看法？");
     if (!entered?.trim()) return;
     text = entered.trim();
+  }
+  if (ctx.isIdle?.() === false) {
+    ctx.ui.notify("当前正在生成剧情回复，请等本轮结束后再发送场外讨论。", "warning");
+    return;
   }
   rt.markNextTurnOoc();
   rt.pi.sendMessage(
@@ -975,7 +1077,7 @@ export async function actionDirectorNote(rt: RpRuntimeHandle, ctx: PiExtensionCo
     if (!tpl || tpl.startsWith("←")) return;
     noteText = tpl;
   } else {
-    const entered = await ctx.ui.input("输入导演指令（注入 Zone 3，不影响缓存命中）", "");
+    const entered = await ctx.ui.input("输入导演指令", "");
     if (!entered?.trim()) return;
     noteText = entered.trim();
   }
@@ -985,7 +1087,8 @@ export async function actionDirectorNote(rt: RpRuntimeHandle, ctx: PiExtensionCo
     "3 轮（短期场景引导）",
     "常驻（直到手动清除）",
   ]);
-  const remainingTurns = ttlPick?.startsWith("1") ? 1 : ttlPick?.startsWith("3") ? 3 : null;
+  if (!ttlPick) return;
+  const remainingTurns = ttlPick.startsWith("1") ? 1 : ttlPick.startsWith("3") ? 3 : null;
   rt.commitTx({
     kind: "note_set",
     note: { id: `note_${Date.now().toString(36)}`, text: noteText, remainingTurns },
@@ -1020,7 +1123,7 @@ export async function actionPersona(rt: RpRuntimeHandle, ctx: PiExtensionContext
   const next = await pickOrCreatePersona(ctx, state.currentPersona);
   rt.commitTx({ kind: "persona_set", persona: next });
   rt.refreshHud(ctx);
-  ctx.ui.notify(`已切换玩家人设：${next.name}（Zone 1 保持冻结，不破坏 KV 缓存）`, "info");
+  ctx.ui.notify(`已切换玩家人设：${next.name}`, "info");
 }
 
 export async function actionGreeting(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
@@ -1036,6 +1139,7 @@ export async function actionGreeting(rt: RpRuntimeHandle, ctx: PiExtensionContex
     return;
   }
   const idx = await pickGreeting(ctx, card, false);
+  if (idx === undefined) return;
   const rendered = evaluateMacros(all[idx]!, {
     charName: card.identity.nickname || card.identity.name,
     userName: state.currentPersona.name,
@@ -1154,7 +1258,7 @@ export async function actionBookmarkSave(rt: RpRuntimeHandle, ctx: PiExtensionCo
 export async function actionBookmarkGoto(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
   const bookmarks = collectLabeledBookmarks(ctx);
   if (bookmarks.length === 0) {
-    ctx.ui.notify("当前会话还没有保存任何剧情书签。使用 Alt+B 或 /rp save 创建一个吧！", "info");
+    ctx.ui.notify("当前会话还没有保存任何剧情书签，请先创建一个书签。", "info");
     return;
   }
 
@@ -1235,10 +1339,22 @@ export async function actionToggleHide(
     return;
   }
 
+  const isEntryHidden = (x: (typeof msgEntries)[number]): boolean => {
+    const fp = computeMessageFingerprint(x.msg);
+    return state.hiddenEntryIds.has(x.entry.id) || state.hiddenFingerprints.has(fp);
+  };
+
+  const hasHidden = state.hiddenEntryIds.size > 0 || state.hiddenFingerprints.size > 0;
+  const pool = hide ? msgEntries : msgEntries.filter(isEntryHidden);
+
   const arg = argsText.trim();
   if (arg) {
+    if (!hide && pool.length === 0) {
+      ctx.ui.notify("当前没有已隐藏的对话楼层。", "info");
+      return;
+    }
     const count = Math.max(1, Number(arg) || 1);
-    const targets = msgEntries.slice(-count);
+    const targets = pool.slice(-count);
     const ids = targets.map((x) => x.entry.id);
     const fps = targets.map((x) => computeMessageFingerprint(x.msg));
     rt.commitTx({ kind: "hide_toggle", entryIds: ids, fingerprints: fps, hidden: hide });
@@ -1246,8 +1362,13 @@ export async function actionToggleHide(
     return;
   }
 
-  // Interactive floor picker showing last 16 messages with status badges
-  const recent = msgEntries.slice(-16).reverse();
+  if (!hide && pool.length === 0 && !hasHidden) {
+    ctx.ui.notify("当前没有已隐藏的对话楼层。", "info");
+    return;
+  }
+
+  // Interactive floor picker showing last 16 messages (or only hidden floors in unhide mode)
+  const recent = pool.slice(-16).reverse();
   const opts = recent.map((x, idx) => {
     const fp = computeMessageFingerprint(x.msg);
     const isHidden = state.hiddenEntryIds.has(x.entry.id) || state.hiddenFingerprints.has(fp);
@@ -1256,9 +1377,8 @@ export async function actionToggleHide(
     return `${idx + 1}. [${badge}] [${roleTag}] ${previewText(extractMsgPlain(x.msg), 50)}`;
   });
 
-  const hasHidden = state.hiddenEntryIds.size > 0 || state.hiddenFingerprints.size > 0;
   const pick = await ctx.ui.select(
-    hide ? "🙈 隐藏或恢复对话楼层（点击切换可见/隐藏）" : "👁 选择要恢复显示的对话楼层",
+    hide ? "🙈 隐藏或恢复对话楼层（点击切换可见/隐藏）" : "👁 选择要恢复显示的已隐藏楼层",
     [...opts, ...(hasHidden ? ["✨ 一键恢复全部已隐藏楼层"] : []), "✕ 返回"],
   );
   if (!pick || pick.startsWith("✕")) return;
@@ -1320,14 +1440,19 @@ export async function actionManualRoll(rt: RpRuntimeHandle, ctx: PiExtensionCont
       "DC 20（困难）",
       "✏️ 自定义 DC",
     ]);
-    if (dcPick?.startsWith("DC ")) {
+    if (!dcPick) return;
+    if (dcPick.startsWith("DC ")) {
       dc = Number(dcPick.split(" ")[1]);
-    } else if (dcPick?.startsWith("✏️")) {
-      const d = Number((await ctx.ui.input("输入目标 DC", "12"))?.trim());
+    } else if (dcPick.startsWith("✏️")) {
+      const dcRaw = await ctx.ui.input("输入目标 DC", "12");
+      if (dcRaw === undefined) return;
+      const d = Number(dcRaw.trim());
       if (Number.isFinite(d) && d > 0) dc = d;
     }
 
-    reason = (await ctx.ui.input("检定事由（可留空）", ""))?.trim() ?? "";
+    const reasonRaw = await ctx.ui.input("检定事由（可留空）", "");
+    if (reasonRaw === undefined) return;
+    reason = reasonRaw.trim();
   }
 
   try {
@@ -1500,6 +1625,7 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
   }
 
   let sim: DowntimeSimResult | null = null;
+  let simTask: GuardedTaskHandle | null = null;
   if (canCompleteWithRegistry(ctx)) {
     const activeClocks = Object.values(state.clocks)
       .filter((c) => !c.completed)
@@ -1536,18 +1662,32 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
       (openHooks.length ? `Open foresights: ${openHooks.join("; ")}\n` : "") +
       (recentFacts.length ? `Recent facts: ${recentFacts.join(" | ")}\n` : "");
 
-    ctx.ui.notify(`⏳ 正在推演「${desc}」期间的幕后世界变化…`, "info");
+    const task = beginGuardedLlmTask(rt, ctx, `正在推演「${desc}」期间的世界变化…`);
+    simTask = task;
+    let simFailed = false;
     try {
       const targetModel = resolveSidecarModel(ctx, state.sidecarModel) ?? ctx.model;
       const raw = await completeWithRegistry(ctx, targetModel, {
         systemPrompt: simPrompt,
         userPrompt: simInput,
         maxTokens: 600,
-        signal: ctx.signal,
+        signal: task.signal,
       });
       sim = extractJsonObject<DowntimeSimResult>(raw);
-    } catch {
+    } catch (err) {
       sim = null;
+      simFailed = true;
+      ctx.ui.notify(`幕间推演模型调用失败：${(err as Error).message}`, "warning");
+    } finally {
+      task.cleanup();
+    }
+    if (!task.isStillValid()) {
+      ctx.ui.notify("会话或分支已变更，已放弃本次幕间推演结果。", "warning");
+      return;
+    }
+    if (simFailed) {
+      const proceedPlain = await ctx.ui.confirm("推演失败，是否仅推进时间并继续？", `目标跨度：${desc}`);
+      if (!proceedPlain) return;
     }
   }
 
@@ -1565,6 +1705,10 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
     const ok = await ctx.ui.confirm("确认应用幕间世界推演结果？", previewLines.join("\n"));
     if (!ok) {
       ctx.ui.notify("已取消本次时间推进。", "info");
+      return;
+    }
+    if (simTask && !simTask.isStillValid()) {
+      ctx.ui.notify("会话或分支已变更，已放弃应用幕间推演结果。", "warning");
       return;
     }
   }
@@ -1850,15 +1994,19 @@ export async function actionAnalyzeCard(rt: RpRuntimeHandle, ctx: PiExtensionCon
     return;
   }
 
-  ctx.ui.setWorkingMessage?.(`正在对「${card.identity.name}」执行 7 维深度建档…`);
+  const task = beginGuardedLlmTask(rt, ctx, `正在对「${card.identity.name}」执行 7 维深度建档…`);
   let res;
   try {
-    res = await analyzeCardWithModel(ctx, card, state.sidecarModel);
+    res = await analyzeCardWithModel(task.guardedCtx, card, state.sidecarModel);
   } catch (err) {
     ctx.ui.notify(`智能建档失败：${(err as Error).message}`, "error");
     return;
   } finally {
-    ctx.ui.setWorkingMessage?.(undefined);
+    task.cleanup();
+  }
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或角色卡已切换，已放弃过期建档结果。", "warning");
+    return;
   }
   if (!res) {
     ctx.ui.notify("未能解析模型返回的结构化画像，请稍后重试。", "warning");
@@ -1897,9 +2045,17 @@ export async function actionAnalyzeCard(rt: RpRuntimeHandle, ctx: PiExtensionCon
     return;
   }
 
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或角色卡已切换，已取消写入建档结果。", "warning");
+    return;
+  }
   applyAnalyzedProfileToCard(card, profile, true, initialStats);
   if (state.worldDir) {
-    saveUpdatedCard(state.worldDir, card);
+    try {
+      saveUpdatedCard(state.worldDir, card);
+    } catch (err) {
+      ctx.ui.notify(`建档结果写入磁盘失败：${(err as Error).message}`, "error");
+    }
   }
 
   hydrateWorldProfileAndVariables(rt, card, "llm_analyze");
@@ -1925,14 +2081,21 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
     return;
   }
 
+  const startLeafId = ctx.sessionManager.getLeafId();
   const branch = ctx.sessionManager.getBranch();
   let lastAssistantIdx = -1;
   for (let i = branch.length - 1; i >= 0; i--) {
     const e = branch[i]!;
-    if (e.type === "message" && e.message?.role === "assistant") {
-      lastAssistantIdx = i;
-      break;
-    }
+    const normMsg = normalizeBranchMessage(e);
+    if (!normMsg) continue;
+    const isStoryReply =
+      (e.type === "message" && normMsg.role === "assistant") ||
+      normMsg.customType === "rp:rewrite";
+    if (!isStoryReply) continue;
+    const fp = computeMessageFingerprint(normMsg);
+    if (state.hiddenEntryIds.has(e.id) || state.hiddenFingerprints.has(fp)) continue;
+    lastAssistantIdx = i;
+    break;
   }
   if (lastAssistantIdx < 0) {
     ctx.ui.notify("当前分支还没有可重摇的回复。", "info");
@@ -1991,10 +2154,21 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
     }
   }
 
+  if (ctx.isIdle?.() === false) {
+    ctx.ui.notify("当前正在生成回复，已取消本次重摇。", "warning");
+    return;
+  }
+  const latestLeafId = ctx.sessionManager.getLeafId();
+  if (startLeafId && latestLeafId && latestLeafId !== startLeafId) {
+    ctx.ui.notify("分支状态已变化，请重新执行重摇。", "warning");
+    return;
+  }
+
   const assistantEntry = branch[lastAssistantIdx]!;
   const triggerEntry = triggerIdx >= 0 ? branch[triggerIdx]! : undefined;
   const normalizedTrigger = triggerEntry ? normalizeBranchMessage(triggerEntry) : null;
   const triggerText = normalizedTrigger ? extractMsgPlain(normalizedTrigger) : "";
+  const triggerCustomType = normalizedTrigger?.customType === "rp:era" ? "rp:era" : "rp:event";
   const rewindParentId = triggerEntry?.parentId ?? (triggerIdx > 0 ? branch[triggerIdx - 1]?.id : undefined);
 
   // Preferred path: true tree-branching Swipe via navigateTree so old swipe stays intact in Pi /tree!
@@ -2014,12 +2188,12 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
     } else {
       rt.pi.sendMessage(
         {
-          customType: "rp:event",
+          customType: triggerCustomType,
           content:
             triggerText ||
             "[Continue and regenerate the response with a fresh narrative angle while staying faithful to the current scene.]",
-          display: false,
-          details: { kind: "reroll" },
+          display: triggerCustomType === "rp:era",
+          details: { kind: triggerCustomType === "rp:era" ? "montage" : "reroll" },
         },
         { triggerTurn: true },
       );
@@ -2028,8 +2202,10 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
     return;
   }
 
-  // Fallback path: non-destructively hide the rejected assistant floor & trigger a fresh generation
-  const fp = computeMessageFingerprint(assistantEntry.message!);
+  // Fallback path: non-destructively hide the rejected story floor & trigger a fresh generation
+  const normalizedAssistant = normalizeBranchMessage(assistantEntry);
+  if (!normalizedAssistant) return;
+  const fp = computeMessageFingerprint(normalizedAssistant);
   rt.commitTx({ kind: "hide_toggle", entryIds: [assistantEntry.id], fingerprints: [fp], hidden: true });
   if (steerHint) {
     rt.commitTx({
@@ -2206,15 +2382,19 @@ export async function actionImpersonate(rt: RpRuntimeHandle, ctx: PiExtensionCon
     (hint ? `Player intent hint: ${hint}\n` : "") +
     `Draft the player's next reply now:`;
 
-  ctx.ui.setWorkingMessage?.("正在以你的视角起草回复…");
+  const task = beginGuardedLlmTask(rt, ctx, "正在以你的视角起草回复…");
   let draft = "";
   try {
-    draft = (await completeWithRegistry(ctx, ctx.model, { systemPrompt, userPrompt, maxTokens: 320, signal: ctx.signal })).trim();
+    draft = (await completeWithRegistry(ctx, ctx.model, { systemPrompt, userPrompt, maxTokens: 320, signal: task.signal })).trim();
   } catch (err) {
     ctx.ui.notify(`代写失败：${(err as Error).message}`, "error");
     return;
   } finally {
-    ctx.ui.setWorkingMessage?.(undefined);
+    task.cleanup();
+  }
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃填入代写草稿。", "warning");
+    return;
   }
 
   if (!draft) {
@@ -2330,15 +2510,19 @@ export async function actionSidePrompt(rt: RpRuntimeHandle, ctx: PiExtensionCont
     .filter(Boolean)
     .join("\n\n");
 
-  ctx.ui.setWorkingMessage?.("场外分析思考中（不写入历史）…");
+  const task = beginGuardedLlmTask(rt, ctx, "场外分析思考中（不写入历史）…");
   let answer = "";
   try {
-    answer = (await completeWithRegistry(ctx, ctx.model, { systemPrompt, userPrompt, maxTokens: 700, signal: ctx.signal })).trim();
+    answer = (await completeWithRegistry(ctx, ctx.model, { systemPrompt, userPrompt, maxTokens: 700, signal: task.signal })).trim();
   } catch (err) {
     ctx.ui.notify(`场外提问失败：${(err as Error).message}`, "error");
     return;
   } finally {
-    ctx.ui.setWorkingMessage?.(undefined);
+    task.cleanup();
+  }
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃显示场外回答。", "warning");
+    return;
   }
 
   if (!answer) {
@@ -2427,7 +2611,7 @@ export async function actionSummarizeOldFloors(
     .join("\n");
 
   const model = resolveSidecarModel(ctx, state.sidecarModel);
-  ctx.ui.setWorkingMessage?.(`正在将最早 ${count} 条对话凝练为记忆书章节…`);
+  const task = beginGuardedLlmTask(rt, ctx, `正在将最早 ${count} 条对话凝练为记忆书章节…`);
   let raw = "";
   try {
     raw = await completeWithRegistry(ctx, model, {
@@ -2435,13 +2619,17 @@ export async function actionSummarizeOldFloors(
         'Summarize the roleplay excerpt into a structured Memory Book chapter. Return ONLY strict JSON: {"title": string, "summary": string, "keywords": string[], "entities": string[]}. Keep summary dense, factual, and under 220 Chinese chars or 110 English words, preserving promises, clues, relationship changes, and emotional turning points.',
       userPrompt: transcript,
       maxTokens: 480,
-      signal: ctx.signal,
+      signal: task.signal,
     });
   } catch (err) {
     ctx.ui.notify(`总结失败：${(err as Error).message}`, "error");
     return;
   } finally {
-    ctx.ui.setWorkingMessage?.(undefined);
+    task.cleanup();
+  }
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃归档旧楼层。", "warning");
+    return;
   }
 
   const parsed = extractJsonObject<{
@@ -2468,9 +2656,13 @@ export async function actionSummarizeOldFloors(
 
   const ok = await ctx.ui.confirm(
     `写入记忆书「${title}」并隐藏这 ${count} 条旧楼层？`,
-    `触发词：${keywords.join("、") || "自动实体"}\n\n${summary}\n\n（旧楼层仅对模型隐藏，随时可 /rp unhide 恢复）`,
+    `触发词：${keywords.join("、") || "自动实体"}\n\n${summary}\n\n（旧楼层仅对模型隐藏，随时可恢复）`,
   );
   if (!ok) return;
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃写入记忆书。", "warning");
+    return;
+  }
 
   const startTurn = Math.max(1, state.turn - Math.ceil(visibleMsgs.length / 2));
   const endTurn = Math.max(startTurn, startTurn + Math.max(1, Math.floor(count / 2)));
@@ -2527,7 +2719,7 @@ export async function actionGenerateLoreEntry(
 
   const recent = collectRecentDialogueLines(ctx, state, 10);
   const model = resolveSidecarModel(ctx, state.sidecarModel);
-  ctx.ui.setWorkingMessage?.(`正在为「${subject}」生成世界书条目…`);
+  const task = beginGuardedLlmTask(rt, ctx, `正在为「${subject}」生成世界书条目…`);
   let raw = "";
   try {
     raw = await completeWithRegistry(ctx, model, {
@@ -2535,13 +2727,17 @@ export async function actionGenerateLoreEntry(
         'Extract a concise World Info (Lorebook) entry for the requested subject based on the recent roleplay dialogue. Return ONLY strict JSON: {"title": string, "keys": string[], "content": string}. Keep content factual and under 220 chars.',
       userPrompt: `Subject: ${subject}\nRecent dialogue:\n${recent.join("\n")}`,
       maxTokens: 420,
-      signal: ctx.signal,
+      signal: task.signal,
     });
   } catch (err) {
     ctx.ui.notify(`生成失败：${(err as Error).message}`, "error");
     return;
   } finally {
-    ctx.ui.setWorkingMessage?.(undefined);
+    task.cleanup();
+  }
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃收录世界书条目。", "warning");
+    return;
   }
 
   const parsed = extractJsonObject<{ title?: string; keys?: string[]; content?: string }>(raw);
@@ -2566,6 +2762,10 @@ export async function actionGenerateLoreEntry(
     `触发词：${keys.join("、")}\n\n${content}`,
   );
   if (!ok) return;
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃收录世界书条目。", "warning");
+    return;
+  }
 
   const compiledBook = compileLoreBook({
     entries: [
@@ -2585,9 +2785,15 @@ export async function actionGenerateLoreEntry(
 
   card.loreBook.entries.push(newEntry);
   if (state.worldDir) {
-    saveUpdatedCard(state.worldDir, card);
+    try {
+      saveUpdatedCard(state.worldDir, card);
+      rt.reloadRuntime(ctx);
+    } catch (err) {
+      ctx.ui.notify(`保存世界书失败（本次会话仍生效）：${(err as Error).message}`, "warning");
+    }
+  } else {
+    ctx.ui.notify("当前角色卡缺少持久化目录，新条目仅在本次会话内存中生效。", "warning");
   }
-  rt.reloadRuntime(ctx);
   ctx.ui.notify(`✅ 已将「${title}」收录进当前角色卡世界书（触发词：${keys.join("、")}）。`, "info");
 }
 
@@ -2624,7 +2830,7 @@ export async function actionQuickReplies(rt: RpRuntimeHandle, ctx: PiExtensionCo
       "↺ 恢复默认快捷回复",
       "✕ 关闭",
     ];
-    const pick = await ctx.ui.select("⚡ 快捷回复与常用动作宏（点选即触发 · Alt+E）", opts);
+    const pick = await ctx.ui.select("⚡ 快捷回复与常用动作宏", opts);
     if (!pick || pick.startsWith("✕")) return;
 
     if (pick.startsWith("+")) {
@@ -2961,6 +3167,10 @@ export async function actionRewriteLast(rt: RpRuntimeHandle, ctx: PiExtensionCon
     ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
     return;
   }
+  if (ctx.isIdle?.() === false) {
+    ctx.ui.notify("当前正在生成回复，请等待结束后再改写。", "warning");
+    return;
+  }
   if (!canCompleteWithRegistry(ctx)) {
     ctx.ui.notify("当前环境不支持模型调用，无法执行局部改写。", "warning");
     return;
@@ -3010,7 +3220,7 @@ export async function actionRewriteLast(rt: RpRuntimeHandle, ctx: PiExtensionCon
     }
   }
 
-  ctx.ui.notify("✂️ 正在按要求定向改写上一条回复…", "info");
+  const task = beginGuardedLlmTask(rt, ctx, "正在按要求定向改写上一条回复…");
   let rewritten = "";
   try {
     rewritten = (
@@ -3021,11 +3231,17 @@ export async function actionRewriteLast(rt: RpRuntimeHandle, ctx: PiExtensionCon
           `Keep story continuity and the original language, and output ONLY the revised prose (no meta commentary, no markdown fences).`,
         userPrompt: `Original reply:\n${original}\n\nMandatory edit instruction (apply visibly and thoroughly):\n${instruction}\n\nOutput the revised reply now:`,
         maxTokens: 4096,
-        signal: ctx.signal,
+        signal: task.signal,
       })
     ).trim();
   } catch (err) {
     ctx.ui.notify(`改写失败：${(err as Error).message}`, "error");
+    return;
+  } finally {
+    task.cleanup();
+  }
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃本次改写结果。", "warning");
     return;
   }
 
@@ -3045,6 +3261,10 @@ export async function actionRewriteLast(rt: RpRuntimeHandle, ctx: PiExtensionCon
     rewritten.slice(0, 600) + (rewritten.length > 600 ? "\n…（已截断预览）" : ""),
   );
   if (!ok) return;
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃替换改写结果。", "warning");
+    return;
+  }
 
   const fp = computeMessageFingerprint(lastTarget.msg);
   rt.commitTx({ kind: "hide_toggle", entryIds: [lastTarget.entry.id], fingerprints: [fp], hidden: true });
@@ -3262,7 +3482,7 @@ export async function actionInterlude(rt: RpRuntimeHandle, ctx: PiExtensionConte
 
   const recent = collectRecentDialogueLines(ctx, state, 8);
   const facts = getActiveFacts(state).slice(-6).map((f) => `- ${f.statement}`).join("\n");
-  ctx.ui.notify("🎞 正在生成零污染幕后插叙（不影响主线）…", "info");
+  const task = beginGuardedLlmTask(rt, ctx, "正在生成幕后插叙…");
   let text = "";
   try {
     text = (
@@ -3276,11 +3496,17 @@ export async function actionInterlude(rt: RpRuntimeHandle, ctx: PiExtensionConte
           (recent.length ? `Recent main scene:\n${recent.join("\n")}\n\n` : "") +
           `Interlude request: ${promptTopic}`,
         maxTokens: 1100,
-        signal: ctx.signal,
+        signal: task.signal,
       })
     ).trim();
   } catch (err) {
     ctx.ui.notify(`生成失败：${(err as Error).message}`, "error");
+    return;
+  } finally {
+    task.cleanup();
+  }
+  if (!task.isStillValid()) {
+    ctx.ui.notify("会话或分支已变更，已放弃显示幕后插叙。", "warning");
     return;
   }
   if (!text) return;
@@ -3311,7 +3537,7 @@ export async function actionExportNovel(rt: RpRuntimeHandle, ctx: PiExtensionCon
     "",
   ];
 
-  let chapterIdx = 1;
+  let chapterIdx = 0;
   let msgCount = 0;
   for (const e of branch) {
     const m = normalizeBranchMessage(e);
@@ -3342,13 +3568,18 @@ export async function actionExportNovel(rt: RpRuntimeHandle, ctx: PiExtensionCon
   }
 
   const exportDir = path.join(ctx.cwd || state.worldDir || getGlobalLibraryDir(), "rp-exports");
-  fs.mkdirSync(exportDir, { recursive: true });
   const stamp = new Date().toISOString().slice(0, 10);
   const customName = argsText.trim().replace(/[^a-zA-Z0-9\u4e00-\u9fa5_-]+/g, "_");
   const fileName = customName ? `${customName}.md` : `${card.slug}-${stamp}.md`;
   const outPath = path.join(exportDir, fileName);
   const fullText = sections.join("\n");
-  fs.writeFileSync(outPath, fullText, "utf-8");
+  try {
+    fs.mkdirSync(exportDir, { recursive: true });
+    fs.writeFileSync(outPath, fullText, "utf-8");
+  } catch (err) {
+    ctx.ui.notify(`导出小说失败：${(err as Error).message}`, "error");
+    return;
+  }
 
   ctx.ui.notify(`📖 已导出纯净小说（${msgCount} 段，约 ${fullText.length} 字）：${outPath}`, "info");
 }

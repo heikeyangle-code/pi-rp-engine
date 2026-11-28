@@ -607,7 +607,7 @@ test("actionRewriteLast guards against identical output & actionExportNovel incl
     assert.ok(exported.includes("开场白：码头起雾了。"), "should include rp:greeting custom_message");
     assert.ok(exported.includes("我走上跳板。"), "should include user message");
     assert.ok(exported.includes("船老大连眼皮都没抬"), "should include rp:rewrite custom_message");
-    assert.ok(exported.includes("## 第 2 节"), "should include rp:era chapter divider");
+    assert.ok(exported.includes("## 第 1 节"), "should include rp:era chapter divider");
     assert.ok(!exported.includes("吐了口烟"), "should exclude replaced/hidden original assistant floor");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });

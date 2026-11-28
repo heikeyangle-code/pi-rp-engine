@@ -83,8 +83,15 @@ export function matchWorldInfoKey(haystack: string, key: string, entry: Compiled
     }
   }
 
-  if (entry.matchWholeWords && /^[a-zA-Z0-9_\-']+$/.test(key)) {
-    const re = new RegExp(`(?<![a-zA-Z0-9_])${escapeRegExp(key)}(?![a-zA-Z0-9_])`, entry.caseSensitive ? "" : "i");
+  if (
+    entry.matchWholeWords &&
+    /^[\p{L}\p{N}_\-'\s]+$/u.test(key) &&
+    !/[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/u.test(key)
+  ) {
+    const re = new RegExp(
+      `(?<![\\p{L}\\p{N}_])${escapeRegExp(key)}(?![\\p{L}\\p{N}_])`,
+      entry.caseSensitive ? "u" : "iu",
+    );
     return re.test(haystack);
   }
   if (entry.caseSensitive) {
@@ -125,13 +132,17 @@ export function matchesWorldInfoKeys(haystack: string, entry: CompiledLoreEntry)
   return findMatchedWorldInfoKey(haystack, entry) !== null;
 }
 
-function deterministicPercent(seed: string): number {
+function deterministicUint32(seed: string): number {
   let h = 2166136261;
   for (let i = 0; i < seed.length; i++) {
     h ^= seed.charCodeAt(i);
     h = Math.imul(h, 16777619);
   }
-  return (h >>> 0) % 100;
+  return h >>> 0;
+}
+
+function deterministicPercent(seed: string): number {
+  return deterministicUint32(seed) % 100;
 }
 
 /** Recall enabled Memory Book chapters by pinned flag, keyword/entity overlap, or BM25 similarity. */
@@ -139,6 +150,7 @@ export function recallMemoryBooks(
   state: SessionRpState,
   queryText: string,
   maxChapters = 4,
+  memoryBookBudget?: number,
 ): { chapters: MemoryBookEntry[]; traces: LoreRecallTraceItem[] } {
   const all = Array.from(state.memoryBooks.values()).filter((m) => m.enabled && m.summary.trim());
   if (all.length === 0) return { chapters: [], traces: [] };
@@ -175,7 +187,21 @@ export function recallMemoryBooks(
   }
 
   scored.sort((a, b) => b.score - a.score || b.entry.createdTurn - a.entry.createdTurn);
-  const picked = scored.slice(0, maxChapters);
+  const candidates = scored.slice(0, maxChapters);
+
+  let picked = candidates;
+  if (typeof memoryBookBudget === "number" && memoryBookBudget > 0) {
+    picked = [];
+    let usedTokens = 0;
+    for (const item of candidates) {
+      const cost = estimateTokens(`[${item.entry.title}] ${item.entry.summary}`);
+      if (item.entry.pinned || usedTokens + cost <= memoryBookBudget || picked.length === 0) {
+        picked.push(item);
+        usedTokens += cost;
+      }
+    }
+  }
+
   return {
     chapters: picked.map((p) => p.entry),
     traces: picked.map((p) => ({
@@ -423,12 +449,12 @@ export function recallLoreWithGraphPpr(options: {
     }
   }
 
-  // Propagate 1-hop entity-to-entity bridges from active Facts & Memory Books
+  // Propagate 1-hop entity-to-entity bridges from active Facts & Memory Books (true normalization by coList.size)
   const bridgedSeeds = new Map<string, number>();
   for (const [ent, weight] of seedEntities.entries()) {
     const coList = entityCooccur.get(ent);
     if (!coList || coList.size === 0) continue;
-    const share = (weight * 0.65) / Math.min(coList.size, 6);
+    const share = (weight * 0.65) / coList.size;
     for (const linkedEnt of coList) {
       if (!seedEntities.has(linkedEnt) && entityToEntries.has(linkedEnt)) {
         bridgedSeeds.set(linkedEnt, (bridgedSeeds.get(linkedEnt) ?? 0) + share);
@@ -482,8 +508,8 @@ export function recallLoreWithGraphPpr(options: {
       for (const ent of ents) {
         hop2Entity.set(ent, (hop2Entity.get(ent) ?? 0) + share);
         const coList = entityCooccur.get(ent);
-        if (coList) {
-          const coShare = (share * 0.5) / Math.min(coList.size, 6);
+        if (coList && coList.size > 0) {
+          const coShare = (share * 0.5) / coList.size;
           for (const linked of coList) {
             hop2Entity.set(linked, (hop2Entity.get(linked) ?? 0) + coShare);
           }
@@ -521,6 +547,12 @@ export function recallLoreWithGraphPpr(options: {
         continue;
       }
       if (e.selective && e.secondaryKeys.length > 0) {
+        if (e.selectiveLogic === "AND_ANY" && !e.secondaryKeys.some((k) => matchWorldInfoKey(haystack, k, e))) {
+          continue;
+        }
+        if (e.selectiveLogic === "AND_ALL" && !e.secondaryKeys.every((k) => matchWorldInfoKey(haystack, k, e))) {
+          continue;
+        }
         if (e.selectiveLogic === "NOT_ANY" && e.secondaryKeys.some((k) => matchWorldInfoKey(haystack, k, e))) {
           continue;
         }
@@ -602,7 +634,7 @@ export function recallLoreWithGraphPpr(options: {
       continue;
     }
     const totalWeight = members.reduce((acc, m) => acc + Math.max(1, m.entry.groupWeight), 0);
-    const pick = deterministicPercent(`${state.turn}:group:${groupName}`) % totalWeight;
+    const pick = deterministicUint32(`${state.turn}:group:${groupName}`) % totalWeight;
     let cursor = 0;
     let chosen = members[0]!;
     for (const m of members) {

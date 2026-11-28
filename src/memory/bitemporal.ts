@@ -9,11 +9,12 @@
 import type { BiTemporalFact, SessionRpState } from "../types.js";
 import { evaluateGate, isFactVisibleToActor } from "../engine/gates.js";
 
-/** Return currently valid facts that also pass physical EraGate checks. */
+/** Return currently valid facts (`validFromTurn <= state.turn` and not invalidated) that pass physical EraGate checks. */
 export function getActiveFacts(state: SessionRpState): BiTemporalFact[] {
   const out: BiTemporalFact[] = [];
   for (const fact of state.facts.values()) {
     if (fact.validUntilTurn !== null) continue;
+    if (fact.validFromTurn > state.turn) continue;
     if (!evaluateGate(fact.gate, state)) continue;
     out.push(fact);
   }
@@ -40,6 +41,11 @@ function extractMatchTokens(text: string): Set<string> {
   const latin = lower.match(/[a-z0-9_]{3,}/g);
   if (latin) {
     for (const w of latin) tokens.add(w);
+  }
+  // 2-char uppercase/alphanumeric tokens (e.g. HP, AI, MP, XP, 2B)
+  const shortUpper = text.match(/(?<![A-Za-z0-9_])[A-Z0-9]{2}(?![A-Za-z0-9_])/g);
+  if (shortUpper) {
+    for (const w of shortUpper) tokens.add(w.toLowerCase());
   }
   // CJK bigrams & short runs
   const cjkRuns = lower.match(/[\u4e00-\u9fff]{2,}/g);
@@ -74,7 +80,7 @@ export function selectFactsForConflictCheck(
   const recent = active.slice(0, recentLimit);
   const older = active.slice(recentLimit);
   const queryLower = `${queryText}\n${state.location}\n${state.presentNpcs.join(" ")}`.toLowerCase();
-  const queryTokens = extractMatchTokens(queryLower);
+  const queryTokens = extractMatchTokens(`${queryText}\n${state.location}\n${state.presentNpcs.join(" ")}`);
 
   const scored: Array<{ fact: BiTemporalFact; score: number }> = [];
   for (const fact of older) {

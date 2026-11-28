@@ -41,7 +41,7 @@
 
 ### 方式二：电脑端使用
 
-如果已在电脑上安装 [Pi CLI](https://github.com/badlogic/pi-mono)，克隆到扩展目录并 `/reload` 即可：
+如果已在电脑上安装 [Pi CLI](https://github.com/earendil-works/pi)，克隆到扩展目录并 `/reload` 即可：
 
 ```bash
 git clone https://github.com/heikeyangle-code/tavern-next.git ~/.pi/agent/extensions/tavern-next

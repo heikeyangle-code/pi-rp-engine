@@ -78,7 +78,7 @@ export function extractMacroVariables(text: string): Array<{ key: string; initia
     if (!key) continue;
     map.set(key, parseScalar(rawVal));
   }
-  const addRe = /\{\{(?:addvar|incvar|decvar)::([^:}]+)(?:::([^}]*))?\}\}/gi;
+  const addRe = /\{\{(?:addvar|addglobalvar|incvar|incglobalvar|decvar|decglobalvar)::([^:}]+)(?:::([^}]*))?\}\}/gi;
   while ((m = addRe.exec(text)) !== null) {
     const key = m[1]!.trim();
     if (key && !map.has(key)) map.set(key, 0);
@@ -93,13 +93,12 @@ export function extractMacroVariables(text: string): Array<{ key: string; initia
 
 function splitMacroOptions(body: string, isDoubleColon: boolean): string[] {
   if (isDoubleColon || body.includes("::")) {
-    return body.split("::").map((s) => s.trim()).filter(Boolean);
+    return body.split("::").map((s) => s.trim());
   }
   // Legacy SillyTavern comma-separated options with \, escape
   return body
     .split(/(?<!\\),/)
-    .map((s) => s.replace(/\\,/g, ",").trim())
-    .filter(Boolean);
+    .map((s) => s.replace(/\\,/g, ",").trim());
 }
 
 /** Evaluate SillyTavern & CCV3 macros cleanly without ever leaking template syntax. */
@@ -107,84 +106,95 @@ export function evaluateMacros(text: string, ctx: MacroContext): string {
   if (!text) return text;
   let out = text;
 
-  // 1. Strip macro comments {{// ...}}
-  out = out.replace(/\{\{\/\/[\s\S]*?\}\}/g, "");
-
-  // 2. Canonical identity & group macros
   const groupList = ctx.groupMembers && ctx.groupMembers.length > 1 ? ctx.groupMembers.join(", ") : ctx.charName;
-  out = out.replace(/\{\{char\}\}|<BOT>/gi, ctx.charName);
-  out = out.replace(/\{\{user\}\}|<USER>/gi, ctx.userName);
-  out = out.replace(/\{\{persona\}\}/gi, ctx.personaDescription ?? "");
-  out = out.replace(/\{\{group\}\}|\{\{charIfNotGroup\}\}/gi, groupList);
-
-  // 3. Formatting helpers
-  out = out.replace(/\{\{newline\}\}/gi, "\n");
-  out = out.replace(/\{\{space\}\}/gi, " ");
-
-  // 4. World clock & recent message macros
-  if (ctx.worldTime !== undefined) {
-    out = out.replace(/\{\{(?:time|isotime)\}\}/gi, ctx.worldTime);
-  }
-  if (ctx.worldDate !== undefined) {
-    out = out.replace(/\{\{(?:date|isodate|weekday)\}\}/gi, ctx.worldDate);
-  }
-  if (ctx.idleDuration !== undefined) {
-    out = out.replace(/\{\{idle_duration\}\}/gi, ctx.idleDuration);
-  }
-  if (ctx.lastUserMessage !== undefined) {
-    out = out.replace(/\{\{lastUserMessage\}\}/gi, ctx.lastUserMessage);
-  }
-  if (ctx.lastCharMessage !== undefined) {
-    out = out.replace(/\{\{lastCharMessage\}\}/gi, ctx.lastCharMessage);
-  }
-
-  // 5. {{outlet::name}} (World Info position=7 outlets)
-  if (ctx.outlets) {
-    out = out.replace(/\{\{outlet::([^}]+)\}\}/gi, (_m, rawName: string) => {
-      const key = rawName.trim();
-      return ctx.outlets?.[key] ?? "";
-    });
-  }
-
-  // 6. {{random::a::b}} / {{random:a,b,c}}
   let choiceCounter = 0;
-  out = out.replace(/\{\{random(::|:)([^}]+)\}\}/gi, (_m, sep: string, body: string) => {
-    const options = splitMacroOptions(body, sep === "::");
-    if (options.length === 0) return "";
-    const idx =
-      ctx.deterministicSeed !== undefined
-        ? seededIndex(ctx.deterministicSeed + choiceCounter++, options.length)
-        : crypto.randomInt(0, options.length);
-    return options[idx] ?? options[0]!;
-  });
-
-  // 7. {{pick::a::b}} / {{pick:a,b,c}} — stable deterministic pick (SillyTavern official behavior!)
-  out = out.replace(/\{\{pick(::|:)([^}]+)\}\}/gi, (_m, sep: string, body: string) => {
-    const options = splitMacroOptions(body, sep === "::");
-    if (options.length === 0) return "";
-    const seed = ctx.deterministicSeed !== undefined ? ctx.deterministicSeed : fnv1aHash(`${ctx.charName}:${ctx.userName}:${body}`);
-    return options[seed % options.length] ?? options[0]!;
-  });
-
-  // 8. {{roll:1d20+3}} / {{roll::1d20}} / {{roll:d20}}
   let rollCounter = 0;
-  out = out.replace(/\{\{roll::?([^}]+)\}\}/gi, (_m, expr: string) => {
-    const seed = ctx.deterministicSeed !== undefined ? ctx.deterministicSeed + 100 + rollCounter++ : undefined;
-    return String(evalRollMacro(expr, seed));
-  });
 
-  // 9. {{getvar::key}} / {{getglobalvar::key}}
-  out = out.replace(/\{\{(?:getvar|getglobalvar)::([^}]+)\}\}/gi, (_m, rawKey: string) => {
-    const key = rawKey.trim();
-    const val = ctx.vars?.[key];
-    return val !== undefined ? String(val) : "";
-  });
+  // 2-pass inner-to-outer resolution for simple nested macros (e.g. {{pick::{{getvar::mood}}::calm}})
+  for (let pass = 0; pass < 2; pass++) {
+    const before = out;
 
-  // 10. Strip mutating variable macros so raw template syntax never leaks to LLM
-  out = out.replace(/\{\{(?:setvar|setglobalvar|addvar|incvar|decvar|flushvar)::[^}]*\}\}/gi, "");
+    // 1. Strip macro comments {{// ...}}
+    out = out.replace(/\{\{\/\/[\s\S]*?\}\}/g, () => "");
 
-  // 11. {{trim}} — removes surrounding whitespace/newlines around the token (official ST behavior)
-  out = out.replace(/[ \t\r\n]*\{\{trim\}\}[ \t\r\n]*/gi, "");
+    // 2. Canonical identity & group macros (callback replacements prevent $& / $1 injection)
+    out = out.replace(/\{\{char\}\}|<BOT>/gi, () => ctx.charName);
+    out = out.replace(/\{\{user\}\}|<USER>/gi, () => ctx.userName);
+    out = out.replace(/\{\{persona\}\}/gi, () => ctx.personaDescription ?? "");
+    out = out.replace(/\{\{group\}\}|\{\{charIfNotGroup\}\}/gi, () => groupList);
+
+    // 3. Formatting helpers
+    out = out.replace(/\{\{newline\}\}/gi, () => "\n");
+    out = out.replace(/\{\{space\}\}/gi, () => " ");
+
+    // 4. World clock & recent message macros
+    if (ctx.worldTime !== undefined) {
+      out = out.replace(/\{\{(?:time|isotime)\}\}/gi, () => ctx.worldTime!);
+    }
+    if (ctx.worldDate !== undefined) {
+      out = out.replace(/\{\{(?:date|isodate|weekday)\}\}/gi, () => ctx.worldDate!);
+    }
+    if (ctx.idleDuration !== undefined) {
+      out = out.replace(/\{\{idle_duration\}\}/gi, () => ctx.idleDuration!);
+    }
+    if (ctx.lastUserMessage !== undefined) {
+      out = out.replace(/\{\{lastUserMessage\}\}/gi, () => ctx.lastUserMessage!);
+    }
+    if (ctx.lastCharMessage !== undefined) {
+      out = out.replace(/\{\{lastCharMessage\}\}/gi, () => ctx.lastCharMessage!);
+    }
+
+    // 5. {{outlet::name}} (World Info position=7 outlets)
+    if (ctx.outlets) {
+      out = out.replace(/\{\{outlet::([^{}]+)\}\}/gi, (_m, rawName: string) => {
+        const key = rawName.trim();
+        return ctx.outlets?.[key] ?? "";
+      });
+    }
+
+    // 6. {{random::a::b}} / {{random:a,b,c}}
+    out = out.replace(/\{\{random(::|:)([^{}]+)\}\}/gi, (_m, sep: string, body: string) => {
+      const options = splitMacroOptions(body, sep === "::");
+      if (options.length === 0) return "";
+      const idx =
+        ctx.deterministicSeed !== undefined
+          ? seededIndex(ctx.deterministicSeed + choiceCounter++, options.length)
+          : crypto.randomInt(0, options.length);
+      return options[idx] ?? options[0]!;
+    });
+
+    // 7. {{pick::a::b}} / {{pick:a,b,c}} — stable deterministic pick (SillyTavern official behavior!)
+    out = out.replace(/\{\{pick(::|:)([^{}]+)\}\}/gi, (_m, sep: string, body: string) => {
+      const options = splitMacroOptions(body, sep === "::");
+      if (options.length === 0) return "";
+      const seed = ctx.deterministicSeed !== undefined ? ctx.deterministicSeed : fnv1aHash(`${ctx.charName}:${ctx.userName}:${body}`);
+      return options[seed % options.length] ?? options[0]!;
+    });
+
+    // 8. {{roll:1d20+3}} / {{roll::1d20}} / {{roll:d20}}
+    out = out.replace(/\{\{roll::?([^{}]+)\}\}/gi, (_m, expr: string) => {
+      const seed = ctx.deterministicSeed !== undefined ? ctx.deterministicSeed + 100 + rollCounter++ : undefined;
+      return String(evalRollMacro(expr, seed));
+    });
+
+    // 9. {{getvar::key}} / {{getglobalvar::key}}
+    out = out.replace(/\{\{(?:getvar|getglobalvar)::([^{}]+)\}\}/gi, (_m, rawKey: string) => {
+      const key = rawKey.trim();
+      const val = ctx.vars?.[key];
+      return val !== undefined ? String(val) : "";
+    });
+
+    // 10. Strip mutating variable macros so raw template syntax never leaks to LLM
+    out = out.replace(
+      /\{\{(?:setvar|setglobalvar|addvar|addglobalvar|incvar|incglobalvar|decvar|decglobalvar|flushvar|flushglobalvar)::[^{}]*\}\}/gi,
+      () => "",
+    );
+
+    // 11. {{trim}} — removes surrounding whitespace/newlines around the token (official ST behavior)
+    out = out.replace(/[ \t\r\n]*\{\{trim\}\}[ \t\r\n]*/gi, () => "");
+
+    if (out === before || !out.includes("{{")) break;
+  }
 
   return out;
 }

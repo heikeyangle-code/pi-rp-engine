@@ -12,6 +12,13 @@ export interface ValidationResult {
   clampedValue?: number | string | boolean;
 }
 
+function findCaseInsensitiveKey<T>(obj: Record<string, T> | undefined, target: string): string | undefined {
+  if (!obj) return undefined;
+  if (Object.prototype.hasOwnProperty.call(obj, target)) return target;
+  const lower = target.trim().toLowerCase();
+  return Object.keys(obj).find((k) => k.trim().toLowerCase() === lower);
+}
+
 /**
  * Build default step-by-step bidirectional adjacency transitions for an ordered state list
  * (e.g. ["陌生", "熟悉", "信任", "亲密"] -> each state can only move to adjacent states,
@@ -55,7 +62,10 @@ export function validateCfsmTransition(
   axis: string,
   to: string,
 ): ValidationResult {
-  const def: CfsmAxisDef | undefined = state.cfsmDefs[actorId]?.[axis];
+  const defActorKey = findCaseInsensitiveKey(state.cfsmDefs, actorId);
+  const defAxisKey = defActorKey ? findCaseInsensitiveKey(state.cfsmDefs[defActorKey], axis) : undefined;
+  const def: CfsmAxisDef | undefined =
+    defActorKey && defAxisKey ? state.cfsmDefs[defActorKey]?.[defAxisKey] : undefined;
   if (!def) {
     // Ad-hoc axis allowed if no formal schema was registered
     return { ok: true };
@@ -66,7 +76,9 @@ export function validateCfsmTransition(
       error: `Invalid CFSM state "${to}" for ${actorId}.${axis}; allowed: [${def.states.join(", ")}]`,
     };
   }
-  const current = state.cfsmStates[actorId]?.[axis]?.state ?? def.initial;
+  const stateActorKey = findCaseInsensitiveKey(state.cfsmStates, defActorKey!) ?? defActorKey!;
+  const stateAxisKey = findCaseInsensitiveKey(state.cfsmStates[stateActorKey], defAxisKey!) ?? defAxisKey!;
+  const current = state.cfsmStates[stateActorKey]?.[stateAxisKey]?.state ?? def.initial;
   if (def.transitions) {
     const allowedNext = def.transitions[current] ?? [];
     if (current !== to && !allowedNext.includes(to)) {

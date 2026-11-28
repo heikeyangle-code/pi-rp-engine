@@ -10,7 +10,6 @@
  */
 
 import type {
-  CardArchetype,
   CompiledCard,
   ContextXRaySnapshot,
   PacingMode,
@@ -32,15 +31,6 @@ const PACING_LABEL: Record<PacingMode, string> = {
   relaxed: "舒缓",
   balanced: "均衡",
   dramatic: "紧张",
-};
-
-const ARCHETYPE_LABEL: Record<CardArchetype, string> = {
-  companion: "陪伴",
-  "slice-of-life": "日常",
-  "rpg-sandbox": "沙盒",
-  mystery: "悬疑",
-  "epic-saga": "史诗",
-  ensemble: "群像",
 };
 
 function formatKvBadge(xray?: ContextXRaySnapshot | null): string | null {
@@ -78,11 +68,6 @@ export function formatRpStatusLine(
   if (activeFlags > 0) parts.push(`🚩${activeFlags}`);
   const openHooks = Array.from(state.foresights.values()).filter((h) => h.status === "open").length;
   if (openHooks > 0) parts.push(`伏笔:${openHooks}`);
-  if (state.memoryBooks.size > 0) parts.push(`书:${state.memoryBooks.size}`);
-  if (xray && xray.blindSpotCount > 0) parts.push(`🔒${xray.blindSpotCount}`);
-  if (state.pacingMode !== "balanced") parts.push(PACING_LABEL[state.pacingMode]);
-  if (state.innerMonologue) parts.push("💭");
-  if (state.notes.length > 0) parts.push(`导:${state.notes.length}`);
   const kv = formatKvBadge(xray);
   if (kv && (kv.startsWith("⚠") || (xray && xray.cacheHitStreak >= 2))) parts.push(kv);
   return parts.join(" · ");
@@ -228,7 +213,7 @@ export function renderRpHud(
   card: CompiledCard | null,
   xray?: ContextXRaySnapshot | null,
 ): void {
-  if (!ctx?.ui) return;
+  if (!ctx?.ui || ctx.hasUI === false) return;
 
   if (!state.active || state.hudMode === "off") {
     clearRpHud(ctx);
@@ -266,7 +251,7 @@ export function renderRpHud(
 }
 
 export function clearRpHud(ctx: PiExtensionContext): void {
-  if (!ctx?.ui) return;
+  if (!ctx?.ui || ctx.hasUI === false) return;
   try {
     ctx.ui.setStatus("rp", undefined);
     ctx.ui.setWidget("rp-hud", undefined);

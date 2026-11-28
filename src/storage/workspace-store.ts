@@ -36,9 +36,36 @@ function readJsonSafe<T>(filePath: string): T | null {
   }
 }
 
+export function assertSafeSegment(id: string, label: string): string {
+  if (
+    typeof id !== "string" ||
+    !id.trim() ||
+    id === "." ||
+    id === ".." ||
+    id.includes("..") ||
+    id.includes("/") ||
+    id.includes("\\") ||
+    id.includes("\0")
+  ) {
+    throw new Error(`Invalid ${label}: "${String(id)}"`);
+  }
+  return id;
+}
+
+function resolveInsideRoot(rootDir: string, ...segments: string[]): string {
+  const resolvedRoot = path.resolve(rootDir);
+  const target = path.resolve(resolvedRoot, ...segments);
+  if (!target.startsWith(resolvedRoot + path.sep)) {
+    throw new Error(`Path traversal rejected: ${target}`);
+  }
+  return target;
+}
+
 function writeJson(filePath: string, data: unknown): void {
   ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), "utf8");
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf8");
+  fs.renameSync(tmpPath, filePath);
 }
 
 export function saveCompiledCard(options: {
@@ -48,7 +75,9 @@ export function saveCompiledCard(options: {
   avatarPng?: Buffer;
   assets?: UnpackedAsset[];
 }): string {
-  const cardDir = path.join(options.baseDir, "cards", options.card.slug);
+  const safeSlug = assertSafeSegment(options.card.slug, "card slug");
+  const cardsRoot = path.join(options.baseDir, "cards");
+  const cardDir = resolveInsideRoot(cardsRoot, safeSlug);
   ensureDir(cardDir);
 
   if (options.avatarPng) {
@@ -72,21 +101,29 @@ export function saveCompiledCard(options: {
 }
 
 export function loadCompiledCard(baseDir: string, slug: string): CompiledCard | null {
-  return readJsonSafe<CompiledCard>(path.join(baseDir, "cards", slug, "card.compiled.json"));
+  const safeSlug = assertSafeSegment(slug, "card slug");
+  const target = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.compiled.json");
+  return readJsonSafe<CompiledCard>(target);
 }
 
 export function loadRawCardJson(baseDir: string, slug: string): Record<string, unknown> | null {
-  return readJsonSafe<Record<string, unknown>>(path.join(baseDir, "cards", slug, "card.raw.json"));
+  const safeSlug = assertSafeSegment(slug, "card slug");
+  const target = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.raw.json");
+  return readJsonSafe<Record<string, unknown>>(target);
 }
 
 export function listCardSlugs(baseDir: string): string[] {
   const cardsDir = path.join(baseDir, "cards");
-  if (!fs.existsSync(cardsDir)) return [];
-  return fs
-    .readdirSync(cardsDir, { withFileTypes: true })
-    .filter((d) => d.isDirectory() && fs.existsSync(path.join(cardsDir, d.name, "card.compiled.json")))
-    .map((d) => d.name)
-    .sort();
+  try {
+    if (!fs.existsSync(cardsDir)) return [];
+    return fs
+      .readdirSync(cardsDir, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && fs.existsSync(path.join(cardsDir, d.name, "card.compiled.json")))
+      .map((d) => d.name)
+      .sort();
+  } catch {
+    return [];
+  }
 }
 
 export interface CardSummaryEntry {
@@ -192,30 +229,39 @@ export function resolveCardBySlug(
 }
 
 export function saveCompiledPreset(baseDir: string, preset: CompiledPreset): string {
-  const dest = path.join(baseDir, "presets", `${preset.id}.json`);
+  const safeId = assertSafeSegment(preset.id, "preset id");
+  const dest = resolveInsideRoot(path.join(baseDir, "presets"), `${safeId}.json`);
   writeJson(dest, preset);
   return dest;
 }
 
 export function loadCompiledPreset(cwd: string, presetId: string): CompiledPreset | null {
-  const proj = readJsonSafe<CompiledPreset>(path.join(getProjectRpDir(cwd), "presets", `${presetId}.json`));
+  const safeId = assertSafeSegment(presetId, "preset id");
+  const projPath = resolveInsideRoot(path.join(getProjectRpDir(cwd), "presets"), `${safeId}.json`);
+  const proj = readJsonSafe<CompiledPreset>(projPath);
   if (proj) return proj;
-  return readJsonSafe<CompiledPreset>(path.join(getGlobalLibraryDir(), "presets", `${presetId}.json`));
+  const libPath = resolveInsideRoot(path.join(getGlobalLibraryDir(), "presets"), `${safeId}.json`);
+  return readJsonSafe<CompiledPreset>(libPath);
 }
 
 export function listPresetIds(cwd: string): string[] {
   const ids = new Set<string>();
   for (const base of [getProjectRpDir(cwd), getGlobalLibraryDir()]) {
     const dir = path.join(base, "presets");
-    if (!fs.existsSync(dir)) continue;
-    for (const f of fs.readdirSync(dir)) {
-      if (f.endsWith(".json")) ids.add(f.slice(0, -5));
+    try {
+      if (!fs.existsSync(dir)) continue;
+      for (const f of fs.readdirSync(dir)) {
+        if (f.endsWith(".json")) ids.add(f.slice(0, -5));
+      }
+    } catch {
+      // Skip inaccessible preset directory
     }
   }
   return Array.from(ids).sort();
 }
 
 export function saveUpdatedCard(baseDir: string, card: CompiledCard): void {
+  const safeSlug = assertSafeSegment(card.slug, "card slug");
   card.frozen.constantLoreIds = card.loreBook.entries
     .filter((e) => e.enabled && e.constant && [0, 1, 5, 6].includes(e.position))
     .map((e) => e.id);
@@ -223,20 +269,23 @@ export function saveUpdatedCard(baseDir: string, card: CompiledCard): void {
   card.importReport.loreCount = card.loreBook.entries.length;
   card.importReport.constantLoreCount = constantCount;
   card.importReport.dynamicLoreCount = Math.max(0, card.loreBook.entries.length - constantCount);
-  writeJson(path.join(baseDir, "cards", card.slug, "card.compiled.json"), card);
+  const dest = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.compiled.json");
+  writeJson(dest, card);
 }
 
 export function deleteCompiledCard(baseDir: string, slug: string): boolean {
-  const cardDir = path.join(baseDir, "cards", slug);
+  const safeSlug = assertSafeSegment(slug, "card slug");
+  const cardDir = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug);
   if (!fs.existsSync(cardDir)) return false;
   fs.rmSync(cardDir, { recursive: true, force: true });
   return true;
 }
 
 export function deleteCompiledPreset(cwd: string, presetId: string): boolean {
+  const safeId = assertSafeSegment(presetId, "preset id");
   let removed = false;
   for (const base of [getProjectRpDir(cwd), getGlobalLibraryDir()]) {
-    const file = path.join(base, "presets", `${presetId}.json`);
+    const file = resolveInsideRoot(path.join(base, "presets"), `${safeId}.json`);
     if (fs.existsSync(file)) {
       fs.rmSync(file, { force: true });
       removed = true;
@@ -250,9 +299,13 @@ export function mergeExternalLoreBook(baseDir: string, slug: string, extraBook: 
   if (!card) return null;
   const existingIds = new Set(card.loreBook.entries.map((e) => e.id));
   for (const entry of extraBook.entries) {
-    const uniqueId = existingIds.has(entry.id) ? `ext_${entry.id}_${existingIds.size}` : entry.id;
-    existingIds.add(uniqueId);
-    card.loreBook.entries.push({ ...entry, id: uniqueId });
+    let candidate = entry.id;
+    let suffix = 1;
+    while (existingIds.has(candidate)) {
+      candidate = `ext_${entry.id}_${suffix++}`;
+    }
+    existingIds.add(candidate);
+    card.loreBook.entries.push({ ...entry, id: candidate });
   }
   saveUpdatedCard(baseDir, card);
   return card;
@@ -271,7 +324,19 @@ export function loadPersonas(cwd: string): PersonaProfile[] {
 export function savePersona(cwd: string, persona: PersonaProfile, scope: "project" | "library" = "library"): void {
   const baseDir = scope === "project" ? getProjectRpDir(cwd) : getGlobalLibraryDir();
   const filePath = path.join(baseDir, "personas.json");
-  const list = readJsonSafe<PersonaProfile[]>(filePath) ?? [];
+  let list: PersonaProfile[] = [];
+  if (fs.existsSync(filePath)) {
+    const parsed = readJsonSafe<PersonaProfile[]>(filePath);
+    if (Array.isArray(parsed)) {
+      list = parsed;
+    } else {
+      try {
+        fs.renameSync(filePath, `${filePath}.corrupt.${Date.now()}`);
+      } catch {
+        // Non-fatal if corrupt backup cannot be renamed
+      }
+    }
+  }
   const idx = list.findIndex((p) => p.id === persona.id);
   if (idx >= 0) list[idx] = persona;
   else list.push(persona);

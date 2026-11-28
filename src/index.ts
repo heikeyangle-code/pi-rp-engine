@@ -25,6 +25,7 @@ import type {
   CompiledLoreEntry,
   CompiledPreset,
   ContextXRaySnapshot,
+  MemoryBookEntry,
   PiCompactionPreparation,
   PiExtensionAPI,
   PiExtensionContext,
@@ -38,8 +39,7 @@ import { loadCompiledCard, loadCompiledPreset, resolveCardBySlug } from "./stora
 import { recallLoreWithGraphPpr, recallMemoryBooks } from "./memory/graph-ppr.js";
 import { type HistoryRecallCooldown, createTurnRecallScope } from "./memory/history-recall.js";
 import { buildSemanticMemSceneCompaction } from "./memory/compaction.js";
-import { getActiveFacts, selectFactsForZone3 } from "./memory/bitemporal.js";
-import { partitionEpistemicFacts } from "./engine/gates.js";
+import { getActiveFacts } from "./memory/bitemporal.js";
 import { evaluateNarrativeHealth } from "./engine/stagnation.js";
 import { estimateTokens } from "./context/token-budget.js";
 import {
@@ -48,7 +48,6 @@ import {
   buildZone3TransientTail,
   computeMessagesTokens,
   computeZone1Hash,
-  evaluateActiveStorylets,
   extractRecentMessagesText,
 } from "./context/zone-builder.js";
 import {
@@ -101,7 +100,7 @@ function extractMessageText(msg: PiMessage | undefined): string {
 export function isMalformedToolLeakText(text: string): boolean {
   const trimmed = text.trim();
   if (!trimmed) return false;
-  if (trimmed.length > 220) return false;
+  if (trimmed.length > 1500) return false;
   // Strip any leaked DSML / XML tool tags & quotes; if nothing meaningful remains, it's a pure leak!
   const stripped = trimmed
     .replace(/<[|｜]?\s*DSML\s*[|｜]?[^>]*>?/gi, "")
@@ -114,7 +113,14 @@ export function isMalformedToolLeakText(text: string): boolean {
 /** Detect reasoning-only or completely empty assistant stops (ported from dsh-tavern body-generation-failure.js). */
 export function isReasoningOnlyOrEmptyStop(msg: PiMessage | undefined): boolean {
   if (!msg || msg.role !== "assistant") return false;
-  if (msg.stopReason === "toolUse" || msg.stopReason === "tool_calls" || msg.stopReason === "aborted") return false;
+  if (
+    msg.stopReason === "toolUse" ||
+    msg.stopReason === "tool_calls" ||
+    msg.stopReason === "aborted" ||
+    msg.stopReason === "error"
+  ) {
+    return false;
+  }
   if (Array.isArray(msg.content)) {
     const hasToolCall = msg.content.some((b) => b && typeof b === "object" && (b.type === "toolCall" || b.type === "tool_use"));
     if (hasToolCall) return false;
@@ -150,6 +156,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     cooldown: Record<string, number>;
     consumedOneShots: string[];
   } | null = null;
+  let pendingCompactionBookEntry: MemoryBookEntry | null = null;
 
   const rpToolSet = new Set<string>(RP_TOOL_NAMES);
 
@@ -184,6 +191,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     cacheHitStreak = 0;
     lastXRay = null;
     pendingLoreRuntime = null;
+    pendingCompactionBookEntry = null;
   }
 
   function commitTx(tx: RpTxEntry): void {
@@ -216,9 +224,19 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       pi.setActiveTools([...savedCodingTools]);
       savedCodingTools = null;
     } else {
-      const filtered = pi.getActiveTools().filter((t) => !rpToolSet.has(t));
-      if (filtered.length !== pi.getActiveTools().length) {
-        pi.setActiveTools(filtered);
+      const current = pi.getActiveTools();
+      const filtered = current.filter((t) => !rpToolSet.has(t));
+      if (filtered.length > 0) {
+        if (filtered.length !== current.length) {
+          pi.setActiveTools(filtered);
+        }
+      } else if (current.length > 0) {
+        const fallback = pi.getAllTools?.().map((t) => t.name).filter((n) => !rpToolSet.has(n));
+        if (fallback && fallback.length > 0) {
+          pi.setActiveTools(fallback);
+        } else if (filtered.length !== current.length) {
+          pi.setActiveTools(filtered);
+        }
       }
     }
   }
@@ -285,12 +303,14 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     activeCard = card;
 
     if (!activeCard) {
+      const missingSlug = state.cardSlug;
       activeCard = null;
       extraCastCards = [];
       activePreset = null;
       state.active = false;
       restoreCodingTools();
       clearRpHud(ctx);
+      ctx?.ui?.notify?.(`无法加载角色卡「${missingSlug}」，已自动退回普通编程会话。`, "warning");
       return;
     }
 
@@ -432,6 +452,14 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
 
   pi.on("session_tree", (_event, ctx) => {
     reloadRuntime(ctx);
+  });
+
+  pi.on("session_shutdown", (_event, ctx) => {
+    ctx?.ui?.setWorkingMessage?.(undefined);
+    if (rpTitleSet) {
+      ctx?.ui?.setTitle?.("Pi");
+      rpTitleSet = false;
+    }
   });
 
   // Zero-friction inline OOC shorthand: `((...))` or `（（...））` automatically marks OOC turn without advancing story/clock
@@ -601,10 +629,18 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     // If multiple context calls fire inside the same turn (tool-call loop), next step inherits prefix_hit unless mutated!
     pendingCacheInvalidation = "prefix_hit";
 
-    // Record live Context X-Ray snapshot (0 extra LLM calls!)
-    const activeFacts = selectFactsForZone3(state, recentText, 8, 6);
-    const { blindSpots } = partitionEpistemicFacts(activeFacts, state.presentNpcs);
-    const activeStorylets = evaluateActiveStorylets(state);
+    // Record live Context X-Ray snapshot (0 extra LLM calls; reuse zone3 output directly without re-running fact/storylet queries!)
+    const recalledBlock = /<rp_recalled_context>([\s\S]*?)<\/rp_recalled_context>/.exec(zone3)?.[1] ?? "";
+    const knownFactCount = (recalledBlock.match(/^- \[T\d+\] /gm) ?? []).length;
+    const blindSpotCount = (recalledBlock.match(/^- \[HIDDEN FROM: /gm) ?? []).length;
+    const activeFactCount = knownFactCount + blindSpotCount;
+
+    const directorBlock = /<rp_director_note>([\s\S]*?)<\/rp_director_note>/.exec(zone3)?.[1] ?? "";
+    const activeStoryletTitles: string[] = [];
+    for (const m of directorBlock.matchAll(/^- \[Triggered Storylet · ([^\]]+)\]/gm)) {
+      if (m[1]) activeStoryletTitles.push(m[1]);
+    }
+
     const zone3Tokens = estimateTokens(zone3);
     const zone2Tokens = Math.max(0, computeMessagesTokens(outMessages) - zone3Tokens);
 
@@ -624,9 +660,9 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       recalled: [...recall.traces, ...memBookRecall.traces],
       gatedOut: recall.gatedOut,
       budgetDropped: recall.budgetDropped,
-      activeFactCount: activeFacts.length,
-      blindSpotCount: blindSpots.length,
-      activeStoryletTitles: activeStorylets.map((s) => s.title),
+      activeFactCount,
+      blindSpotCount,
+      activeStoryletTitles,
       hiddenFloorCount: state.hiddenEntryIds.size,
       repetitionScore: narrativeHealth.repetitionScore,
       stagnantTurns: narrativeHealth.stagnantTurns,
@@ -635,15 +671,79 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     return { messages: outMessages };
   });
 
-  // Official Pi SDK `before_provider_request`: optionally apply SillyTavern preset sampling parameters
-  pi.on("before_provider_request", (event) => {
+  // Official Pi SDK `before_provider_request`: optionally apply SillyTavern preset sampling parameters (provider-aware)
+  pi.on("before_provider_request", (event, ctx) => {
     if (!state.active || !state.applyPresetSampling || !activePreset) return;
     const payload = event?.payload;
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
 
     const s = activePreset.sampling;
     const next = { ...(payload as Record<string, unknown>) };
+    const modelObj = (ctx?.model && typeof ctx.model === "object" ? ctx.model : undefined) as
+      | { api?: string; provider?: string }
+      | undefined;
+    const api = typeof modelObj?.api === "string" ? modelObj.api.toLowerCase() : "";
+    const provider = typeof modelObj?.provider === "string" ? modelObj.provider.toLowerCase() : "";
+
     let mutated = false;
+
+    if (api.includes("google") || provider === "google" || provider.startsWith("google-")) {
+      const existingCfg =
+        next.generationConfig && typeof next.generationConfig === "object" && !Array.isArray(next.generationConfig)
+          ? { ...(next.generationConfig as Record<string, unknown>) }
+          : {};
+      let cfgMutated = false;
+      if (typeof s.temperature === "number" && Number.isFinite(s.temperature)) {
+        existingCfg.temperature = s.temperature;
+        cfgMutated = true;
+      }
+      if (typeof s.topP === "number" && Number.isFinite(s.topP)) {
+        existingCfg.topP = s.topP;
+        cfgMutated = true;
+      }
+      if (typeof s.maxTokens === "number" && Number.isFinite(s.maxTokens) && s.maxTokens > 0) {
+        existingCfg.maxOutputTokens = s.maxTokens;
+        cfgMutated = true;
+      }
+      if (cfgMutated) {
+        next.generationConfig = existingCfg;
+        mutated = true;
+      }
+      return mutated ? next : undefined;
+    }
+
+    if (api === "anthropic-messages" || api.includes("anthropic") || provider === "anthropic") {
+      if (typeof s.temperature === "number" && Number.isFinite(s.temperature)) {
+        next.temperature = s.temperature;
+        mutated = true;
+      }
+      if (typeof s.topP === "number" && Number.isFinite(s.topP)) {
+        next.top_p = s.topP;
+        mutated = true;
+      }
+      if (typeof s.maxTokens === "number" && Number.isFinite(s.maxTokens) && s.maxTokens > 0) {
+        next.max_tokens = s.maxTokens;
+        mutated = true;
+      }
+      return mutated ? next : undefined;
+    }
+
+    if (api === "openai-responses") {
+      if (typeof s.temperature === "number" && Number.isFinite(s.temperature)) {
+        next.temperature = s.temperature;
+        mutated = true;
+      }
+      if (typeof s.topP === "number" && Number.isFinite(s.topP)) {
+        next.top_p = s.topP;
+        mutated = true;
+      }
+      if (typeof s.maxTokens === "number" && Number.isFinite(s.maxTokens) && s.maxTokens > 0) {
+        next.max_output_tokens = s.maxTokens;
+        mutated = true;
+      }
+      return mutated ? next : undefined;
+    }
+
     if (typeof s.temperature === "number" && Number.isFinite(s.temperature)) {
       next.temperature = s.temperature;
       mutated = true;
@@ -677,17 +777,31 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       return;
     }
 
+    const resolvedEntryId =
+      typeof event?.messageEntryId === "string" && event.messageEntryId
+        ? event.messageEntryId
+        : typeof msg?.entryId === "string" && msg.entryId
+          ? msg.entryId
+          : typeof msg?.id === "string" && msg.id
+            ? msg.id
+            : null;
+    const isErrorOrAborted =
+      event?.outcome === "error" ||
+      event?.outcome === "aborted" ||
+      msg?.stopReason === "error" ||
+      msg?.stopReason === "aborted";
+
     if (msg) {
       lastAssistantText = extractMessageText(msg);
       // Auto-recover from DeepSeek V4 DSML / malformed `<rp_state_patch">` OR reasoning-only/empty stop without burning a turn!
-      const isMalformed = isMalformedToolLeakText(lastAssistantText);
-      const isEmptyStop = !isMalformed && isReasoningOnlyOrEmptyStop(msg);
+      // Never trigger recovery retries on API errors or aborted turns.
+      const isMalformed = !isErrorOrAborted && isMalformedToolLeakText(lastAssistantText);
+      const isEmptyStop = !isErrorOrAborted && !isMalformed && isReasoningOnlyOrEmptyStop(msg);
       if (isMalformed || isEmptyStop) {
         const fp = computeMessageFingerprint(msg);
-        const entryId = typeof msg.entryId === "string" ? msg.entryId : typeof msg.id === "string" ? msg.id : null;
         commitTx({
           kind: "hide_toggle",
-          entryIds: entryId ? [entryId] : [],
+          entryIds: resolvedEntryId ? [resolvedEntryId] : [],
           fingerprints: [fp],
           hidden: true,
         });
@@ -725,8 +839,9 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     if (thisTurnOoc && msg) {
       const hideIds: string[] = [];
       const hideFps: string[] = [computeMessageFingerprint(msg)];
-      const assistantId = typeof msg.entryId === "string" ? msg.entryId : typeof msg.id === "string" ? msg.id : null;
+      const assistantId = resolvedEntryId;
       if (assistantId) hideIds.push(assistantId);
+      let hidFallbackAssistant = Boolean(assistantId);
       const branch = ctx?.sessionManager?.getBranch?.() ?? [];
       for (let i = branch.length - 1; i >= 0; i--) {
         const e = branch[i]!;
@@ -737,9 +852,10 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
             hideFps.push(computeMessageFingerprint(e.message));
             break;
           }
-          if (e.message.role === "assistant" && !assistantId) {
+          if (e.message.role === "assistant" && !hidFallbackAssistant) {
             hideIds.push(e.id);
             hideFps.push(computeMessageFingerprint(e.message));
+            hidFallbackAssistant = true;
           }
         } else if (e.type === "custom_message" && e.customType === "rp:ooc") {
           hideIds.push(e.id);
@@ -772,39 +888,47 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     if (lastTurnWasOoc || state.turn <= 0) return;
     if (lastSidecarSettledTurn === state.turn) return;
     lastSidecarSettledTurn = state.turn;
-    const committed = await runSidecarLightSettlement({
-      pi,
-      ctx,
-      state,
-      lastUserText,
-      lastAssistantText,
-    });
-    if (committed > 0) {
-      renderRpHud(ctx, state, activeCard, lastXRay);
+    try {
+      const committed = await runSidecarLightSettlement({
+        pi,
+        ctx,
+        state,
+        lastUserText,
+        lastAssistantText,
+      });
+      if (committed > 0) {
+        renderRpHud(ctx, state, activeCard, lastXRay);
+      }
+    } catch {
+      // Sidecar settlement is best-effort and must never break the main RP turn
     }
   };
 
-  pi.on("agent_settled", async (_event, ctx) => {
+  pi.on("agent_settled", async (event, ctx) => {
+    if (event?.aborted) return;
     await triggerSidecarOnce(ctx);
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     ctx?.ui?.setWorkingMessage?.(undefined);
     isOocTurn = false; // Safe recovery if turn was aborted before turn_end
+    if (event?.aborted) return;
     await triggerSidecarOnce(ctx);
   });
 
   // EverMemOS Semantic MemScene Compaction — 100% Official Pi SDK async CompactionResult contract
-  // AND automatically persists the consolidated MemScene into a searchable Memory Book chapter!
+  // Stashes the consolidated MemScene draft here and commits it in `session_compact` once compaction succeeds!
   pi.on("session_before_compact", async (event, ctx) => {
     if (!state.active) return;
     const prep = (event?.preparation ?? {}) as Partial<PiCompactionPreparation>;
     const summary = await buildSemanticMemSceneCompaction(ctx, state, {
       messagesToSummarize: prep.messagesToSummarize,
       previousSummary: prep.previousSummary,
+      signal: event?.signal,
     });
 
-    // Persist EverMemOS MemScene consolidation into Memory Books so future turns can Graph-PPR recall it!
+    // Prepare EverMemOS MemScene draft to commit on `session_compact` with a non-colliding ID
+    pendingCompactionBookEntry = null;
     if (summary.trim()) {
       const prevMaxTurn = Array.from(state.memoryBooks.values()).reduce(
         (acc, b) => Math.max(acc, b.turnRange[1]),
@@ -823,20 +947,17 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
           ].filter(Boolean),
         ),
       ).slice(0, 12);
-      commitTx({
-        kind: "memory_book_upsert",
-        entry: {
-          id: `mb_compact_t${endTurn}`,
-          title: `压缩记忆章 (T${startTurn}-T${endTurn}${state.location ? ` · ${state.location}` : ""})`,
-          summary: summary.trim().slice(0, 1600),
-          entities,
-          keywords: entities.slice(0, 8),
-          turnRange: [startTurn, endTurn],
-          enabled: true,
-          pinned: false,
-          createdTurn: state.turn,
-        },
-      });
+      pendingCompactionBookEntry = {
+        id: `mb_compact_t${endTurn}_${Date.now().toString(36).slice(-4)}`,
+        title: `压缩记忆章 (T${startTurn}-T${endTurn}${state.location ? ` · ${state.location}` : ""})`,
+        summary: summary.trim().slice(0, 1600),
+        entities,
+        keywords: entities.slice(0, 8),
+        turnRange: [startTurn, endTurn],
+        enabled: true,
+        pinned: false,
+        createdTurn: state.turn,
+      };
     }
 
     const firstKeptEntryId =
@@ -859,5 +980,14 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
         },
       },
     };
+  });
+
+  // Commit the stashed MemScene Memory Book chapter only after compaction actually succeeds
+  pi.on("session_compact", (_event, ctx) => {
+    if (!state.active || !pendingCompactionBookEntry) return;
+    const entry = pendingCompactionBookEntry;
+    pendingCompactionBookEntry = null;
+    commitTx({ kind: "memory_book_upsert", entry });
+    renderRpHud(ctx, state, activeCard, lastXRay);
   });
 }

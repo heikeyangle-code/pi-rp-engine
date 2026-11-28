@@ -2,8 +2,8 @@
  * Unified, provider-neutral LLM helper for Pi's official `ctx.modelRegistry`.
  *
  * v3 Hardening:
- *  - Strips reasoning/CoT tags (`<think>`, `<thinking>`, `<reasoning>`) before downstream parsing.
- *  - Provides balanced-brace JSON extraction (`extractJsonObject`) immune to thinking braces or multiple code blocks.
+ *  - Strips reasoning/CoT tags (`<think>`, `<thinking>`, `<thought>`, `<reasoning>`) before downstream parsing.
+ *  - Provides balanced-brace JSON extraction (`extractJsonObject`) immune to thinking braces or stray prose quotes.
  *  - Exposes `resolveSidecarModel` & `listRegistryModels` for selecting dedicated fast/cheap sidecar models.
  *  - Prefers `ctx.modelRegistry.streamSimple(model, context, options).result()` and cleanly falls back to `.complete()`.
  */
@@ -19,16 +19,17 @@ export interface RegistryLlmRequest {
   stripThinking?: boolean;
 }
 
-/** Strip model reasoning blocks (`<think>`, `<thinking>`, `<reasoning>`) safely without losing actual output. */
+/** Strip model reasoning blocks (`<think>`, `<thinking>`, `<thought>`, `<reasoning>`) safely without losing actual output. */
 export function stripThinkingBlocks(raw: string): string {
   if (!raw) return "";
   let text = raw
     .replace(/<think\b[^>]*>[\s\S]*?<\/think\s*>/gi, "")
     .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking\s*>/gi, "")
+    .replace(/<thought\b[^>]*>[\s\S]*?<\/thought\s*>/gi, "")
     .replace(/<reasoning\b[^>]*>[\s\S]*?<\/reasoning\s*>/gi, "");
 
-  // Handle unclosed `<think>` if a model ran out of tokens mid-thought (never leak raw CoT!)
-  const unclosedIdx = text.search(/<(?:think|thinking|reasoning)\b[^>]*>/i);
+  // Handle unclosed `<think>` / `<thought>` if a model ran out of tokens mid-thought (never leak raw CoT!)
+  const unclosedIdx = text.search(/<(?:think|thinking|thought|reasoning)\b[^>]*>/i);
   if (unclosedIdx >= 0) {
     text = text.slice(0, unclosedIdx).trim();
   }
@@ -38,7 +39,8 @@ export function stripThinkingBlocks(raw: string): string {
 /**
  * Balanced-brace JSON object extractor.
  * Strips `<think>` blocks first, tries fenced ```json blocks first, then walks balanced `{ ... }`
- * candidates from last-to-first / first-to-last so stray prose braces NEVER break JSON.parse!
+ * candidates while only tracking string literals when inside `{ ... }` (`depth > 0`) so stray prose quotes
+ * NEVER trap the scanner!
  */
 export function extractJsonObject<T = Record<string, unknown>>(raw: string): T | null {
   const cleaned = stripThinkingBlocks(raw);
@@ -66,7 +68,7 @@ export function extractJsonObject<T = Record<string, unknown>>(raw: string): T |
     }
   }
 
-  // 3. Scan for balanced `{ ... }` objects respecting string literals & escapes
+  // 3. Scan for balanced `{ ... }` objects respecting string literals & escapes ONLY while depth > 0
   const candidates: string[] = [];
   let inString = false;
   let escape = false;
@@ -75,22 +77,28 @@ export function extractJsonObject<T = Record<string, unknown>>(raw: string): T |
 
   for (let i = 0; i < cleaned.length; i++) {
     const ch = cleaned[i]!;
-    if (inString) {
-      if (escape) {
-        escape = false;
-      } else if (ch === "\\") {
-        escape = true;
-      } else if (ch === '"') {
-        inString = false;
+    if (depth > 0) {
+      if (inString) {
+        if (escape) {
+          escape = false;
+        } else if (ch === "\\") {
+          escape = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
       }
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      continue;
+      if (ch === '"') {
+        inString = true;
+        continue;
+      }
     }
     if (ch === "{") {
-      if (depth === 0) start = i;
+      if (depth === 0) {
+        start = i;
+        inString = false;
+        escape = false;
+      }
       depth++;
     } else if (ch === "}") {
       if (depth > 0) {
@@ -98,6 +106,8 @@ export function extractJsonObject<T = Record<string, unknown>>(raw: string): T |
         if (depth === 0 && start >= 0) {
           candidates.push(cleaned.slice(start, i + 1));
           start = -1;
+          inString = false;
+          escape = false;
         }
       }
     }
@@ -200,8 +210,18 @@ export async function completeWithRegistry(
 
   const options: Record<string, unknown> = {};
   // Reasoning/thinking models (e.g. deepseek-flash high) count CoT tokens inside `maxTokens`.
-  // Enforce a safe >= 4096 floor so thinking never starves visible output or truncates JSON!
-  if (typeof req.maxTokens === "number") options.maxTokens = Math.max(req.maxTokens, 4096);
+  // Enforce a safe >= 4096 floor unless model.contextWindow is explicitly small (< 6000).
+  if (typeof req.maxTokens === "number") {
+    const cw =
+      model && typeof model === "object" && typeof (model as PiModelDescriptor).contextWindow === "number"
+        ? (model as PiModelDescriptor).contextWindow!
+        : undefined;
+    if (cw !== undefined && cw > 0 && cw < 6000) {
+      options.maxTokens = Math.min(Math.max(req.maxTokens, 256), Math.max(256, Math.floor(cw * 0.5)));
+    } else {
+      options.maxTokens = Math.max(req.maxTokens, 4096);
+    }
+  }
   if (req.signal ?? ctx.signal) options.signal = req.signal ?? ctx.signal;
 
   let raw = "";

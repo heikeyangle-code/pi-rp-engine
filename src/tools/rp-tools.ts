@@ -1,5 +1,5 @@
 /**
- * Six RP-exclusive tools registered with `defaultActive: false` (0 tokens in dormant coding sessions).
+ * Seven RP-exclusive tools registered with `defaultActive: false` (0 tokens in dormant coding sessions).
  * All tools include narrative `renderCall` / `renderResult` TUI micro-cards and operate strictly
  * through deterministic L1 event sourcing (`rp:tx`).
  */
@@ -8,7 +8,9 @@ import type {
   BiTemporalFact,
   CompiledCard,
   CompiledLoreEntry,
+  PhysicalSnapshot,
   PiExtensionAPI,
+  PiToolDefinition,
   RpTxEntry,
   SessionRpState,
 } from "../types.js";
@@ -28,7 +30,7 @@ import {
 } from "../memory/history-recall.js";
 import { rankBySemanticSimilarity, reciprocalRankFusion } from "../memory/embedding.js";
 import { loadUiPrefs } from "../ui/file-picker.js";
-import { isFactVisibleToActor } from "../engine/gates.js";
+import { evaluateGate, isFactVisibleToActor } from "../engine/gates.js";
 import { createLinesComponent, styleBold, styleDim, styleFg, wrapDisplayLine } from "../ui/renderers.js";
 
 export const RP_TOOL_NAMES = [
@@ -52,6 +54,78 @@ export interface RpToolRuntime {
   setHistoryRecallCooldowns?(next: HistoryRecallCooldown[]): void;
 }
 
+type ExtendedPiToolDefinition = PiToolDefinition & {
+  executionMode?: "sequential" | "parallel";
+  annotations?: { readOnlyHint?: boolean };
+};
+
+function registerExtendedTool(pi: PiExtensionAPI, tool: ExtendedPiToolDefinition): void {
+  pi.registerTool(tool);
+}
+
+/** Monotonic module-level sequence counter so multiple `rp_fact_commit` calls in the same turn never collide. */
+let nextCommitSeq = 0;
+
+function allocateUniqueId(prefix: string, turn: number, existing: Map<string, unknown>): string {
+  let candidate = `${prefix}_t${turn}_${nextCommitSeq++}`;
+  while (existing.has(candidate)) {
+    candidate = `${prefix}_t${turn}_${nextCommitSeq++}`;
+  }
+  return candidate;
+}
+
+/** Create a lightweight staging clone of the mutable state slices touched by `rp_state_patch` for two-phase validation. */
+function cloneStagingState(state: SessionRpState): SessionRpState {
+  const stats: SessionRpState["stats"] = {};
+  for (const [actor, rec] of Object.entries(state.stats)) {
+    stats[actor] = { ...rec };
+  }
+  const statBounds: SessionRpState["statBounds"] = {};
+  for (const [actor, rec] of Object.entries(state.statBounds)) {
+    statBounds[actor] = {};
+    for (const [k, b] of Object.entries(rec)) {
+      statBounds[actor]![k] = { ...b };
+    }
+  }
+  const inventory: SessionRpState["inventory"] = {};
+  for (const [actor, rec] of Object.entries(state.inventory)) {
+    inventory[actor] = { ...rec };
+  }
+  const cfsmDefs: SessionRpState["cfsmDefs"] = {};
+  for (const [actor, rec] of Object.entries(state.cfsmDefs)) {
+    cfsmDefs[actor] = { ...rec };
+  }
+  const cfsmStates: SessionRpState["cfsmStates"] = {};
+  for (const [actor, rec] of Object.entries(state.cfsmStates)) {
+    cfsmStates[actor] = {};
+    for (const [axis, s] of Object.entries(rec)) {
+      cfsmStates[actor]![axis] = { ...s };
+    }
+  }
+  const clocks: SessionRpState["clocks"] = {};
+  for (const [cid, c] of Object.entries(state.clocks)) {
+    clocks[cid] = { ...c };
+  }
+  const physicalState: SessionRpState["physicalState"] = {};
+  for (const [actor, snap] of Object.entries(state.physicalState)) {
+    physicalState[actor] = { ...snap };
+  }
+
+  return {
+    ...state,
+    presentNpcs: [...state.presentNpcs],
+    flags: { ...state.flags },
+    stats,
+    statBounds,
+    inventory,
+    cfsmDefs,
+    cfsmStates,
+    clocks,
+    physicalState,
+    auditLog: [...state.auditLog],
+  };
+}
+
 function getAllLoreEntries(rt: RpToolRuntime): CompiledLoreEntry[] {
   const primary = rt.getCard();
   if (!primary) return [];
@@ -64,13 +138,14 @@ function getAllLoreEntries(rt: RpToolRuntime): CompiledLoreEntry[] {
 
 export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
   // 1. rp_roll_check
-  pi.registerTool({
+  registerExtendedTool(pi, {
     name: "rp_roll_check",
     label: "RP 掷骰检定",
     description:
       "Execute a deterministic dice roll or skill check (supports e.g. '1d20+3', 'd20', '2d20kh1', '2d20kl1', '2d6', '1d100'). Use ONLY when an outcome is genuinely uncertain or contested.",
     promptSnippet: "Roll dice or resolve an uncertain skill/combat check deterministically.",
     defaultActive: false,
+    annotations: { readOnlyHint: true },
     parameters: {
       type: "object",
       properties: {
@@ -156,13 +231,14 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
   });
 
   // 2. rp_state_patch
-  pi.registerTool({
+  registerExtendedTool(pi, {
     name: "rp_state_patch",
     label: "RP 状态账本更新",
     description:
-      "Commit deterministic world state updates (stats, inventory, location, present NPCs, flags, progress clocks, CFSM axis definitions & transitions). All numeric bounds and CFSM transitions are code-validated.",
+      "Commit deterministic world state updates (stats, inventory, location, present NPCs, flags, progress clocks, CFSM axis definitions & transitions). All numeric bounds and CFSM transitions are code-validated atomically before commit.",
     promptSnippet: "Update authoritative world stats, inventory, location, flags, clocks, or CFSM states.",
     defaultActive: false,
+    executionMode: "sequential",
     parameters: {
       type: "object",
       properties: {
@@ -197,7 +273,11 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             required: ["actor", "item", "delta"],
           },
         },
-        flags: { type: "object", description: "Map of boolean flags to set" },
+        flags: {
+          type: "object",
+          additionalProperties: { type: "boolean" },
+          description: "Map of boolean flags to set",
+        },
         clocks: {
           type: "array",
           items: {
@@ -220,7 +300,11 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               axis: { type: "string" },
               states: { type: "array", items: { type: "string" } },
               initial: { type: "string" },
-              transitions: { type: "object" },
+              transitions: {
+                type: "object",
+                additionalProperties: { type: "array", items: { type: "string" } },
+                description: "Optional allowed state transition map",
+              },
             },
             required: ["actor", "axis", "states", "initial"],
           },
@@ -238,7 +322,6 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             required: ["actor", "axis", "to"],
           },
         },
-
         physical: {
           type: "array",
           items: {
@@ -288,14 +371,25 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
       }
 
+      // Phase 1: Validate all operations against a staging copy before committing any `rp:tx`
+      const staging = cloneStagingState(state);
+      const pendingTxs: RpTxEntry[] = [];
       const applied: string[] = [];
       const rejected: string[] = [];
 
+      const stageTx = (tx: RpTxEntry, summary: string) => {
+        applyRpTx(staging, tx);
+        pendingTxs.push(tx);
+        applied.push(summary);
+      };
+
       if (typeof params.location === "string" || Array.isArray(params.present_npcs)) {
-        const loc = typeof params.location === "string" ? params.location : state.location;
-        const npcs = Array.isArray(params.present_npcs) ? params.present_npcs.map(String) : state.presentNpcs;
-        rt.commitTx({ kind: "location_set", location: loc, presentNpcs: npcs });
-        applied.push(`location=${loc}${npcs.length ? ` [${npcs.join(", ")}]` : ""}`);
+        const loc = typeof params.location === "string" ? params.location : staging.location;
+        const npcs = Array.isArray(params.present_npcs) ? params.present_npcs.map(String) : staging.presentNpcs;
+        stageTx(
+          { kind: "location_set", location: loc, presentNpcs: npcs },
+          `location=${loc}${npcs.length ? ` [${npcs.join(", ")}]` : ""}`,
+        );
       }
 
       if (Array.isArray(params.stats)) {
@@ -307,22 +401,24 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           const min = typeof s.min === "number" ? s.min : undefined;
           const max = typeof s.max === "number" ? s.max : undefined;
           if (!key) continue;
-          const checked = computeCheckedStatValue(state, actorId, key, op, val, min, max);
+          const checked = computeCheckedStatValue(staging, actorId, key, op, val, min, max);
           if (!checked.ok) {
             rejected.push(`${actorId}.${key}: ${checked.error ?? "invalid"}`);
             continue;
           }
-          rt.commitTx({
-            kind: "stat_patch",
-            actorId,
-            key,
-            op,
-            value: val,
-            min,
-            max,
-            reason: typeof s.reason === "string" ? s.reason : undefined,
-          });
-          applied.push(`${actorId}.${key}=${String(checked.clampedValue)}`);
+          stageTx(
+            {
+              kind: "stat_patch",
+              actorId,
+              key,
+              op,
+              value: val,
+              min,
+              max,
+              reason: typeof s.reason === "string" ? s.reason : undefined,
+            },
+            `${actorId}.${key}=${String(checked.clampedValue)}`,
+          );
         }
       }
 
@@ -332,26 +428,27 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           const name = String(item.item ?? "");
           const delta = Number(item.delta ?? 0);
           if (!name || !Number.isFinite(delta) || delta === 0) continue;
-          const invCheck = validateInventoryPatch(state, actorId, name, delta);
+          const invCheck = validateInventoryPatch(staging, actorId, name, delta);
           if (!invCheck.ok) {
             rejected.push(`${actorId}.inv[${name}]: ${invCheck.error ?? "insufficient"}`);
             continue;
           }
-          rt.commitTx({
-            kind: "inventory_patch",
-            actorId,
-            item: name,
-            delta,
-            note: typeof item.note === "string" ? item.note : undefined,
-          });
-          applied.push(`${actorId}.inv[${name}] ${delta > 0 ? `+${delta}` : delta}`);
+          stageTx(
+            {
+              kind: "inventory_patch",
+              actorId,
+              item: name,
+              delta,
+              note: typeof item.note === "string" ? item.note : undefined,
+            },
+            `${actorId}.inv[${name}] ${delta > 0 ? `+${delta}` : delta}`,
+          );
         }
       }
 
       if (params.flags && typeof params.flags === "object" && !Array.isArray(params.flags)) {
         for (const [k, v] of Object.entries(params.flags as Record<string, unknown>)) {
-          rt.commitTx({ kind: "flag_set", flag: k, value: Boolean(v) });
-          applied.push(`flag.${k}=${Boolean(v)}`);
+          stageTx({ kind: "flag_set", flag: k, value: Boolean(v) }, `flag.${k}=${Boolean(v)}`);
         }
       }
 
@@ -359,11 +456,13 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         for (const c of params.clocks as Array<Record<string, unknown>>) {
           const clockId = String(c.clockId ?? "");
           const delta = Number(c.delta ?? 0);
-          const max = typeof c.max === "number" ? c.max : state.clocks[clockId]?.max ?? 4;
-          const label = typeof c.label === "string" ? c.label : state.clocks[clockId]?.label ?? clockId;
+          const max = typeof c.max === "number" ? c.max : staging.clocks[clockId]?.max ?? 4;
+          const label = typeof c.label === "string" ? c.label : staging.clocks[clockId]?.label ?? clockId;
           if (!clockId || !Number.isFinite(delta)) continue;
-          rt.commitTx({ kind: "progress_clock", clockId, label, delta, max });
-          const now = state.clocks[clockId];
+          const tx: RpTxEntry = { kind: "progress_clock", clockId, label, delta, max };
+          applyRpTx(staging, tx);
+          pendingTxs.push(tx);
+          const now = staging.clocks[clockId];
           applied.push(`clock[${label}]=${now?.value ?? 0}/${now?.max ?? max}`);
         }
       }
@@ -375,20 +474,22 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           const states = Array.isArray(d.states) ? d.states.map(String) : [];
           const initial = String(d.initial ?? states[0] ?? "");
           if (!actorId || !axis || states.length === 0 || !initial) continue;
-          rt.commitTx({
-            kind: "cfsm_define",
-            actorId,
-            def: {
-              axis,
-              states,
-              initial,
-              transitions:
-                d.transitions && typeof d.transitions === "object"
-                  ? (d.transitions as Record<string, string[]>)
-                  : undefined,
+          stageTx(
+            {
+              kind: "cfsm_define",
+              actorId,
+              def: {
+                axis,
+                states,
+                initial,
+                transitions:
+                  d.transitions && typeof d.transitions === "object"
+                    ? (d.transitions as Record<string, string[]>)
+                    : undefined,
+              },
             },
-          });
-          applied.push(`cfsm.define(${actorId}.${axis}=${initial})`);
+            `cfsm.define(${actorId}.${axis}=${initial})`,
+          );
         }
       }
 
@@ -398,69 +499,84 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           const axis = String(t.axis ?? "");
           const to = String(t.to ?? "");
           const reason = String(t.reason ?? "");
-          const check = validateCfsmTransition(state, actorId, axis, to);
+          const check = validateCfsmTransition(staging, actorId, axis, to);
           if (!check.ok) {
             rejected.push(`cfsm ${actorId}.${axis}->${to}: ${check.error ?? "invalid"}`);
             continue;
           }
-          const from = state.cfsmStates[actorId]?.[axis]?.state ?? "initial";
-          rt.commitTx({ kind: "cfsm_transition", actorId, axis, from, to, reason, turn: state.turn });
-          applied.push(`cfsm ${actorId}.${axis}: ${from}->${to}`);
+          const from = staging.cfsmStates[actorId]?.[axis]?.state ?? "initial";
+          stageTx(
+            { kind: "cfsm_transition", actorId, axis, from, to, reason, turn: staging.turn },
+            `cfsm ${actorId}.${axis}: ${from}->${to}`,
+          );
         }
       }
 
       const spatialNote = typeof params.spatial_notes === "string" ? params.spatial_notes.trim() : undefined;
+      let appliedPhysicalCount = 0;
       if (Array.isArray(params.physical)) {
         for (const ph of params.physical as Array<Record<string, unknown>>) {
           const actorId = String(ph.actor ?? "").trim();
           if (!actorId) continue;
-          rt.commitTx({
-            kind: "physical_patch",
-            snapshot: {
-              actorId,
-              attire: typeof ph.attire === "string" ? ph.attire.trim() || undefined : undefined,
-              condition: typeof ph.condition === "string" ? ph.condition.trim() || undefined : undefined,
-              holding: typeof ph.holding === "string" ? ph.holding.trim() || undefined : undefined,
-              position: typeof ph.position === "string" ? ph.position.trim() || undefined : undefined,
-              updatedTurn: state.turn,
+          const snapshot: PhysicalSnapshot = { actorId, updatedTurn: staging.turn };
+          if (typeof ph.attire === "string" && ph.attire.trim()) snapshot.attire = ph.attire.trim();
+          if (typeof ph.condition === "string" && ph.condition.trim()) snapshot.condition = ph.condition.trim();
+          if (typeof ph.holding === "string" && ph.holding.trim()) snapshot.holding = ph.holding.trim();
+          if (typeof ph.position === "string" && ph.position.trim()) snapshot.position = ph.position.trim();
+          stageTx(
+            {
+              kind: "physical_patch",
+              snapshot,
+              spatialNotes: spatialNote,
+              reason: "tool",
             },
+            `physical[${actorId}]`,
+          );
+          appliedPhysicalCount++;
+        }
+      }
+      if (appliedPhysicalCount === 0 && spatialNote !== undefined) {
+        stageTx(
+          {
+            kind: "physical_patch",
+            snapshot: { actorId: "", updatedTurn: staging.turn },
             spatialNotes: spatialNote,
             reason: "tool",
-          });
-          applied.push(`physical[${actorId}]`);
-        }
-      } else if (spatialNote !== undefined) {
-        rt.commitTx({
-          kind: "physical_patch",
-          snapshot: { actorId: "", updatedTurn: state.turn },
-          spatialNotes: spatialNote,
-          reason: "tool",
-        });
-        applied.push("spatial_notes");
+          },
+          "spatial_notes",
+        );
+      }
+
+      // Phase 2: Atomic commit — abort all transactions if any validation failed
+      if (rejected.length > 0) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Rejected (no changes committed): ${rejected.join("; ")}` }],
+          details: { applied: [], rejected },
+        };
+      }
+
+      for (const tx of pendingTxs) {
+        rt.commitTx(tx);
       }
 
       rt.refreshHud(ctx);
-      const lines = [
-        applied.length ? `Applied: ${applied.join("; ")}` : "No state changes applied.",
-        rejected.length ? `Rejected: ${rejected.join("; ")}` : "",
-      ].filter(Boolean);
-
       return {
-        isError: applied.length === 0 && rejected.length > 0 ? true : undefined,
-        content: [{ type: "text", text: lines.join("\n") }],
-        details: { applied, rejected },
+        content: [{ type: "text", text: applied.length ? `Applied: ${applied.join("; ")}` : "No state changes applied." }],
+        details: { applied, rejected: [] },
       };
     },
   });
 
   // 3. rp_fact_commit
-  pi.registerTool({
+  registerExtendedTool(pi, {
     name: "rp_fact_commit",
     label: "RP 事实与伏笔归档",
     description:
       "Commit bi-temporal facts (with witnesses for epistemic isolation), invalidate outdated facts, update DREAM ABC character beliefs, or plant/resolve foresight hooks.",
     promptSnippet: "Record durable world facts, invalidate superseded facts, update character beliefs, or manage foresights.",
     defaultActive: false,
+    executionMode: "sequential",
     parameters: {
       type: "object",
       properties: {
@@ -472,7 +588,11 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               id: { type: "string" },
               statement: { type: "string" },
               entities: { type: "array", items: { type: "string" } },
-              witnesses: { description: "'public' or array of witness names" },
+              witnesses: {
+                type: "array",
+                items: { type: "string" },
+                description: "Array of witness names (use [\"public\"] for public facts visible to everyone)",
+              },
               causeEvent: { type: "string" },
             },
             required: ["statement"],
@@ -583,21 +703,35 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
 
       const log: string[] = [];
       const previews: string[] = [];
-      let idx = 0;
 
       if (Array.isArray(params.add_facts)) {
         for (const f of params.add_facts as Array<Record<string, unknown>>) {
           const statement = String(f.statement ?? "").trim();
           if (!statement) continue;
+
+          let witnessIds: string[] | "public" = "public";
+          if (f.witnesses === "public") {
+            witnessIds = "public";
+          } else if (typeof f.witnesses === "string") {
+            const w = f.witnesses.trim();
+            witnessIds = !w || w.toLowerCase() === "public" ? "public" : [w];
+          } else if (Array.isArray(f.witnesses)) {
+            const cleaned = f.witnesses.map((x) => String(x).trim()).filter(Boolean);
+            witnessIds = cleaned.length === 1 && cleaned[0]!.toLowerCase() === "public" ? "public" : cleaned;
+          }
+
           const fact: BiTemporalFact = {
-            id: typeof f.id === "string" && f.id.trim() ? f.id.trim() : `fact_t${state.turn}_${idx++}`,
+            id:
+              typeof f.id === "string" && f.id.trim()
+                ? f.id.trim()
+                : allocateUniqueId("fact", state.turn, state.facts),
             statement,
             entities: Array.isArray(f.entities) ? f.entities.map(String) : [],
             validFromTurn: state.turn,
             validUntilTurn: null,
             ingestedAtTurn: state.turn,
             eventTimeLabel: state.worldTimeLabel || undefined,
-            witnessIds: Array.isArray(f.witnesses) ? f.witnesses.map(String) : "public",
+            witnessIds,
             causeEvent: typeof f.causeEvent === "string" ? f.causeEvent : undefined,
           };
           rt.commitTx({ kind: "fact_add", fact });
@@ -642,7 +776,10 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         for (const h of params.foresights as Array<Record<string, unknown>>) {
           const summary = String(h.summary ?? "").trim();
           if (!summary) continue;
-          const id = typeof h.id === "string" && h.id.trim() ? h.id.trim() : `hook_t${state.turn}_${idx++}`;
+          const id =
+            typeof h.id === "string" && h.id.trim()
+              ? h.id.trim()
+              : allocateUniqueId("hook", state.turn, state.foresights);
           const status = h.status === "paid_off" || h.status === "expired" ? h.status : "open";
           rt.commitTx({
             kind: "foresight_upsert",
@@ -697,13 +834,14 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
   });
 
   // 4. rp_recall (Unified worldbook list/read/search + memory books/facts/foresights)
-  pi.registerTool({
+  registerExtendedTool(pi, {
     name: "rp_recall",
     label: "RP 深度世界书检索",
     description:
       "Query the compiled worldbook (action='search' default, action='list' to browse paginated entry titles, action='read' to read a specific entry by title/keyword), plus memory books, bi-temporal facts, and open foresights.",
     promptSnippet: "Search, list, or read worldbook entries, memory books, facts, and open foresights.",
     defaultActive: false,
+    annotations: { readOnlyHint: true },
     parameters: {
       type: "object",
       properties: {
@@ -739,7 +877,10 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const action = params.action === "list" || params.action === "read" ? params.action : "search";
       const query = String(params.query ?? "").trim();
       const allLore = getAllLoreEntries(rt);
-      const visibleLore = allLore.filter((e) => (state.loreOverrides[e.id] ?? e.enabled) && e.content.trim().length > 0);
+      // Enforce spoiler gates across list, read, search, and semantic embedding search
+      const visibleLore = allLore.filter(
+        (e) => (state.loreOverrides[e.id] ?? e.enabled) && e.content.trim().length > 0 && evaluateGate(e.gate, state),
+      );
 
       // Mode A: Paginated title directory (`list`) ported from dsh-tavern worldbook-files.js
       if (action === "list") {
@@ -825,7 +966,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const budget = typeof params.token_budget === "number" ? Math.min(2400, Math.max(200, params.token_budget)) : 900;
 
       const loreRes = recallLoreWithGraphPpr({
-        entries: allLore,
+        entries: visibleLore,
         state,
         recentText: query,
         tokenBudget: budget,
@@ -911,13 +1052,14 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
   });
 
   // 4b. rp_history_recall (Ported from dsh-tavern bm25.js + history-recall.js)
-  pi.registerTool({
+  registerExtendedTool(pi, {
     name: "rp_history_recall",
     label: "RP 历史原文召回",
     description:
       "Search or read committed story history verbatim (including older compacted or hidden floors) using CJK Bigram-BM25. Provide EITHER `query` (keywords for entities/promises/numbers) OR `turn` (1-indexed round number + optional `radius` 0..3). Max 6 calls per turn; full reads have a 10-turn cooldown.",
     promptSnippet: "Recall exact past dialogue/details by BM25 keyword search or round number.",
     defaultActive: false,
+    annotations: { readOnlyHint: true },
     parameters: {
       type: "object",
       properties: {
@@ -1004,13 +1146,14 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
   });
 
   // 5. rp_era_advance
-  pi.registerTool({
+  registerExtendedTool(pi, {
     name: "rp_era_advance",
     label: "RP 幕次跃迁",
     description:
       "Advance the narrative era/act, unlock milestones, and optionally advance world time (days/time label) for a montage or chapter break.",
     promptSnippet: "Advance story era/act, unlock milestones, and skip world time.",
     defaultActive: false,
+    executionMode: "sequential",
     parameters: {
       type: "object",
       properties: {
@@ -1040,9 +1183,25 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
       }
       const fromEra = state.era;
+      const prevWorldTimeLabel = state.worldTimeLabel;
       const toEra = String(params.to_era ?? state.era).trim() || state.era;
       const milestones = Array.isArray(params.milestones) ? params.milestones.map(String) : [];
       const montageSummary = typeof params.montage_summary === "string" ? params.montage_summary : "";
+
+      // Compute calendar anchor using the BEFORE-tick `worldTimeLabel` prior to committing `clock_tick`
+      let temporalNote = "";
+      if (typeof params.day_delta === "number" && params.day_delta >= 365) {
+        const yrs = Math.round(params.day_delta / 365);
+        const anchor = computeCalendarAnchor(prevWorldTimeLabel, yrs, params.day_delta);
+        if (anchor) temporalNote += ` | ${anchor.exactHint}`;
+        const card = rt.getCard();
+        const profile = detectLifespanProfile(
+          `${card?.frozen.description ?? ""} ${card?.frozen.scenario ?? ""} ${state.archetype}`,
+        );
+        if (profile === "mortal" && yrs >= 60) {
+          temporalNote += ` | Temporal warning: +${yrs} years exceeds normal mortal lifespan; reflect aging/mortality or generational shift rather than keeping mortal characters ageless.`;
+        }
+      }
 
       rt.commitTx({
         kind: "era_advance",
@@ -1062,20 +1221,6 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         });
       }
 
-      let temporalNote = "";
-      if (typeof params.day_delta === "number" && params.day_delta >= 365) {
-        const yrs = Math.round(params.day_delta / 365);
-        const anchor = computeCalendarAnchor(state.worldTimeLabel, yrs, params.day_delta);
-        if (anchor) temporalNote += ` | ${anchor.exactHint}`;
-        const card = rt.getCard();
-        const profile = detectLifespanProfile(
-          `${card?.frozen.description ?? ""} ${card?.frozen.scenario ?? ""} ${state.archetype}`,
-        );
-        if (profile === "mortal" && yrs >= 60) {
-          temporalNote += ` | Temporal warning: +${yrs} years exceeds normal mortal lifespan; reflect aging/mortality or generational shift rather than keeping mortal characters ageless.`;
-        }
-      }
-
       rt.refreshHud(ctx);
       return {
         content: [
@@ -1090,13 +1235,14 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
   });
 
   // 6. rp_npc_deliberate
-  pi.registerTool({
+  registerExtendedTool(pi, {
     name: "rp_npc_deliberate",
     label: "RP NPC 视角隔离推演",
     description:
       "Retrieve an NPC's strictly isolated epistemic view (ONLY facts they witnessed + their own CFSM state and DREAM beliefs) so you can decide their hidden-information reaction without leaking secrets.",
     promptSnippet: "Inspect an NPC's strictly isolated knowledge (FANToM epistemic boundary) before acting.",
     defaultActive: false,
+    annotations: { readOnlyHint: true },
     parameters: {
       type: "object",
       properties: {

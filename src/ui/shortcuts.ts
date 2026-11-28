@@ -64,16 +64,19 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
   // false timeout errors while the user reads or browses a native bottom sheet!
   // Always launch interactive shortcut UI non-blocking so mobile hosts (pi-android)
   // never hit the 30s `catalog.triggerShortcut` RPC timeout even when ctx.mode === "tui".
-  let shortcutBusy = false;
+  const SHORTCUT_BUSY_WATCHDOG_MS = 60_000;
+  let shortcutBusySince = 0;
   const runShortcut = (fn: (ctx: PiExtensionContext) => Promise<void>, ctx: PiExtensionContext): void => {
-    if (shortcutBusy) return;
-    shortcutBusy = true;
+    const now = Date.now();
+    if (shortcutBusySince > 0 && now - shortcutBusySince < SHORTCUT_BUSY_WATCHDOG_MS) return;
+    shortcutBusySince = now;
+    const token = now;
     void Promise.resolve(fn(ctx))
       .catch((err) => {
         ctx.ui?.notify?.(`操作执行失败：${(err as Error).message}`, "error");
       })
       .finally(() => {
-        shortcutBusy = false;
+        if (shortcutBusySince === token) shortcutBusySince = 0;
       });
   };
 
@@ -117,7 +120,14 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
 
   pi.registerShortcut("alt+w", {
     description: "🔄 重摇回复",
-    handler: requireActive((ctx) => handlers.rerollLast(ctx)),
+    handler: requireActive(async (ctx) => {
+      if (typeof ctx.navigateTree !== "function" && typeof ctx.fork !== "function") {
+        ctx.ui.setEditorText?.("/rp reroll");
+        ctx.ui.notify("当前快捷键上下文不支持分支树操作，已将 /rp reroll 填入输入框，按回车即可重摇。", "info");
+        return;
+      }
+      await handlers.rerollLast(ctx);
+    }),
   });
 
   pi.registerShortcut("alt+u", {
@@ -162,7 +172,14 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
 
   pi.registerShortcut("alt+j", {
     description: "⏩ 跳转书签",
-    handler: requireActive((ctx) => handlers.gotoBookmark(ctx)),
+    handler: requireActive(async (ctx) => {
+      if (typeof ctx.navigateTree !== "function" && typeof ctx.fork !== "function") {
+        ctx.ui.setEditorText?.("/rp goto");
+        ctx.ui.notify("当前快捷键上下文不支持分支树跳转，已将 /rp goto 填入输入框，按回车即可选择书签。", "info");
+        return;
+      }
+      await handlers.gotoBookmark(ctx);
+    }),
   });
 
   pi.registerShortcut("alt+h", {

@@ -1,31 +1,42 @@
 /**
- * Zero-dependency CJK Bigram + Latin BM25 retrieval engine.
+ * Zero-dependency CJK/Kana/Hangul Bigram + Unicode Latin BM25 retrieval engine.
  * Ported faithfully from dsh-tavern's `bm25.js` (k1=1.5, b=0.75, Int32Array packed postings).
  *
- * Chinese/CJK segments emit both unigrams and 2-char sliding bigrams so partial/fuzzy
- * Chinese queries match reliably without any external tokenizer.
+ * Chinese/Japanese/Korean segments emit both unigrams (filtering common CJK stopwords) and
+ * 2-char sliding bigrams so partial/fuzzy queries match reliably without any external tokenizer.
  */
 
 const BM25_K1 = 1.5;
 const BM25_B = 0.75;
 const BM25_TF_SCALE = 4096;
 
+const CJK_STOPWORDS = new Set(["的", "了", "是", "在", "我", "你", "他", "她", "它", "和", "与", "这", "那"]);
+const CJK_SEGMENT_RE = /^[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+$/u;
+
 function pushCjkTokens(tokens: string[], segment: string): void {
-  for (const ch of segment) tokens.push(ch);
-  for (let i = 0; i < segment.length - 1; i++) {
-    tokens.push(segment.slice(i, i + 2));
+  const chars = Array.from(segment);
+  for (const ch of chars) {
+    if (!CJK_STOPWORDS.has(ch)) {
+      tokens.push(ch);
+    }
+  }
+  for (let i = 0; i < chars.length - 1; i++) {
+    const a = chars[i]!;
+    const b = chars[i + 1]!;
+    if (CJK_STOPWORDS.has(a) && CJK_STOPWORDS.has(b)) continue;
+    tokens.push(a + b);
   }
 }
 
 export function tokenizeBigram(text: string): string[] {
   const normalized = String(text ?? "").toLocaleLowerCase();
   const tokens: string[] = [];
-  const pattern = /[a-z0-9_]+|[\u3400-\u9fff]+/gi;
+  const pattern = /[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]+|(?:(?![\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af])[\p{L}\p{N}_])+/gu;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(normalized)) !== null) {
     const part = match[0];
     if (!part) continue;
-    if (/^[\u3400-\u9fff]+$/u.test(part)) {
+    if (CJK_SEGMENT_RE.test(part)) {
       pushCjkTokens(tokens, part);
     } else {
       tokens.push(part);
@@ -84,7 +95,8 @@ export function bm25Scores(
   candidates?: Set<number>,
 ): Float64Array {
   const scores = new Float64Array(corpus.count);
-  for (const token of queryTokens) {
+  const uniqueTokens = Array.from(new Set(queryTokens));
+  for (const token of uniqueTokens) {
     const postings = corpus.index.get(token);
     if (!postings) continue;
     const df = postings.length;

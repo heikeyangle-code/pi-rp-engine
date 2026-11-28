@@ -34,6 +34,10 @@ function normalizeRole(raw: unknown): "system" | "user" | "assistant" {
 
 function optNum(val: unknown): number | undefined {
   if (typeof val === "number" && Number.isFinite(val)) return val;
+  if (typeof val === "string" && val.trim() !== "") {
+    const n = Number(val);
+    if (Number.isFinite(n)) return n;
+  }
   return undefined;
 }
 
@@ -69,10 +73,14 @@ export function compileSillyTavernPreset(
         const rec = item as Record<string, unknown>;
         const id = typeof rec.identifier === "string" ? rec.identifier : "";
         if (id) {
-          orderedEntries.push({
-            identifier: id,
-            enabled: typeof rec.enabled === "boolean" ? rec.enabled : true,
-          });
+          const promptObj = byId.get(id);
+          const enabled =
+            typeof rec.enabled === "boolean"
+              ? rec.enabled
+              : typeof promptObj?.enabled === "boolean"
+                ? promptObj.enabled
+                : true;
+          orderedEntries.push({ identifier: id, enabled });
         }
       }
     }
@@ -121,8 +129,7 @@ export function compileSillyTavernPreset(
     const isJailbreakOrTail =
       injPos === 1 ||
       seenChatHistory ||
-      entry.identifier === "jailbreak" ||
-      entry.identifier === "nsfw";
+      entry.identifier === "jailbreak";
 
     const compiled: CompiledPresetPrompt = {
       identifier: entry.identifier,
@@ -144,16 +151,18 @@ export function compileSillyTavernPreset(
   // Zone 3 prompts sorted by depth descending (depth=0 sits closest to generation)
   zone3Prompts.sort((a, b) => b.depth - a.depth || a.order - b.order);
 
-  const presetName =
+  const explicitName =
     options.name?.trim() ||
     (typeof rawJson.name === "string" && rawJson.name.trim()) ||
-    "Imported Preset";
+    "";
+  const presetName = explicitName || "Imported Preset";
 
+  const slugFromName = explicitName
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fa5_-]+/g, "-")
+    .replace(/^-+|-+$/g, "");
   const id =
-    presetName
-      .toLowerCase()
-      .replace(/[^a-z0-9\u4e00-\u9fa5_-]+/g, "-")
-      .replace(/^-+|-+$/g, "") ||
+    slugFromName ||
     `preset-${crypto.createHash("sha1").update(JSON.stringify(rawJson)).digest("hex").slice(0, 8)}`;
 
   return {
@@ -173,8 +182,8 @@ export function compileSillyTavernPreset(
       topK: optNum(rawJson.top_k),
       frequencyPenalty: optNum(rawJson.frequency_penalty),
       presencePenalty: optNum(rawJson.presence_penalty),
-      maxTokens: optNum(rawJson.openai_max_tokens),
-      maxContext: optNum(rawJson.openai_max_context),
+      maxTokens: optNum(rawJson.openai_max_tokens) ?? optNum(rawJson.max_tokens) ?? optNum(rawJson.max_length),
+      maxContext: optNum(rawJson.openai_max_context) ?? optNum(rawJson.max_context),
     },
     strippedCount,
     warnings,

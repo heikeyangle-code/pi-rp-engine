@@ -620,9 +620,12 @@ test("v4-8: Bulletproof KV-Cache: deterministic Zone 1 macros, tail-only toolRes
     },
   }, mockCtx);
   assert.ok(compactRes?.compaction?.summary.includes("MemScene"));
+  const postCompactHandlers = handlers.get("session_compact") ?? [];
+  assert.equal(postCompactHandlers.length, 1);
+  await postCompactHandlers[0]!({ compactionEntry: { summary: compactRes.compaction.summary } }, mockCtx);
   assert.ok(
     branch.some((e) => e.customType === RP_ENTRY_TYPE && (e.data as RpTxEntry).kind === "memory_book_upsert"),
-    "session_before_compact MUST persist consolidated MemScene into Memory Books!",
+    "session_compact MUST persist consolidated MemScene into Memory Books!",
   );
 
   fs.rmSync(tmpDir, { recursive: true, force: true });

@@ -270,10 +270,10 @@ export function parseNestedYamlVariables(
       continue;
     }
 
-    // Inline JSON/YAML array `[30, "0-100 好感度"]` or `["柴刀", "火折子"]`
+    // Inline JSON/YAML array `[30, "0-100 好感度"]`, `[50, "Hero's trust"]`, or `['柴刀', '火折子']`
     if (valPart.startsWith("[") && valPart.endsWith("]")) {
-      try {
-        const parsedArr = JSON.parse(valPart.replace(/'/g, '"')) as unknown[];
+      const parsedArr = tryParseJsonLoose(valPart);
+      if (Array.isArray(parsedArr)) {
         if (
           parsedArr.length === 2 &&
           (typeof parsedArr[0] === "number" || typeof parsedArr[0] === "string" || typeof parsedArr[0] === "boolean") &&
@@ -291,8 +291,6 @@ export function parseNestedYamlVariables(
           }
           continue;
         }
-      } catch {
-        // Fall through
       }
     }
 
@@ -354,31 +352,218 @@ function splitJsArgs(argStr: string): string[] {
   return args;
 }
 
+/** Balanced-paren scanner for `_.set(...)`, `_.add(...)`, and `_.assign(...)` calls. */
+function extractMvuCalls(text: string): Array<{ fn: string; rawArgs: string; comment?: string }> {
+  const calls: Array<{ fn: string; rawArgs: string; comment?: string }> = [];
+  const startRe = /_\.(set|add|assign)\s*\(/g;
+  let m: RegExpExecArray | null;
+
+  while ((m = startRe.exec(text)) !== null) {
+    const fn = m[1]!.toLowerCase();
+    const argsStart = startRe.lastIndex;
+    let depth = 1;
+    let quote: string | null = null;
+    let escape = false;
+    let i = argsStart;
+
+    while (i < text.length && depth > 0) {
+      const ch = text[i]!;
+      if (quote) {
+        if (escape) escape = false;
+        else if (ch === "\\") escape = true;
+        else if (ch === quote) quote = null;
+      } else {
+        if (ch === '"' || ch === "'" || ch === "`") {
+          quote = ch;
+        } else if (ch === "(") {
+          depth++;
+        } else if (ch === ")") {
+          depth--;
+          if (depth === 0) break;
+        }
+      }
+      i++;
+    }
+
+    if (depth !== 0) continue;
+    const rawArgs = text.slice(argsStart, i);
+    const tail = text.slice(i + 1);
+    const commentMatch = /^[ \t]*;?[ \t]*\/\/([^\n]*)/.exec(tail);
+    const comment = commentMatch?.[1]?.trim() || undefined;
+    calls.push({ fn, rawArgs, comment });
+    startRe.lastIndex = i + 1 + (commentMatch ? commentMatch[0].length : 0);
+  }
+
+  return calls;
+}
+
+/** Loose JSON5-like parser supporting `//` & `/* ... *\/` comments, single-quoted strings, unquoted keys, and trailing commas. */
 function tryParseJsonLoose(text: string): unknown {
-  const cleaned = text
-    .trim()
-    // Strip JS line comments outside strings (best-effort for JSON5 MVU blocks)
-    .replace(/(^|\s)\/\/[^\n]*/g, "$1")
-    .replace(/,\s*([}\]])/g, "$1");
+  const trimmed = text.trim();
+  if (!trimmed) return null;
   try {
-    return JSON.parse(cleaned);
+    return JSON.parse(trimmed);
+  } catch {
+    // Fall through to string-aware JSON5 normalizer
+  }
+
+  // Pass 1: strip // and /* */ comments outside strings, and convert single-quoted strings to double-quoted
+  let out = "";
+  let i = 0;
+  while (i < trimmed.length) {
+    const ch = trimmed[i]!;
+    if (ch === '"') {
+      out += ch;
+      i++;
+      while (i < trimmed.length) {
+        const c = trimmed[i]!;
+        out += c;
+        i++;
+        if (c === "\\" && i < trimmed.length) {
+          out += trimmed[i]!;
+          i++;
+        } else if (c === '"') {
+          break;
+        }
+      }
+      continue;
+    }
+    if (ch === "'") {
+      out += '"';
+      i++;
+      while (i < trimmed.length) {
+        const c = trimmed[i]!;
+        if (c === "\\" && i + 1 < trimmed.length) {
+          const next = trimmed[i + 1]!;
+          if (next === "'") {
+            out += "'";
+          } else if (next === '"') {
+            out += '\\"';
+          } else {
+            out += "\\" + next;
+          }
+          i += 2;
+        } else if (c === '"') {
+          out += '\\"';
+          i++;
+        } else if (c === "'") {
+          out += '"';
+          i++;
+          break;
+        } else {
+          out += c;
+          i++;
+        }
+      }
+      continue;
+    }
+    if (ch === "/" && trimmed[i + 1] === "/") {
+      i += 2;
+      while (i < trimmed.length && trimmed[i] !== "\n") i++;
+      continue;
+    }
+    if (ch === "/" && trimmed[i + 1] === "*") {
+      i += 2;
+      while (i < trimmed.length && !(trimmed[i] === "*" && trimmed[i + 1] === "/")) i++;
+      if (i < trimmed.length) i += 2;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+
+  // Pass 2: quote unquoted object keys & strip trailing commas (string-aware)
+  let final = "";
+  i = 0;
+  let expectKey = false;
+  const containerStack: string[] = [];
+  while (i < out.length) {
+    const ch = out[i]!;
+    if (ch === '"') {
+      final += ch;
+      i++;
+      while (i < out.length) {
+        const c = out[i]!;
+        final += c;
+        i++;
+        if (c === "\\" && i < out.length) {
+          final += out[i]!;
+          i++;
+        } else if (c === '"') {
+          break;
+        }
+      }
+      expectKey = false;
+      continue;
+    }
+    if (ch === "{") {
+      containerStack.push("{");
+      expectKey = true;
+      final += ch;
+      i++;
+      continue;
+    }
+    if (ch === "[") {
+      containerStack.push("[");
+      expectKey = false;
+      final += ch;
+      i++;
+      continue;
+    }
+    if (ch === "}" || ch === "]") {
+      containerStack.pop();
+      expectKey = false;
+      final += ch;
+      i++;
+      continue;
+    }
+    if (ch === ",") {
+      let j = i + 1;
+      while (j < out.length && /\s/.test(out[j]!)) j++;
+      if (out[j] === "}" || out[j] === "]") {
+        i++;
+        continue;
+      }
+      final += ch;
+      expectKey = containerStack[containerStack.length - 1] === "{";
+      i++;
+      continue;
+    }
+    if (expectKey && !/\s/.test(ch)) {
+      const keyMatch = /^([A-Za-z_$\u4e00-\u9fff][\w$\u4e00-\u9fff-]*)(\s*:)/.exec(out.slice(i));
+      if (keyMatch) {
+        final += `"${keyMatch[1]!}"${keyMatch[2]!}`;
+        i += keyMatch[0].length;
+        expectKey = false;
+        continue;
+      }
+      expectKey = false;
+    }
+    final += ch;
+    i++;
+  }
+
+  try {
+    return JSON.parse(final);
   } catch {
     return null;
   }
 }
 
-/** Pre-sanitization salvage from HTML status panels/tables (`<div>HP: 80/100</div>`, `<td>好感度</td><td>35</td>`). */
+/** Pre-sanitization salvage from HTML status panels/tables (`<div>HP: 80/100</div>`, `<td><b>好感度</b></td><td><span>35</span></td>`). */
 function salvageHtmlStatusTableVars(text: string): Array<{ path: string; value: number | string | boolean; min?: number; max?: number }> {
   if (!/<(?:div|table|section|span|td|tr)\b/i.test(text)) return [];
   const results: Array<{ path: string; value: number | string | boolean; min?: number; max?: number }> = [];
 
-  // 1. Table row pairs `<td>好感度</td><td>35/100</td>`
-  const tdPairRe = /<t[dh]\b[^>]*>([^<]{1,24})<\/t[dh]>\s*<t[dh]\b[^>]*>([^<]{1,48})<\/t[dh]>/gi;
+  // 1. Table row pairs (allowing nested HTML tags inside <td>/<th> cells)
+  const tdPairRe =
+    /<t[dh]\b[^>]*>((?:(?!<\/t[dh]\b)[\s\S]){1,200})<\/t[dh]>\s*<t[dh]\b[^>]*>((?:(?!<\/t[dh]\b)[\s\S]){1,200})<\/t[dh]>/gi;
   let m: RegExpExecArray | null;
   while ((m = tdPairRe.exec(text)) !== null) {
-    const key = m[1]!.replace(/[:：\s]+$/g, "").trim();
-    const rawVal = m[2]!.trim();
-    if (!key || !rawVal || /^(?:项目|属性|名称|数值|状态|item|stat|name|value)$/i.test(key)) continue;
+    const key = m[1]!.replace(/<[^>]*>/g, "").replace(/[:：\s]+$/g, "").trim();
+    const rawVal = m[2]!.replace(/<[^>]*>/g, "").trim();
+    if (!key || key.length > 24 || !rawVal || rawVal.length > 48) continue;
+    if (/^(?:项目|属性|名称|数值|状态|item|stat|name|value)$/i.test(key)) continue;
     const ratio = /^(-?\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)$/.exec(rawVal);
     if (ratio) {
       const num = Number(ratio[1]);
@@ -464,13 +649,11 @@ export function salvageMvuVariables(sources: {
   const scanText = (text: string | undefined, source: SalvagedVariable["source"], isDedicatedInitVar = false) => {
     if (!text) return;
 
-    // 1. Official MVU `_.set(...)` & `_.add(...)` & `_.assign(...)` (respects `_.set('path', oldVal, newVal);//comment`!)
-    const mvuCallRe = /_\.(set|add|assign)\(\s*([\s\S]*?)\)\s*;?(?:\s*\/\/([^\n]*))?/g;
-    let m: RegExpExecArray | null;
-    while ((m = mvuCallRe.exec(text)) !== null) {
-      const fn = m[1]!.toLowerCase();
-      const args = splitJsArgs(m[2]!);
-      const comment = m[3]?.trim() || undefined;
+    // 1. Official MVU `_.set(...)` & `_.add(...)` & `_.assign(...)` via balanced-paren scanner
+    for (const call of extractMvuCalls(text)) {
+      const fn = call.fn;
+      const args = splitJsArgs(call.rawArgs);
+      const comment = call.comment;
       const bounds = parseBoundsHint(comment);
 
       if (fn === "set") {
@@ -520,6 +703,7 @@ export function salvageMvuVariables(sources: {
 
     // 2. `<initvar>...</initvar>`, `<UpdateVariable>...</UpdateVariable>`, fenced ```json / ```json5 / ```yaml
     const taggedBlockRe = /<(initvar|UpdateVariable)\b[^>]*>([\s\S]*?)<\/\1\s*>/gi;
+    let m: RegExpExecArray | null;
     while ((m = taggedBlockRe.exec(text)) !== null) {
       const body = m[2]!.trim();
       const jsonObj = tryParseJsonLoose(body);

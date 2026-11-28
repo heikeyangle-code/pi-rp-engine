@@ -48,7 +48,13 @@ export function extractPlainTextStats(text: string): SalvagedVariable[] {
     const val = Number(m[2]);
     const max = Number(m[3]);
     if (!key || !Number.isFinite(val) || !Number.isFinite(max) || max <= 0) continue;
-    if (/^(?:http|https|date|time|年|月|日)$/i.test(key)) continue;
+    if (
+      /^(?:http|https|date|time|birthday|birth|score|ratio|page|chapter|年|月|日|日期|时间|生日|诞辰|比分|得分|战绩|页码|页|章节)$/i.test(
+        key,
+      )
+    ) {
+      continue;
+    }
     if (!results.has(key)) {
       const allowNegative = val < 0 || BIPOLAR_STAT_RE.test(key);
       const min = allowNegative ? Math.min(-max, val) : 0;
@@ -128,6 +134,7 @@ export function inferHeuristicWorldProfile(input: {
   const { initialStage, initialTime, initialLocation } = extractPlainTextAnchors({
     scenario: input.scenario,
     firstMes: input.firstMes,
+    description: input.description,
   });
 
   const hasRpgSignals =
@@ -135,7 +142,7 @@ export function inferHeuristicWorldProfile(input: {
       combined,
     );
   const hasMysterySignals =
-    /(?:案件|侦探|凶手|线索|悬疑|推理|密室|嫌疑人|真相|谜团|调查员|克苏鲁|COC|detective|murder|clue|suspect|investigation|mystery)/i.test(
+    /(?:案件|侦探|凶手|悬疑|推理|密室|嫌疑人|调查员|克苏鲁|\bCoC\b|\bdetective\b|\bmurder\b|\bsuspect\b|\binvestigation\b|\bwhodunit\b)/i.test(
       combined,
     );
   const hasEpicSignals =
@@ -145,7 +152,7 @@ export function inferHeuristicWorldProfile(input: {
     );
   const hasEnsembleCues =
     Boolean(input.hasGroupGreetings) ||
-    /(?:群像|多角色|攻略对象|全员|众人|后宫|角色列表|人物表|main cast|ensemble|multiple characters)/i.test(
+    /(?:群像|多角色|攻略对象|后宫|角色列表|人物表|\bmain cast\b|\bensemble cast\b|\bmultiple characters\b)/i.test(
       `${input.description}\n${input.scenario}`,
     );
   const hasSliceSignals =
@@ -163,7 +170,10 @@ export function inferHeuristicWorldProfile(input: {
 
   const hasExplicitStats = input.salvagedVariables.length > 0;
   const hasInventoryWords = /(?:背包|物品栏|持有物|道具|装备|金币|inventory|backpack|items?:)/i.test(combined);
-  const hasClockWords = /(?:倒计时|警戒|警觉度|进度条|计时|时钟|期限|countdown|clock|tension|alert level)/i.test(combined);
+  const hasClockWords =
+    /(?:倒计时|警戒度|警觉度|警戒值|进度条|期限|\bcountdown\b|\bprogress clock\b|\bdoom clock\b|\balert level\b)/i.test(
+      combined,
+    );
 
   const modules: WorldProfileModules = {
     stats: hasExplicitStats || archetype === "rpg-sandbox" || archetype === "mystery" || archetype === "epic-saga",

@@ -12,6 +12,7 @@ import * as zlib from "node:zlib";
 import type { CardSpecOrigin } from "../types.js";
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const MAX_PNG_TEXT_BYTES = 16 * 1024 * 1024; // 16 MiB cap for inflated PNG text chunks
 const MAX_ZIP_ENTRIES = 512;
 const MAX_ZIP_TOTAL_BYTES = 128 * 1024 * 1024; // 128 MiB cap
 
@@ -70,7 +71,9 @@ export function extractPngCardJson(buf: Buffer): {
       if (nul > 0) {
         const key = chunkData.subarray(0, nul).toString("latin1").toLowerCase();
         if (key === "ccv3" || key === "chara") {
-          found.set(key, chunkData.subarray(nul + 1).toString("latin1"));
+          const valueBytes = chunkData.subarray(nul + 1);
+          const utf8Candidate = valueBytes.toString("utf8").replace(/^\uFEFF/, "").trim();
+          found.set(key, utf8Candidate.startsWith("{") ? utf8Candidate : valueBytes.toString("latin1"));
         }
       }
     } else if (type === "zTXt") {
@@ -80,11 +83,15 @@ export function extractPngCardJson(buf: Buffer): {
         const compressionMethod = chunkData[nul + 1];
         if ((key === "ccv3" || key === "chara") && compressionMethod === 0) {
           try {
-            const inflated = zlib.inflateSync(chunkData.subarray(nul + 2));
+            const inflated = zlib.inflateSync(chunkData.subarray(nul + 2), {
+              maxOutputLength: MAX_PNG_TEXT_BYTES,
+            });
             found.set(key, inflated.toString("utf8"));
           } catch (err) {
             warnings.push(`Failed to inflate zTXt chunk "${key}": ${(err as Error).message}`);
           }
+        } else if (key === "ccv3" || key === "chara") {
+          warnings.push(`Unsupported zTXt compression method ${compressionMethod} in chunk "${key}"`);
         }
       }
     } else if (type === "iTXt") {
@@ -99,11 +106,20 @@ export function extractPngCardJson(buf: Buffer): {
           if (transEnd >= 0) {
             const textBytes = chunkData.subarray(transEnd + 1);
             try {
-              const decoded =
-                compressionFlag === 1 && compressionMethod === 0
-                  ? zlib.inflateSync(textBytes).toString("utf8")
-                  : textBytes.toString("utf8");
-              found.set(key, decoded);
+              if (compressionFlag === 1) {
+                if (compressionMethod !== 0) {
+                  warnings.push(`Unsupported iTXt compression method ${compressionMethod} in chunk "${key}"`);
+                } else {
+                  const decoded = zlib
+                    .inflateSync(textBytes, { maxOutputLength: MAX_PNG_TEXT_BYTES })
+                    .toString("utf8");
+                  found.set(key, decoded);
+                }
+              } else if (compressionFlag === 0) {
+                found.set(key, textBytes.toString("utf8"));
+              } else {
+                warnings.push(`Unsupported iTXt compression flag ${compressionFlag} in chunk "${key}"`);
+              }
             } catch (err) {
               warnings.push(`Failed to decode iTXt chunk "${key}": ${(err as Error).message}`);
             }
@@ -117,40 +133,61 @@ export function extractPngCardJson(buf: Buffer): {
     offset = dataEnd + 4;
   }
 
-  const chosenKey: "ccv3" | "chara" | null = found.has("ccv3")
-    ? "ccv3"
-    : found.has("chara")
-      ? "chara"
-      : null;
+  const candidates: Array<"ccv3" | "chara"> = [];
+  if (found.has("ccv3")) candidates.push("ccv3");
+  if (found.has("chara")) candidates.push("chara");
 
-  if (!chosenKey) {
+  if (candidates.length === 0) {
     throw new Error("PNG does not contain a ccv3 or chara metadata chunk");
   }
 
-  const payload = found.get(chosenKey)!.trim();
-  const jsonText = payload.startsWith("{") ? payload : Buffer.from(payload, "base64").toString("utf8");
+  let lastError: Error | null = null;
+  for (const key of candidates) {
+    try {
+      const payload = found.get(key)!.replace(/^\uFEFF/, "").trim();
+      const jsonText = (payload.startsWith("{") ? payload : Buffer.from(payload, "base64").toString("utf8"))
+        .replace(/^\uFEFF/, "")
+        .trim();
 
-  const parsed = JSON.parse(jsonText);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`PNG ${chosenKey} payload is not a JSON object`);
+      const parsed = JSON.parse(jsonText);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`PNG ${key} payload is not a JSON object`);
+      }
+      return { rawJson: parsed as Record<string, unknown>, chunkKey: key, warnings };
+    } catch (err) {
+      lastError = err as Error;
+      if (key === "ccv3" && candidates.includes("chara")) {
+        warnings.push(`Failed to parse PNG ccv3 chunk, falling back to chara: ${lastError.message}`);
+      }
+    }
   }
-  return { rawJson: parsed as Record<string, unknown>, chunkKey: chosenKey, warnings };
+
+  throw lastError ?? new Error("Failed to parse PNG card metadata");
 }
 
 /** Validate a ZIP entry path against Zip-Slip traversal attacks. */
 export function sanitizeZipEntryPath(entryName: string): string {
-  const normalized = entryName.replace(/\\/g, "/").replace(/^\/+/, "");
-  if (!normalized || normalized.includes("\0")) {
+  if (!entryName || entryName.includes("\0")) {
     throw new Error(`Unsafe ZIP entry path: "${entryName}"`);
   }
-  const segments = normalized.split("/").filter((s) => s.length > 0);
-  if (segments.length === 0) {
+  const normalized = entryName.replace(/\\/g, "/");
+  if (normalized.startsWith("/") || /^[a-z]:/i.test(normalized)) {
     throw new Error(`Unsafe ZIP entry path: "${entryName}"`);
   }
-  for (const seg of segments) {
-    if (seg === ".." || seg === ".") {
+  const rawSegments = normalized.split("/");
+  const segments: string[] = [];
+  for (const seg of rawSegments) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
       throw new Error(`Zip-Slip traversal detected in entry: "${entryName}"`);
     }
+    if (/^[a-z]:/i.test(seg)) {
+      throw new Error(`Unsafe ZIP entry path: "${entryName}"`);
+    }
+    segments.push(seg);
+  }
+  if (segments.length === 0) {
+    throw new Error(`Unsafe ZIP entry path: "${entryName}"`);
   }
   return segments.join("/");
 }
@@ -168,8 +205,11 @@ export function readZipEntries(buf: Buffer): Map<string, Buffer> {
   let eocdOffset = -1;
   for (let pos = buf.length - minEocd; pos >= searchStart; pos--) {
     if (buf.readUInt32LE(pos) === 0x06054b50) {
-      eocdOffset = pos;
-      break;
+      const commentLen = buf.readUInt16LE(pos + 20);
+      if (pos + minEocd + commentLen === buf.length) {
+        eocdOffset = pos;
+        break;
+      }
     }
   }
   if (eocdOffset < 0) {
@@ -188,7 +228,7 @@ export function readZipEntries(buf: Buffer): Map<string, Buffer> {
   }
 
   const entries = new Map<string, Buffer>();
-  let totalUncompressed = 0;
+  let actualTotalBytes = 0;
   let pos = cdOffset;
 
   for (let i = 0; i < totalEntries; i++) {
@@ -197,7 +237,6 @@ export function readZipEntries(buf: Buffer): Map<string, Buffer> {
     }
     const method = buf.readUInt16LE(pos + 10);
     const compressedSize = buf.readUInt32LE(pos + 20);
-    const uncompressedSize = buf.readUInt32LE(pos + 24);
     const nameLen = buf.readUInt16LE(pos + 28);
     const extraLen = buf.readUInt16LE(pos + 30);
     const commentLen = buf.readUInt16LE(pos + 32);
@@ -206,11 +245,10 @@ export function readZipEntries(buf: Buffer): Map<string, Buffer> {
     const rawName = buf.subarray(pos + 46, pos + 46 + nameLen).toString("utf8");
     pos += 46 + nameLen + extraLen + commentLen;
 
-    if (rawName.endsWith("/")) continue;
+    if (rawName.endsWith("/") || rawName.endsWith("\\")) continue;
 
     const safeName = sanitizeZipEntryPath(rawName);
-    totalUncompressed += uncompressedSize;
-    if (totalUncompressed > MAX_ZIP_TOTAL_BYTES) {
+    if (actualTotalBytes >= MAX_ZIP_TOTAL_BYTES) {
       throw new Error(`ZIP/CHARX exceeds uncompressed size limit (${MAX_ZIP_TOTAL_BYTES} bytes)`);
     }
 
@@ -226,13 +264,22 @@ export function readZipEntries(buf: Buffer): Map<string, Buffer> {
     }
 
     const compressed = buf.subarray(dataStart, dataEnd);
+    const remainingBudget = MAX_ZIP_TOTAL_BYTES - actualTotalBytes;
     let data: Buffer;
     if (method === 0) {
+      if (compressed.length > remainingBudget) {
+        throw new Error(`ZIP/CHARX exceeds uncompressed size limit (${MAX_ZIP_TOTAL_BYTES} bytes)`);
+      }
       data = Buffer.from(compressed);
     } else if (method === 8) {
-      data = zlib.inflateRawSync(compressed, { maxOutputLength: MAX_ZIP_TOTAL_BYTES });
+      data = zlib.inflateRawSync(compressed, { maxOutputLength: Math.max(1, remainingBudget) });
     } else {
       throw new Error(`Unsupported ZIP compression method ${method} for "${safeName}"`);
+    }
+
+    actualTotalBytes += data.length;
+    if (actualTotalBytes > MAX_ZIP_TOTAL_BYTES) {
+      throw new Error(`ZIP/CHARX exceeds uncompressed size limit (${MAX_ZIP_TOTAL_BYTES} bytes)`);
     }
 
     entries.set(safeName, data);
@@ -309,7 +356,7 @@ export function unpackBuffer(buf: Buffer, filename = "input.json"): UnpackedInpu
     if (!cardBuf) {
       throw new Error(".charx 压缩包缺少根目录 card.json");
     }
-    const rawJson = JSON.parse(cardBuf.toString("utf8")) as Record<string, unknown>;
+    const rawJson = JSON.parse(cardBuf.toString("utf8").replace(/^\uFEFF/, "").trim()) as Record<string, unknown>;
     const assets: UnpackedAsset[] = [];
     for (const [entryName, data] of entries.entries()) {
       if (entryName === "card.json") continue;
@@ -379,4 +426,3 @@ export function inspectImportFileQuick(
   }
   return null;
 }
-

@@ -102,8 +102,11 @@ export function renderSmartStatBar(
   return `${renderProgressBar(value - lo, max - lo, slots)} ${value}/${max}`;
 }
 
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
 function charDisplayWidth(ch: string): number {
   const code = ch.codePointAt(0) ?? 0;
+  if (code === 0xfe0f || code === 0x200d) return 0;
   if (
     (code >= 0x1100 && code <= 0x115f) ||
     (code >= 0x2e80 && code <= 0xa4cf) ||
@@ -119,8 +122,9 @@ function charDisplayWidth(ch: string): number {
 }
 
 export function displayWidth(text: string): number {
+  const stripped = text.replace(ANSI_ESCAPE_RE, "");
   let w = 0;
-  for (const ch of text) w += charDisplayWidth(ch);
+  for (const ch of stripped) w += charDisplayWidth(ch);
   return w;
 }
 
@@ -163,19 +167,23 @@ export function truncateDisplayLine(line: string, maxWidth: number): string {
   return `${out}…`;
 }
 
-/** Style optional `<thought>...</thought>` inner monologue blocks into crisp Markdown asides. */
+/** Style optional `<thought>...</thought>` inner monologue blocks into crisp Markdown asides (skipping fenced code blocks). */
 export function formatThoughtBlocks(markdown: string): string {
   if (!/<thought\b/i.test(markdown)) return markdown;
-  return markdown.replace(/<thought\b[^>]*>([\s\S]*?)<\/thought>/gi, (_full, inner: string) => {
-    const cleaned = inner
-      .trim()
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line, idx) => (idx === 0 ? `> 💭 *${line}*` : `> *${line}*`))
-      .join("\n");
-    return cleaned ? `${cleaned}\n` : "";
-  });
+  return markdown.replace(
+    /(?:^|\r?\n)(?:```|~~~)[^\n]*\r?\n[\s\S]*?(?:\r?\n(?:```|~~~)[ \t]*(?=\r?\n|$)|$)|<thought\b[^>]*>([\s\S]*?)<\/thought>/gi,
+    (full, inner: string | undefined) => {
+      if (inner === undefined) return full;
+      const cleaned = inner
+        .trim()
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line, idx) => (idx === 0 ? `> 💭 *${line}*` : `> *${line}*`))
+        .join("\n");
+      return cleaned ? `${cleaned}\n` : "";
+    },
+  );
 }
 
 /** Create a zero-dependency Pi TUI Component from a width-aware line renderer. */
@@ -218,9 +226,14 @@ function renderEditorialCard(options: {
   const headerRule = styleFg(theme, accentColor, "╭─");
   const footerRule = styleFg(theme, accentColor, `╰${"─".repeat(Math.min(innerWidth + 1, 44))}`);
 
+  const prefixPlain = `╭─ [${tag}] `;
+  const availHeader = Math.max(8, width - displayWidth(prefixPlain));
+  const rawMeta = subtitle ? `${title} · ${subtitle}` : title;
   const headerLine =
-    `${headerRule} ${styleFg(theme, accentColor, `[${tag}]`)} ${styleBold(theme, title)}` +
-    (subtitle ? ` ${styleDim(theme, `· ${subtitle}`)}` : "");
+    displayWidth(rawMeta) <= availHeader
+      ? `${headerRule} ${styleFg(theme, accentColor, `[${tag}]`)} ${styleBold(theme, title)}` +
+        (subtitle ? ` ${styleDim(theme, `· ${subtitle}`)}` : "")
+      : `${headerRule} ${styleFg(theme, accentColor, `[${tag}]`)} ${styleBold(theme, truncateDisplayLine(rawMeta, availHeader))}`;
 
   const lines: string[] = [headerLine];
   const rawLines = body.replace(/\r\n?/g, "\n").split("\n");

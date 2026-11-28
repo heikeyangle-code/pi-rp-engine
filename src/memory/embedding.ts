@@ -6,18 +6,39 @@
  *
  * - Works with ANY OpenAI-compatible `/v1/embeddings` endpoint (OpenAI, SiliconFlow, local Ollama).
  * - Strict 3.5s timeout + graceful silent fallback to pure BM25 when disabled or unreachable.
- * - Content-hashed Float32Array vector cache avoids re-embedding unchanged rounds or lore entries.
+ * - Content-hashed Float32Array LRU vector cache avoids re-embedding unchanged rounds or lore entries.
  */
 
 import { createHash } from "node:crypto";
 import type { EmbeddingConfig } from "../types.js";
 
 const MAX_CACHE_ENTRIES = 2048;
+const EMBEDDING_BATCH_SIZE = 32;
 const vectorCache = new Map<string, Float32Array>();
 
 function cacheKey(endpoint: string, model: string, text: string): string {
   const hash = createHash("sha1").update(text, "utf8").digest("hex").slice(0, 16);
   return `${endpoint}|${model}|${hash}`;
+}
+
+function lruGet(key: string): Float32Array | undefined {
+  const hit = vectorCache.get(key);
+  if (!hit) return undefined;
+  // Promote to most-recently-used position
+  vectorCache.delete(key);
+  vectorCache.set(key, hit);
+  return hit;
+}
+
+function lruSet(key: string, vec: Float32Array): void {
+  if (vectorCache.has(key)) {
+    vectorCache.delete(key);
+  }
+  vectorCache.set(key, vec);
+  if (vectorCache.size > MAX_CACHE_ENTRIES) {
+    const oldest = vectorCache.keys().next().value;
+    if (oldest) vectorCache.delete(oldest);
+  }
 }
 
 export function cosineSimilarity(a: Float32Array | number[], b: Float32Array | number[]): number {
@@ -59,7 +80,8 @@ export function reciprocalRankFusion<T extends string | number>(
 }
 
 /**
- * Batch-embed texts via an OpenAI-compatible `/embeddings` endpoint with content caching.
+ * Batch-embed texts via an OpenAI-compatible `/embeddings` endpoint with LRU content caching
+ * and automatic 32-text chunking.
  * Returns null cleanly if config is disabled, invalid, timed out, or errored.
  */
 export async function embedTexts(
@@ -81,7 +103,7 @@ export async function embedTexts(
     const trimmed = (texts[i] ?? "").trim().slice(0, 1800);
     if (!trimmed) continue;
     const key = cacheKey(endpoint, model, trimmed);
-    const cached = vectorCache.get(key);
+    const cached = lruGet(key);
     if (cached) {
       results[i] = cached;
     } else {
@@ -99,33 +121,33 @@ export async function embedTexts(
     if (config.apiKey?.trim()) {
       headers.Authorization = `Bearer ${config.apiKey.trim()}`;
     }
-    const resp = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({ model, input: missingTexts }),
-      signal: controller.signal,
-    });
-    if (!resp.ok) return null;
-    const json = (await resp.json()) as {
-      data?: Array<{ index?: number; embedding?: number[] }>;
-    };
-    if (!Array.isArray(json?.data)) return null;
 
-    const rows: Array<{ index?: number; embedding?: number[] }> = json.data;
-    for (let j = 0; j < rows.length; j++) {
-      const row = rows[j];
-      if (!row || !Array.isArray(row.embedding) || row.embedding.length === 0) continue;
-      const pos = typeof row.index === "number" ? row.index : j;
-      const origIdx = missingIndices[pos];
-      const text = missingTexts[pos];
-      if (origIdx === undefined || !text) continue;
-      const vec = Float32Array.from(row.embedding);
-      results[origIdx] = vec;
-      const key = cacheKey(endpoint, model, text);
-      vectorCache.set(key, vec);
-      if (vectorCache.size > MAX_CACHE_ENTRIES) {
-        const oldest = vectorCache.keys().next().value;
-        if (oldest) vectorCache.delete(oldest);
+    for (let offset = 0; offset < missingTexts.length; offset += EMBEDDING_BATCH_SIZE) {
+      const batchTexts = missingTexts.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+      const batchIndices = missingIndices.slice(offset, offset + EMBEDDING_BATCH_SIZE);
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ model, input: batchTexts }),
+        signal: controller.signal,
+      });
+      if (!resp.ok) return null;
+      const json = (await resp.json()) as {
+        data?: Array<{ index?: number; embedding?: number[] }>;
+      };
+      if (!Array.isArray(json?.data)) return null;
+
+      const rows: Array<{ index?: number; embedding?: number[] }> = json.data;
+      for (let j = 0; j < rows.length; j++) {
+        const row = rows[j];
+        if (!row || !Array.isArray(row.embedding) || row.embedding.length === 0) continue;
+        const pos = typeof row.index === "number" ? row.index : j;
+        const origIdx = batchIndices[pos];
+        const text = batchTexts[pos];
+        if (origIdx === undefined || !text) continue;
+        const vec = Float32Array.from(row.embedding);
+        results[origIdx] = vec;
+        lruSet(cacheKey(endpoint, model, text), vec);
       }
     }
     return results;

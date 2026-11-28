@@ -101,6 +101,7 @@ export interface PiUiContext {
 
 export interface PiModelDescriptor {
   provider?: string;
+  api?: string;
   id?: string;
   name?: string;
   contextWindow?: number;
@@ -125,18 +126,39 @@ export interface PiModelRegistry {
 
 export interface PiExtensionContext {
   cwd: string;
-  mode?: "tui" | "rpc" | "print" | string;
+  mode?: "tui" | "rpc" | "print" | "json" | string;
   model?: unknown;
   ui: PiUiContext;
   sessionManager: PiSessionManager;
   modelRegistry?: PiModelRegistry;
   hasUI?: boolean;
   signal?: AbortSignal;
+  isProjectTrusted?: () => boolean;
   isIdle?(): boolean;
   abort?(): Promise<void> | void;
   getContextUsage?(): { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
   fork?(entryId: string, options?: Record<string, unknown>): Promise<{ cancelled?: boolean }>;
   navigateTree?(targetId: string, options?: Record<string, unknown>): Promise<{ cancelled?: boolean }>;
+}
+
+export interface TurnEndEvent {
+  turnIndex?: number;
+  message?: PiMessage;
+  messageEntryId?: string;
+  toolResultEntryIds?: string[];
+  outcome?: "completed" | "aborted" | "error";
+  [key: string]: unknown;
+}
+
+export interface SessionShutdownEvent {
+  reason?: string;
+  [key: string]: unknown;
+}
+
+export interface SessionCompactEvent {
+  compactionEntry?: PiSessionEntry;
+  fromExtension?: boolean;
+  [key: string]: unknown;
 }
 
 export interface PiToolDefinition {
@@ -147,6 +169,12 @@ export interface PiToolDefinition {
   promptGuidelines?: string[];
   parameters: Record<string, unknown>;
   defaultActive?: boolean;
+  executionMode?: "parallel" | "sequential";
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+  };
   execute(
     toolCallId: string,
     params: Record<string, unknown>,
@@ -180,7 +208,12 @@ export interface PiCompactionPreparation {
   previousSummary?: string;
 }
 
+export type ToolDefinition = PiToolDefinition;
+
 export interface PiExtensionAPI {
+  on(event: "turn_end", handler: (event: TurnEndEvent, ctx: PiExtensionContext) => any): void;
+  on(event: "session_shutdown", handler: (event: SessionShutdownEvent, ctx: PiExtensionContext) => any): void;
+  on(event: "session_compact", handler: (event: SessionCompactEvent, ctx: PiExtensionContext) => any): void;
   on(event: string, handler: (event: any, ctx: PiExtensionContext) => any): void;
   registerTool(tool: PiToolDefinition): void;
   registerCommand(name: string, def: PiCommandDefinition): void;
@@ -191,6 +224,7 @@ export interface PiExtensionAPI {
   ): void;
   getFlag?(name: string): boolean | string | undefined;
   getActiveTools(): string[];
+  getAllTools?(): Array<{ name: string; [key: string]: unknown }>;
   setActiveTools(names: string[]): void;
   appendEntry(customType: string, data: unknown): void;
   sendMessage(

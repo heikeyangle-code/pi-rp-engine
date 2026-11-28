@@ -77,7 +77,17 @@ export function saveUiPrefs(patch: Partial<UiPrefs>): void {
     const p = getPrefsPath();
     fs.mkdirSync(path.dirname(p), { recursive: true });
     const next = { ...loadUiPrefs(), ...patch };
-    fs.writeFileSync(p, JSON.stringify(next, null, 2), "utf8");
+    const hasApiKey = Boolean(next.embeddingConfig?.apiKey);
+    const tmp = `${p}.tmp.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), hasApiKey ? { encoding: "utf8", mode: 0o600 } : "utf8");
+    fs.renameSync(tmp, p);
+    if (hasApiKey) {
+      try {
+        fs.chmodSync(p, 0o600);
+      } catch {
+        // Non-fatal on platforms without POSIX chmod
+      }
+    }
   } catch {
     // Non-fatal
   }
@@ -99,7 +109,7 @@ export function normalizeUserFilePath(raw: string, cwd: string): string {
   if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
     cleaned = cleaned.slice(1, -1);
   }
-  cleaned = cleaned.replace(/\\ /g, " ");
+  cleaned = cleaned.replace(/\\([ ()'"])/g, "$1");
   if (cleaned.startsWith("~/")) {
     cleaned = path.join(os.homedir(), cleaned.slice(2));
   }
@@ -150,10 +160,16 @@ export function getQuickImportRoots(cwd: string): Array<{ label: string; dir: st
   const add = (label: string, dir: string | undefined) => {
     if (!dir) return;
     const resolved = path.resolve(dir);
-    if (seen.has(resolved)) return;
     try {
       if (fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()) {
-        seen.add(resolved);
+        let canonical = resolved;
+        try {
+          canonical = fs.realpathSync(resolved);
+        } catch {
+          // Keep resolved path if realpath fails
+        }
+        if (seen.has(canonical)) return;
+        seen.add(canonical);
         candidates.push({ label, dir: resolved });
       }
     } catch {
@@ -198,10 +214,17 @@ export function smartDiscoverRpFiles(cwd: string, limit = 24): CandidateFile[] {
           walk(full, depth + 1);
         } else if (ent.isFile()) {
           const ext = path.extname(ent.name).toLowerCase();
-          if (!VALID_EXTS.has(ext) || seen.has(full)) continue;
+          if (!VALID_EXTS.has(ext)) continue;
+          let canonical = path.resolve(full);
+          try {
+            canonical = fs.realpathSync(full);
+          } catch {
+            // Fall back to resolved path
+          }
+          if (seen.has(canonical)) continue;
           const info = classifyCandidateFile(full, dir);
           if (info) {
-            seen.add(full);
+            seen.add(canonical);
             results.push({
               ...info,
               displayPath: baseLabel ? `${baseLabel}/${info.displayPath}` : info.displayPath,
@@ -220,9 +243,13 @@ export function smartDiscoverRpFiles(cwd: string, limit = 24): CandidateFile[] {
     scanDir(prefs.lastImportDir, 1, "上次目录");
   }
   // Scan Downloads (depth 1) — super common place for SillyTavern PNG/JSON downloads!
-  for (const dl of [path.join(home, "Downloads"), "/sdcard/Download"]) {
+  const downloadDirs: Array<{ dir: string; label: string }> = [
+    { dir: path.join(home, "Downloads"), label: "Downloads" },
+    { dir: "/sdcard/Download", label: "Android/Download" },
+  ];
+  for (const { dir: dl, label } of downloadDirs) {
     if (fs.existsSync(dl)) {
-      scanDir(dl, 1, "Downloads");
+      scanDir(dl, 1, label);
     }
   }
 
@@ -360,7 +387,14 @@ export async function pickFilesToImport(ctx: PiExtensionContext): Promise<string
         ctx.ui.notify(`找不到文件：${resolved}`, "error");
         return "continue";
       }
-      if (fs.statSync(resolved).isDirectory()) {
+      let isDir = false;
+      try {
+        isDir = fs.statSync(resolved).isDirectory();
+      } catch {
+        ctx.ui.notify(`无法读取路径：${resolved}`, "error");
+        return "continue";
+      }
+      if (isDir) {
         const picked = await browseDirectory(ctx, resolved);
         return picked ?? "continue";
       }

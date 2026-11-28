@@ -5,8 +5,8 @@
  * Constitutional fidelity guarantees:
  *  1. NEVER truncate or summarize `mes_example`.
  *  2. NEVER censor or alter jailbreaks, writing-style guides, POV rules, or author constraints.
- *  3. ONLY strip SillyTavern 1.0 frontend shells (<script>, <style>, <iframe>, balanced nested styled HTML
- *     status bars, <UpdateVariable> MVU blocks, _.set(...) JS patches, ST /setvar slash script blocks).
+ *  3. ONLY strip SillyTavern 1.0 frontend shells (<script>, <style>, <iframe>, <svg>, balanced nested styled HTML
+ *     status bars, <initvar>/<UpdateVariable> MVU blocks, _.set(...) JS patches, ST /setvar slash script blocks).
  *  4. ONLY deduplicate near-identical anti-godmoding boilerplate appearing >= 2 times across rule fields.
  */
 
@@ -28,7 +28,9 @@ export interface DeduplicatedRecord {
 const SIMPLE_FRONTEND_PATTERNS: Array<{ kind: string; regex: RegExp }> = [
   { kind: "script_tag", regex: /<script\b[^>]*>[\s\S]*?<\/script\s*>/gi },
   { kind: "style_tag", regex: /<style\b[^>]*>[\s\S]*?<\/style\s*>/gi },
-  { kind: "iframe_tag", regex: /<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>/gi },
+  { kind: "iframe_tag", regex: /<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>|<iframe\b[^>]*\/?>/gi },
+  { kind: "svg_tag", regex: /<svg\b[^>]*>[\s\S]*?<\/svg\s*>|<svg\b[^>]*\/>/gi },
+  { kind: "mvu_initvar_block", regex: /<initvar\b[^>]*>[\s\S]*?<\/initvar\s*>/gi },
   { kind: "mvu_update_block", regex: /<UpdateVariable\b[^>]*>[\s\S]*?<\/UpdateVariable\s*>/gi },
   { kind: "mvu_status_block", regex: /<StatusPlaceHolderImpl\s*\/?>/gi },
   {
@@ -41,8 +43,10 @@ const SIMPLE_FRONTEND_PATTERNS: Array<{ kind: string; regex: RegExp }> = [
   },
 ];
 
+// Narrow <details> matching so narrative collapsibles like `<details class="summary-card">` are preserved
+// while styled status panels (`<details style="...">` or `<details class="status-panel">`) are still stripped.
 const STYLED_CONTAINER_OPEN =
-  /<(div|section|table|details)\b([^>]*\b(?:style|class|onclick|onload)\s*=\s*["'][^"']*(?:display\s*:\s*(?:flex|grid)|grid-template|background|border|status|stat|hud|card|panel|st-|mvu|bar|box|progress|font-size|padding|margin|color\s*:)[^"']*["'][^>]*)>/i;
+  /<(?:(div|section|table)\b[^>]*\b(?:style|class|onclick|onload)\s*=\s*["'][^"']*(?:display\s*:\s*(?:flex|grid)|grid-template|background|border|status|stat|hud|card|panel|st-|mvu|bar|box|progress|font-size|padding|margin|color\s*:)[^"']*["']|(details)\b[^>]*\b(?:(?:style|onclick|onload)\s*=\s*["'][^"']*(?:display\s*:\s*(?:flex|grid)|grid-template|background|border|font-size|padding|margin|color\s*:)[^"']*["']|class\s*=\s*["'][^"']*(?:status|hud|mvu|st-)[^"']*["']))[^>]*>/i;
 
 function previewOf(text: string): string {
   const compact = text.replace(/\s+/g, " ").trim();
@@ -66,7 +70,7 @@ export function stripBalancedStyledHtmlContainers(
     const m = STYLED_CONTAINER_OPEN.exec(text);
     if (!m || m.index === undefined) break;
 
-    const tagName = m[1]!.toLowerCase();
+    const tagName = (m[1] ?? m[2])!.toLowerCase();
     const startIdx = m.index;
     const afterOpen = startIdx + m[0].length;
 
@@ -158,6 +162,8 @@ export function sanitizeFrontendShell(
 /** Check if a SillyTavern regex_script is a frontend HTML/CSS/JS presentation script (to be stripped). */
 export function isFrontendRegexScript(script: Record<string, unknown>): boolean {
   const replace = typeof script.replaceString === "string" ? script.replaceString : "";
+  // Pure cleanup scripts (empty replacement) strip unwanted tags rather than injecting frontend HTML/CSS/JS
+  if (replace.trim() === "") return false;
   const find = typeof script.findRegex === "string" ? script.findRegex : "";
   const combined = `${find}\n${replace}`;
   return /<(?:div|span|style|script|iframe|table|details|svg|button|input)\b|\bstyle\s*=|\bclass\s*=|display\s*:\s*(?:flex|grid)|TavernHelper|UpdateVariable/i.test(
@@ -214,24 +220,42 @@ export function applyDisplayRegexRules(
       const re = new RegExp(pattern, rule.flags);
       out = out.replace(re, (...args) => {
         const rawMatch = String(args[0] ?? "");
-        const captures = args.slice(1, -2);
+        // Detect trailing `groups` object passed by JS when the regex has named capture groups
+        const hasGroups =
+          args.length >= 4 &&
+          typeof args[args.length - 1] === "object" &&
+          args[args.length - 1] !== null &&
+          typeof args[args.length - 2] === "string" &&
+          typeof args[args.length - 3] === "number";
+        const captures = args.slice(1, hasGroups ? -3 : -2);
+        const groups = hasGroups ? (args[args.length - 1] as Record<string, string | undefined>) : undefined;
+
         let trimmedMatch = rawMatch;
         for (const rawTrim of rule.trimStrings) {
           if (!rawTrim) continue;
           const trim = macroCtx ? evaluateMacros(rawTrim, macroCtx) : rawTrim;
           if (trim) trimmedMatch = trimmedMatch.split(trim).join("");
         }
-        let rep = rule.replacement.replace(/\{\{match\}\}/gi, trimmedMatch);
-        if (macroCtx) {
-          rep = evaluateMacros(rep, macroCtx);
-        }
-        // Standard $1..$9 / $& replacement
-        rep = rep.replace(/\$(\d+|&)/g, (_m, tok: string) => {
-          if (tok === "&") return trimmedMatch;
-          const idx = parseInt(tok, 10) - 1;
-          return captures[idx] !== undefined ? String(captures[idx]) : "";
-        });
-        return rep;
+
+        const template = macroCtx ? evaluateMacros(rule.replacement, macroCtx) : rule.replacement;
+
+        // Single-pass replacement for {{match}}, $&, $$, $<name>, and $1..$n so `$100` inside
+        // matched text or capture groups is never corrupted by a second substitution pass.
+        return template.replace(
+          /\{\{match\}\}|\$\$|\$&|\$<([^>]+)>|\$(\d+)/gi,
+          (token, namedGroup: string | undefined, numTok: string | undefined) => {
+            if (token.toLowerCase() === "{{match}}" || token === "$&") return trimmedMatch;
+            if (token === "$$") return "$";
+            if (namedGroup !== undefined) {
+              return groups && groups[namedGroup] !== undefined ? String(groups[namedGroup]) : "";
+            }
+            if (numTok !== undefined) {
+              const idx = parseInt(numTok, 10) - 1;
+              return idx >= 0 && idx < captures.length && captures[idx] !== undefined ? String(captures[idx]) : "";
+            }
+            return token;
+          },
+        );
       });
     } catch {
       // Skip invalid regex safely
@@ -332,10 +356,13 @@ export function stripDisplayResiduals(markdown: string): string {
   if (!markdown) return markdown;
   const dummy: StrippedRecord[] = [];
   let out = markdown
+    .replace(/<initvar\b[^>]*>[\s\S]*?<\/initvar\s*>/gi, "")
     .replace(/<UpdateVariable\b[^>]*>[\s\S]*?<\/UpdateVariable\s*>/gi, "")
     .replace(/<StatusPlaceHolderImpl\s*\/?>/gi, "")
     .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "")
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "");
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "")
+    .replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>|<iframe\b[^>]*\/?>/gi, "")
+    .replace(/<svg\b[^>]*>[\s\S]*?<\/svg\s*>|<svg\b[^>]*\/>/gi, "");
   out = stripBalancedStyledHtmlContainers(out, "display", dummy);
   return out.replace(/\n{3,}/g, "\n\n").trim();
 }

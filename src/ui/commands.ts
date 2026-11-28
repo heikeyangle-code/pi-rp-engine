@@ -49,51 +49,64 @@ import {
 } from "./actions.js";
 import { openRpDashboard, type DashboardRuntime } from "./dashboard.js";
 
+const CARD_SUMMARY_CACHE_TTL_MS = 5000;
+let cardSummaryCache: { cwd: string; ts: number; data: ReturnType<typeof listAllCardSummaries> } | null = null;
+
+function getCachedCardSummaries(cwd: string): ReturnType<typeof listAllCardSummaries> {
+  const now = Date.now();
+  if (cardSummaryCache && cardSummaryCache.cwd === cwd && now - cardSummaryCache.ts < CARD_SUMMARY_CACHE_TTL_MS) {
+    return cardSummaryCache.data;
+  }
+  const data = listAllCardSummaries(cwd);
+  cardSummaryCache = { cwd, ts: now, data };
+  return data;
+}
+
 const SUBCOMMANDS: Array<{ value: string; description: string }> = [
   { value: "import", description: "打开文件浏览器导入角色卡 / 世界书 / 预设（支持批量）" },
   { value: "load", description: "从角色库加载角色卡（仅绑定当前会话）" },
-  { value: "panel", description: "打开 7 标签页世界控制台（TUI 浮窗 / 全功能面板 · Ctrl+Shift+R）" },
-  { value: "qr", description: "快捷回复与常用动作宏 (Alt+E)" },
-  { value: "xray", description: "上下文 X-Ray 透视：Zone 1/2/3、KV-Cache 连击与世界书命中原因 (Alt+X)" },
+  { value: "panel", description: "打开世界面板（动态一览 / 场景 / 人物 / 记忆 / 导演台）" },
+  { value: "qr", description: "快捷回复与常用动作宏" },
+  { value: "xray", description: "上下文 X-Ray 透视：Zone 1/2/3、KV-Cache 连击与世界书命中原因" },
   { value: "undo", description: "查看状态变更审计日志并一键撤销误改" },
   { value: "books", description: "打开记忆书章节 (Memory Books) 管理面板" },
   { value: "storylets", description: "管理条件触发动态剧情卡 (Storylets) 与场景目标" },
   { value: "sidecar", description: "配置后台专职 Sidecar 模型（结算/语义压缩/生成世界书）" },
   { value: "monologue", description: "开关角色内心独白 (<thought>) 引文块" },
   { value: "library", description: "管理并清理已导入的角色卡、预设与玩家马甲" },
-  { value: "imp", description: "以玩家视角帮我代写一段回复并填入输入框 (Alt+I)" },
-  { value: "ask", description: "零污染场外提问 Side Prompt，不写入历史 (Alt+Q)" },
+  { value: "imp", description: "以玩家视角帮我代写一段回复并填入输入框" },
+  { value: "ask", description: "零污染场外提问 Side Prompt，不写入历史" },
   { value: "rewrite", description: "局部定向改写上一条回复（非破坏性替换）" },
   { value: "style", description: "一键切换回复篇幅（精炼/标准/长篇）与叙事人称" },
   { value: "ban", description: "管理本局反 AI 套话禁词表（另含自动复读检测）" },
   { value: "spotlight", description: "群像镜头切换：指定下一轮主导 NPC" },
   { value: "interlude", description: "零污染幕后插叙 / 敌方视角 / 番外小剧场" },
   { value: "export", description: "一键导出当前分支为纯净 Markdown 小说" },
-  { value: "reroll", description: "重摇上一条回复（支持定向微调预设，旧分支保留在 /tree · Alt+W）" },
-  { value: "continue", description: "让角色无缝续写剧情 (Alt+K)" },
-  { value: "act", description: "生成 3 个符合当下情境的行动建议 (Alt+A)" },
+  { value: "reroll", description: "重摇上一条回复（支持定向微调预设，旧分支保留在 /tree）" },
+  { value: "continue", description: "让角色无缝续写剧情" },
+  { value: "act", description: "生成 3 个符合当下情境的行动建议" },
   { value: "recap", description: "0 Token 瞬时合成前情提要与当前局势摘要" },
   { value: "summarize", description: "将较早的对话楼层归档为记忆书章节并隐藏（省 Token 防失忆）" },
   { value: "loregen", description: "从最近对话为新出现的人物/地点一键生成世界书条目" },
   { value: "analyze", description: "一键 AI 智能建档：识别卡型、初态、别名与防剧透门禁（永久缓存）" },
-  { value: "note", description: "管理导演指令 Author's Note (Alt+N)" },
-  { value: "pace", description: "切换叙事节奏 (relaxed / balanced / dramatic · Alt+P)" },
-  { value: "skip", description: "切场景 / 跳时间 (Alt+T)" },
+  { value: "note", description: "管理导演指令 Author's Note" },
+  { value: "pace", description: "切换叙事节奏 (relaxed / balanced / dramatic)" },
+  { value: "skip", description: "切场景 / 跳时间" },
   { value: "ooc", description: "发起 OOC 讨论，不推进剧情（也可直接输入 ((内容))）" },
   { value: "roll", description: "快捷掷骰检定器，支持优势/劣势/DC" },
-  { value: "save", description: "保存剧情书签 (Alt+B)" },
-  { value: "goto", description: "跳转或分叉至已保存的剧情书签 (Alt+J)" },
+  { value: "save", description: "保存剧情书签" },
+  { value: "goto", description: "跳转或分叉至已保存的剧情书签" },
   { value: "hide", description: "交互式隐藏对话楼层（不发给模型，不删记录）" },
   { value: "unhide", description: "恢复已隐藏的对话楼层" },
   { value: "persona", description: "切换或新建玩家马甲（不破坏缓存）" },
   { value: "greet", description: "切换/重发角色开场白" },
   { value: "cast", description: "交互式管理多角色同场共演" },
   { value: "preset", description: "加载或关闭酒馆预设" },
-  { value: "hud", description: "切换 HUD 显示模式 (minimal / full / off · Alt+H)" },
+  { value: "hud", description: "切换 HUD 显示模式 (minimal / full / off)" },
   { value: "mode", description: "切换后台结算模式 (tool-assisted / sidecar-light / off)" },
   { value: "raw", description: "切换原味直通模式（跳过酒馆前端壳剥离）" },
   { value: "keys", description: "查看全部 18 项 RP 快捷键速查表" },
-  { value: "exit", description: "彻底退出当前会话 RP 模式，恢复编程助手 (Alt+Shift+X)" },
+  { value: "exit", description: "彻底退出当前会话 RP 模式，恢复编程助手" },
 ];
 
 export function makeDashboardRuntime(rt: RpRuntimeHandle): DashboardRuntime {
@@ -131,121 +144,139 @@ export function makeDashboardRuntime(rt: RpRuntimeHandle): DashboardRuntime {
 
 /** Open the context-aware `/rp` main menu (Dormant Launcher vs Active RP Control Center). */
 export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
-  const state = rt.getState();
+  while (true) {
+    const state = rt.getState();
 
-  if (!state.active) {
-    const cards = listAllCardSummaries(ctx.cwd);
-    const pick = await ctx.ui.select("🎭 RP 引擎启动器（仅在当前会话生效，绝不影响其他会话）", [
-      `🎭 加载已有角色卡（角色库共 ${cards.length} 张）`,
-      "📥 浏览并导入角色卡 / 世界书 / 预设（自动识别 Downloads 与当前目录）",
-      "🗂 资产库管理（清理角色卡 / 预设 / 马甲）",
-      "⌨️ 查看 18 项快捷键速查表",
+    if (!state.active) {
+      const cards = listAllCardSummaries(ctx.cwd);
+      const pick = await ctx.ui.select("🎭 RP 引擎启动器（仅在当前会话生效）", [
+        `🎭 加载已有角色卡（角色库共 ${cards.length} 张）`,
+        "📥 浏览并导入角色卡 / 世界书 / 预设",
+        "🗂 资产库管理（清理角色卡 / 预设 / 马甲）",
+        "✕ 关闭",
+      ]);
+      if (!pick || pick.startsWith("✕")) return;
+      if (pick.startsWith("🎭")) await actionLoadCard(rt, ctx, "");
+      else if (pick.startsWith("📥")) await actionImportFile(rt, ctx, "");
+      else if (pick.startsWith("🗂")) await actionManageLibrary(rt, ctx);
+      return;
+    }
+
+    const card = rt.getCard();
+    const title = `🎭 ${[card?.identity.name ?? state.cardSlug ?? "RP", state.location || state.era, `T${state.turn}`].filter(Boolean).join(" · ")}`;
+    const pick = await ctx.ui.select(title, [
+      "📊 打开世界面板（动态一览 / 场景 / 人物 / 记忆 / 世界书 / 导演）",
+      "⚡ 快捷回复  /  ✍️ 代写回复  /  💡 行动建议",
+      "🔄 重摇回复  /  ✂️ 局部改写  /  ▶ 无缝续写",
+      "💭 场外提问（全知零污染）  /  💬 对话内 OOC（用完自动隐身）",
+      "⏳ 幕间推演  /  🔦 镜头聚焦  /  🎞 幕后插叙  /  🔖 书签",
+      "🎭 换卡 / 换开场白 / 📥 导入新卡 / ✨ AI 深度建档",
+      "⚙ 快捷设置（切换 HUD / 预设 / 结算模式 / 掷骰 / 导出小说 / 退出）",
       "✕ 关闭",
     ]);
     if (!pick || pick.startsWith("✕")) return;
-    if (pick.startsWith("🎭")) await actionLoadCard(rt, ctx, "");
-    else if (pick.startsWith("📥")) await actionImportFile(rt, ctx, "");
-    else if (pick.startsWith("🗂")) await actionManageLibrary(rt, ctx);
-    else if (pick.startsWith("⌨️")) await actionShowShortcuts(ctx);
+
+    if (pick.startsWith("📊")) {
+      await openRpDashboard(makeDashboardRuntime(rt), ctx);
+      return;
+    }
+    if (pick.startsWith("⚡")) {
+      const sub = await ctx.ui.select("快捷回复与行动辅助", [
+        "⚡ 快捷回复与常用动作宏",
+        "✍️ 帮我代写主角回复并填入输入框",
+        "💡 生成 3 个行动建议",
+        "← 返回",
+      ]);
+      if (!sub || sub.startsWith("←")) continue;
+      if (sub.startsWith("⚡")) await actionQuickReplies(rt, ctx, "");
+      else if (sub.startsWith("✍️")) await actionImpersonate(rt, ctx, "");
+      else if (sub.startsWith("💡")) await actionIdeas(rt, ctx);
+      return;
+    }
+    if (pick.startsWith("🔄")) {
+      const sub = await ctx.ui.select("重摇、改写与续写", [
+        "🔄 重摇上一条回复（支持定向微调）",
+        "✂️ 局部定向改写上一条回复",
+        "▶ 让角色无缝续写剧情",
+        "← 返回",
+      ]);
+      if (!sub || sub.startsWith("←")) continue;
+      if (sub.startsWith("🔄")) await actionReroll(rt, ctx, "");
+      else if (sub.startsWith("✂️")) await actionRewriteLast(rt, ctx, "");
+      else if (sub.startsWith("▶")) await actionContinue(rt, ctx);
+      return;
+    }
+    if (pick.startsWith("💭")) {
+      const sub = await ctx.ui.select("场外提问与 OOC", [
+        "💭 全知零污染场外提问（不进历史，了解完整进度与面板）",
+        "💬 对话内 OOC（可查历史/按指令改状态，结束后自动隐身防污染）",
+        "← 返回",
+      ]);
+      if (!sub || sub.startsWith("←")) continue;
+      if (sub.startsWith("💭")) await actionSidePrompt(rt, ctx, "");
+      else if (sub.startsWith("💬")) await actionOoc(rt, ctx, "");
+      return;
+    }
+    if (pick.startsWith("⏳")) {
+      const sub = await ctx.ui.select("场景推演、镜头与书签", [
+        "⏳ 幕间世界推演 / 切场景",
+        "🔦 群像镜头切换：指定下一轮主导 NPC",
+        "🎞 零污染幕后插叙 / 小剧场（不影响主线）",
+        "🔖 保存当前节点为书签",
+        "⏪ 跳转 / 分叉至已有书签",
+        "← 返回",
+      ]);
+      if (!sub || sub.startsWith("←")) continue;
+      if (sub.startsWith("⏳")) await actionSkipMontage(rt, ctx, "");
+      else if (sub.startsWith("🔦")) await actionSpotlight(rt, ctx, "");
+      else if (sub.startsWith("🎞")) await actionInterlude(rt, ctx, "");
+      else if (sub.startsWith("🔖")) await actionBookmarkSave(rt, ctx, "");
+      else if (sub.startsWith("⏪")) await actionBookmarkGoto(rt, ctx, "");
+      return;
+    }
+    if (pick.startsWith("🎭")) {
+      const sub = await ctx.ui.select("角色卡、开场白与导入", [
+        "✨ 一键 AI 深度建档（提取初态 / 人物关系 / 口癖锚点 / 门禁）",
+        "💬 重发 / 切换开场白",
+        "🎭 切换其他主角色卡",
+        "📥 导入新的角色卡 / 世界书 / 预设",
+        "← 返回",
+      ]);
+      if (!sub || sub.startsWith("←")) continue;
+      if (sub.startsWith("✨")) await actionAnalyzeCard(rt, ctx);
+      else if (sub.startsWith("💬")) await actionGreeting(rt, ctx);
+      else if (sub.startsWith("🎭")) await actionLoadCard(rt, ctx, "");
+      else if (sub.startsWith("📥")) await actionImportFile(rt, ctx, "");
+      return;
+    }
+    if (pick.startsWith("⚙")) {
+      const sub = await ctx.ui.select("快捷设置与工具", [
+        `🖥 切换 HUD 显示（当前：${state.hudMode}）`,
+        `🎛 切换酒馆预设（当前：${state.presetId ?? "无"}）`,
+        `⚙️ 切换结算模式（当前：${state.settlementMode}）`,
+        `🛡 原味直通模式（当前：${state.rawPassthrough ? "开" : "关"}）`,
+        "📖 导出纯净 Markdown 小说（至当前项目 rp-exports/）",
+        "🎲 快捷掷骰检定",
+        "🚪 彻底退出本会话 RP 模式",
+        "← 返回",
+      ]);
+      if (!sub || sub.startsWith("←")) continue;
+      if (sub.startsWith("🖥")) await actionSetHud(rt, ctx, "");
+      else if (sub.startsWith("🎛")) await actionPreset(rt, ctx, "");
+      else if (sub.startsWith("⚙️")) await actionSetSettlementMode(rt, ctx, "");
+      else if (sub.startsWith("🛡")) await actionToggleRawPassthrough(rt, ctx, "");
+      else if (sub.startsWith("📖")) await actionExportNovel(rt, ctx, "");
+      else if (sub.startsWith("🎲")) await actionManualRoll(rt, ctx, "");
+      else if (sub.startsWith("🚪")) await actionExitRp(rt, ctx, true);
+      return;
+    }
     return;
-  }
-
-  const card = rt.getCard();
-  const title = `🎭 ${[card?.identity.name ?? state.cardSlug ?? "RP", state.location || state.era, `T${state.turn}`].filter(Boolean).join(" · ")}`;
-  const pick = await ctx.ui.select(title, [
-    "📊 打开世界面板（动态一览 / 场景 / 人物 / 记忆 / 世界书 / 导演）",
-    "⚡ 快捷回复  /  ✍️ 代写回复  /  💡 行动建议",
-    "🔄 重摇回复  /  ✂️ 局部改写  /  ▶ 无缝续写",
-    "💭 场外提问（全知零污染）  /  💬 对话内 OOC（用完自动隐身）",
-    "⏳ 幕间推演  /  🔦 镜头聚焦  /  🎞 幕后插叙  /  🔖 书签",
-    "🎭 换卡 / 换开场白 / 📥 导入新卡 / ✨ AI 深度建档",
-    "⚙ 快捷设置（切换 HUD / 预设 / 结算模式 / 掷骰 / 导出小说 / 退出）",
-    "✕ 关闭",
-  ]);
-  if (!pick || pick.startsWith("✕")) return;
-
-  if (pick.startsWith("📊")) {
-    await openRpDashboard(makeDashboardRuntime(rt), ctx);
-  } else if (pick.startsWith("⚡")) {
-    const sub = await ctx.ui.select("快捷回复与行动辅助", [
-      "⚡ 快捷回复与常用动作宏 (Alt+E)",
-      "✍️ 帮我代写主角回复并填入输入框 (Alt+I)",
-      "💡 生成 3 个行动建议 (Alt+A)",
-      "← 返回",
-    ]);
-    if (sub?.startsWith("⚡")) await actionQuickReplies(rt, ctx, "");
-    else if (sub?.startsWith("✍️")) await actionImpersonate(rt, ctx, "");
-    else if (sub?.startsWith("💡")) await actionIdeas(rt, ctx);
-  } else if (pick.startsWith("🔄")) {
-    const sub = await ctx.ui.select("重摇、改写与续写", [
-      "🔄 重摇上一条回复（支持定向微调 · Alt+W）",
-      "✂️ 局部定向改写上一条回复 (Alt+U)",
-      "▶ 让角色无缝续写剧情 (Alt+K)",
-      "← 返回",
-    ]);
-    if (sub?.startsWith("🔄")) await actionReroll(rt, ctx, "");
-    else if (sub?.startsWith("✂️")) await actionRewriteLast(rt, ctx, "");
-    else if (sub?.startsWith("▶")) await actionContinue(rt, ctx);
-  } else if (pick.startsWith("💭")) {
-    const sub = await ctx.ui.select("场外提问与 OOC", [
-      "💭 全知零污染场外提问（不进历史，了解完整进度与面板 · Alt+Q）",
-      "💬 对话内 OOC（可查历史/按指令改状态，结束后自动隐身防污染）",
-      "← 返回",
-    ]);
-    if (sub?.startsWith("💭")) await actionSidePrompt(rt, ctx, "");
-    else if (sub?.startsWith("💬")) await actionOoc(rt, ctx, "");
-  } else if (pick.startsWith("⏳")) {
-    const sub = await ctx.ui.select("场景推演、镜头与书签", [
-      "⏳ 幕间世界推演 / 切场景 (Alt+T)",
-      "🔦 群像镜头切换：指定下一轮主导 NPC",
-      "🎞 零污染幕后插叙 / 小剧场（不影响主线）",
-      "🔖 保存当前节点为书签 (Alt+B)",
-      "⏪ 跳转 / 分叉至已有书签 (Alt+J)",
-      "← 返回",
-    ]);
-    if (sub?.startsWith("⏳")) await actionSkipMontage(rt, ctx, "");
-    else if (sub?.startsWith("🔦")) await actionSpotlight(rt, ctx, "");
-    else if (sub?.startsWith("🎞")) await actionInterlude(rt, ctx, "");
-    else if (sub?.startsWith("🔖")) await actionBookmarkSave(rt, ctx, "");
-    else if (sub?.startsWith("⏪")) await actionBookmarkGoto(rt, ctx, "");
-  } else if (pick.startsWith("🎭")) {
-    const sub = await ctx.ui.select("角色卡、开场白与导入", [
-      "✨ 一键 AI 深度建档（提取初态 / 人物关系 / 口癖锚点 / 门禁）",
-      "💬 重发 / 切换开场白",
-      "🎭 切换其他主角色卡",
-      "📥 导入新的角色卡 / 世界书 / 预设",
-      "← 返回",
-    ]);
-    if (sub?.startsWith("✨")) await actionAnalyzeCard(rt, ctx);
-    else if (sub?.startsWith("💬")) await actionGreeting(rt, ctx);
-    else if (sub?.startsWith("🎭")) await actionLoadCard(rt, ctx, "");
-    else if (sub?.startsWith("📥")) await actionImportFile(rt, ctx, "");
-  } else if (pick.startsWith("⚙")) {
-    const sub = await ctx.ui.select("快捷设置与工具", [
-      `🖥 切换 HUD 显示（当前：${state.hudMode} · Alt+H）`,
-      `🎛 切换酒馆预设（当前：${state.presetId ?? "无"}）`,
-      `⚙️ 切换结算模式（当前：${state.settlementMode}）`,
-      `🛡 原味直通模式（当前：${state.rawPassthrough ? "开" : "关"}）`,
-      "📖 导出纯净 Markdown 小说（至当前项目 rp-exports/）",
-      "🎲 快捷掷骰检定",
-      "⌨️ 查看全部 18 项快捷键",
-      "🚪 彻底退出本会话 RP 模式 (Alt+Shift+X)",
-      "← 返回",
-    ]);
-    if (sub?.startsWith("🖥")) await actionSetHud(rt, ctx, "");
-    else if (sub?.startsWith("🎛")) await actionPreset(rt, ctx, "");
-    else if (sub?.startsWith("⚙️")) await actionSetSettlementMode(rt, ctx, "");
-    else if (sub?.startsWith("🛡")) await actionToggleRawPassthrough(rt, ctx, "");
-    else if (sub?.startsWith("📖")) await actionExportNovel(rt, ctx, "");
-    else if (sub?.startsWith("🎲")) await actionManualRoll(rt, ctx, "");
-    else if (sub?.startsWith("⌨️")) await actionShowShortcuts(ctx);
-    else if (sub?.startsWith("🚪")) await actionExitRp(rt, ctx, true);
   }
 }
 
 export function registerRpCommands(pi: PiExtensionAPI, rt: RpRuntimeHandle): void {
   pi.registerCommand("rp", {
-    description: "角色扮演引擎控制台（仅当前会话生效，输入 /rp 或按 Alt+R 打开菜单）",
+    description: "角色扮演引擎控制台（仅当前会话生效，输入 /rp 打开菜单）",
     getArgumentCompletions(prefix: string) {
       const lower = prefix.trimStart().toLowerCase();
       if (!lower.includes(" ")) {
@@ -258,7 +289,7 @@ export function registerRpCommands(pi: PiExtensionAPI, rt: RpRuntimeHandle): voi
       const [sub, ...restParts] = lower.split(/\s+/);
       const rest = restParts.join(" ");
       if (sub === "load") {
-        const cards = listAllCardSummaries(process.cwd());
+        const cards = getCachedCardSummaries(process.cwd());
         return cards
           .filter((c) => c.slug.toLowerCase().includes(rest) || c.name.toLowerCase().includes(rest))
           .map((c) => ({ value: `load ${c.slug}`, label: c.name, description: `${c.source} · ${c.specOrigin}` }));
@@ -318,11 +349,11 @@ export function registerRpCommands(pi: PiExtensionAPI, rt: RpRuntimeHandle): voi
           return;
         case "books":
         case "memory":
-          await openRpDashboard(makeDashboardRuntime(rt), ctx, 2);
+          await openRpDashboard(makeDashboardRuntime(rt), ctx, 3);
           return;
         case "storylets":
         case "scene":
-          await openRpDashboard(makeDashboardRuntime(rt), ctx, 0);
+          await openRpDashboard(makeDashboardRuntime(rt), ctx, 1);
           return;
         case "qr":
         case "quick":

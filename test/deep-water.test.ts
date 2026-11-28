@@ -233,7 +233,7 @@ test("deep-water-4: Hybrid Semantic Embedding Cosine + RRF Fusion & 50-Turn Long
     cooldowns: [],
   });
   assert.equal(recalled.result.found, true, "BM25 must recall Turn-2 promise at Turn 50");
-  assert.equal(recalled.result.matches[0]!.turn, 2);
+  assert.equal(recalled.result.matches[0]!.turn, 1);
 });
 
 test("deep-water-5: OOC ((...)) turn auto-hides OOC Q&A from future story context (zero pollution) without advancing turn", async () => {

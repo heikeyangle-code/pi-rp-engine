@@ -22,6 +22,7 @@ import type {
   ContextXRaySnapshot,
   MemoryBookEntry,
   PacingMode,
+  PhysicalSnapshot,
   PiExtensionContext,
   RpTxEntry,
   SessionRpState,
@@ -32,7 +33,7 @@ import { evaluateGate, partitionEpistemicFacts } from "../engine/gates.js";
 import { evaluateActiveStorylets } from "../context/zone-builder.js";
 import { compileLoreBook } from "../parser/lore-compiler.js";
 import { saveUpdatedCard } from "../storage/workspace-store.js";
-import { renderProgressBar, renderSmartStatBar } from "./renderers.js";
+import { renderProgressBar } from "./renderers.js";
 import { RP_SHORTCUT_LIST } from "./shortcuts.js";
 import { loadUiPrefs, saveUiPrefs } from "./file-picker.js";
 import { openTuiOverlayDashboard, type OverlayTabIndex } from "./tui-overlay.js";
@@ -74,16 +75,83 @@ function getAllLore(rt: DashboardRuntime): CompiledLoreEntry[] {
   return [...card.loreBook.entries, ...rt.getExtraCastCards().flatMap((c) => c.loreBook.entries)];
 }
 
-/** Clean native bottom-sheet header on RPC/mobile (no terminal `╭─` box-drawing noise). */
-function sheetHeader(_ctx: PiExtensionContext, title: string): string {
-  return title;
-}
-
 async function editLongText(ctx: PiExtensionContext, title: string, initial: string): Promise<string | undefined> {
   if (typeof ctx.ui.editor === "function") {
     return ctx.ui.editor(title, initial);
   }
   return ctx.ui.input(title, initial);
+}
+
+function persistCardSafely(worldDir: string | null, card: CompiledCard, ctx: PiExtensionContext): boolean {
+  if (!worldDir) {
+    ctx.ui.notify("当前角色卡缺少持久化目录，修改仅在本次会话内存中生效。", "warning");
+    return false;
+  }
+  try {
+    saveUpdatedCard(worldDir, card);
+    return true;
+  } catch (err) {
+    ctx.ui.notify(`保存角色卡失败：${(err as Error).message}`, "error");
+    return false;
+  }
+}
+
+function persistUiPrefsSafely(patch: Parameters<typeof saveUiPrefs>[0], ctx: PiExtensionContext): boolean {
+  try {
+    saveUiPrefs(patch);
+    return true;
+  } catch (err) {
+    ctx.ui.notify(`保存界面偏好失败：${(err as Error).message}`, "error");
+    return false;
+  }
+}
+
+async function editPhysicalSnapshot(
+  rt: DashboardRuntime,
+  ctx: PiExtensionContext,
+  actorId: string,
+  cur: PhysicalSnapshot | undefined,
+  turn: number,
+): Promise<void> {
+  const attireRaw = await ctx.ui.input(`${actorId} 当前着装/外貌（可选）`, cur?.attire ?? "");
+  if (attireRaw === undefined) return;
+  const conditionRaw = await ctx.ui.input(`${actorId} 身体状态/伤势（可选）`, cur?.condition ?? "");
+  if (conditionRaw === undefined) return;
+  const holdingRaw = await ctx.ui.input(`${actorId} 当前手持物（可选）`, cur?.holding ?? "");
+  if (holdingRaw === undefined) return;
+  const positionRaw = await ctx.ui.input(`${actorId} 当前空间站位（可选）`, cur?.position ?? "");
+  if (positionRaw === undefined) return;
+
+  const snapshot: PhysicalSnapshot = { actorId, updatedTurn: turn };
+  let changed = false;
+  const nextAttire = attireRaw.trim();
+  if (nextAttire !== (cur?.attire ?? "")) {
+    snapshot.attire = nextAttire;
+    changed = true;
+  }
+  const nextCondition = conditionRaw.trim();
+  if (nextCondition !== (cur?.condition ?? "")) {
+    snapshot.condition = nextCondition;
+    changed = true;
+  }
+  const nextHolding = holdingRaw.trim();
+  if (nextHolding !== (cur?.holding ?? "")) {
+    snapshot.holding = nextHolding;
+    changed = true;
+  }
+  const nextPosition = positionRaw.trim();
+  if (nextPosition !== (cur?.position ?? "")) {
+    snapshot.position = nextPosition;
+    changed = true;
+  }
+
+  if (!changed) {
+    ctx.ui.notify(`「${actorId}」外貌与站位未作修改。`, "info");
+    return;
+  }
+
+  rt.commitTx({ kind: "physical_patch", snapshot, reason: "panel" });
+  ctx.ui.notify(`已更新「${actorId}」外貌与站位。`, "info");
 }
 
 // ---------------------------------------------------------------------------
@@ -116,17 +184,23 @@ async function openStoryletsManager(rt: DashboardRuntime, ctx: PiExtensionContex
       }),
       "← 返回",
     ];
-    const pick = await ctx.ui.select(`🃏 动态剧情卡 Storylets（共 ${list.length} 张，条件满足时自动注入导演台）`, opts);
+    const pick = await ctx.ui.select(`🃏 动态剧情卡（共 ${list.length} 张）`, opts);
     if (!pick || pick.startsWith("←")) return;
 
     if (pick.startsWith("+")) {
       const title = (await ctx.ui.input("剧情卡标题（如：雨夜敲门声）", ""))?.trim();
       if (!title) continue;
-      const triggerPrompt = (await editLongText(ctx, "触发时注入给 AI 的剧情引导内容", ""))?.trim();
+      const triggerPrompt = (await editLongText(ctx, "触发时的剧情引导内容", ""))?.trim();
       if (!triggerPrompt) continue;
-      const minTurnStr = (await ctx.ui.input("最早触发回合 minTurn（可选，留空不限）", ""))?.trim();
-      const locStr = (await ctx.ui.input("限定地点（逗号分隔，可选，留空不限）", ""))?.trim();
-      const flagStr = (await ctx.ui.input("需要已开启的 Flag（逗号分隔，可选，留空不限）", ""))?.trim();
+      const minTurnRaw = await ctx.ui.input("最早触发回合（可选，留空不限）", "");
+      if (minTurnRaw === undefined) continue;
+      const locRaw = await ctx.ui.input("限定地点（逗号分隔，可选，留空不限）", "");
+      if (locRaw === undefined) continue;
+      const flagRaw = await ctx.ui.input("需要已开启的状态标记（逗号分隔，可选）", "");
+      if (flagRaw === undefined) continue;
+      const minTurnStr = minTurnRaw.trim();
+      const locStr = locRaw.trim();
+      const flagStr = flagRaw.trim();
       const gate: StoryletEntry["gate"] = {};
       if (minTurnStr && /^\d+$/.test(minTurnStr)) gate.minTurn = Number(minTurnStr);
       if (locStr) gate.requiredLocations = locStr.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
@@ -229,7 +303,9 @@ async function openClocksManager(rt: DashboardRuntime, ctx: PiExtensionContext):
     if (sub.startsWith("+")) {
       const label = (await ctx.ui.input("时钟名称（如：警觉度、任务倒计时）", ""))?.trim();
       if (!label) continue;
-      const max = Math.max(1, Number((await ctx.ui.input("总格数（如 4 / 6 / 8）", "4"))?.trim()) || 4);
+      const maxRaw = await ctx.ui.input("总格数（如 4 / 6 / 8）", "4");
+      if (maxRaw === undefined) continue;
+      const max = Math.max(1, Number(maxRaw.trim()) || 4);
       const clockId = label.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_").slice(0, 24) || `clk_${Date.now()}`;
       rt.commitTx({ kind: "progress_clock", clockId, label, delta: 0, max });
       rt.refreshHud(ctx);
@@ -279,8 +355,12 @@ async function openBeliefsManager(rt: DashboardRuntime, ctx: PiExtensionContext,
       if (!activatingEvent) continue;
       const belief = (await ctx.ui.input("形成了什么看法/信念", ""))?.trim();
       if (!belief) continue;
-      const subjectiveInsight = (await ctx.ui.input("内心潜台词（可选）", ""))?.trim() || undefined;
-      const emotionalTone = (await ctx.ui.input("情绪基调（可选）", ""))?.trim() || undefined;
+      const insightRaw = await ctx.ui.input("内心潜台词（可选）", "");
+      if (insightRaw === undefined) continue;
+      const toneRaw = await ctx.ui.input("情绪基调（可选）", "");
+      if (toneRaw === undefined) continue;
+      const subjectiveInsight = insightRaw.trim() || undefined;
+      const emotionalTone = toneRaw.trim() || undefined;
       rt.commitTx({
         kind: "belief_update",
         actorId,
@@ -361,8 +441,9 @@ async function openActorProfile(rt: DashboardRuntime, ctx: PiExtensionContext, a
       if (sub.startsWith("+")) {
         const axis = (await ctx.ui.input("维度名称（如：信任、警觉、好感）", "信任"))?.trim();
         if (!axis) continue;
-        const statesStr = (await ctx.ui.input("阶段顺序（逗号分隔）", "戒备, 试探, 信任, 亲近"))?.trim();
-        const statesList = (statesStr ?? "").split(/[,，→]/).map((x) => x.trim()).filter(Boolean);
+        const statesRaw = await ctx.ui.input("阶段顺序（逗号分隔）", "戒备, 试探, 信任, 亲近");
+        if (statesRaw === undefined) continue;
+        const statesList = statesRaw.split(/[,，→]/).map((x) => x.trim()).filter(Boolean);
         if (statesList.length >= 2) {
           rt.commitTx({ kind: "cfsm_define", actorId: actor, def: { axis, states: statesList, initial: statesList[0]! } });
           rt.refreshHud(ctx);
@@ -403,17 +484,16 @@ async function openActorProfile(rt: DashboardRuntime, ctx: PiExtensionContext, a
       }
       rt.refreshHud(ctx);
     } else if (pick.startsWith("🧥")) {
-      const attire = (await ctx.ui.input(`${actor} 当前着装/外貌（可选）`, phys?.attire ?? ""))?.trim() || undefined;
-      const condition = (await ctx.ui.input(`${actor} 身体状态/伤势（可选）`, phys?.condition ?? ""))?.trim() || undefined;
-      const holding = (await ctx.ui.input(`${actor} 当前手持物（可选）`, phys?.holding ?? ""))?.trim() || undefined;
-      const position = (await ctx.ui.input(`${actor} 当前空间站位（可选）`, phys?.position ?? ""))?.trim() || undefined;
-      rt.commitTx({ kind: "physical_patch", snapshot: { actorId: actor, attire, condition, holding, position, updatedTurn: s.turn }, reason: "panel" });
-      ctx.ui.notify(`已更新「${actor}」当前外貌与站位。`, "info");
+      await editPhysicalSnapshot(rt, ctx, actor, phys, s.turn);
     } else if (pick.startsWith("🎙")) {
-      const backbone = (await ctx.ui.input(`${actor} 核心立场与防迎合底线`, anchor?.backbone ?? ""))?.trim();
-      if (!backbone) continue;
-      const samplesRaw = (await ctx.ui.input("典型说话原话（用 | 分隔 2-3 句，可选）", anchor?.speechSamples.join(" | ") ?? "")) ?? "";
-      const taboo = (await ctx.ui.input("绝对禁止的 OOC 行为（可选）", anchor?.tabooBehaviors ?? ""))?.trim() || undefined;
+      const backboneRaw = await ctx.ui.input(`${actor} 核心立场与防迎合底线`, anchor?.backbone ?? "");
+      if (backboneRaw === undefined || !backboneRaw.trim()) continue;
+      const samplesRaw = await ctx.ui.input("典型说话原话（用 | 分隔 2-3 句，可选）", anchor?.speechSamples.join(" | ") ?? "");
+      if (samplesRaw === undefined) continue;
+      const tabooRaw = await ctx.ui.input("绝对禁止的 OOC 行为（可选）", anchor?.tabooBehaviors ?? "");
+      if (tabooRaw === undefined) continue;
+      const backbone = backboneRaw.trim();
+      const taboo = tabooRaw.trim() || undefined;
       rt.commitTx({
         kind: "voice_anchor_upsert",
         anchor: { actorId: actor, backbone, speechSamples: samplesRaw.split("|").map((x) => x.trim()).filter(Boolean).slice(0, 3), tabooBehaviors: taboo },
@@ -424,13 +504,22 @@ async function openActorProfile(rt: DashboardRuntime, ctx: PiExtensionContext, a
     } else if (pick.startsWith("🎒")) {
       await openInventoryManager(rt, ctx);
     } else if (pick.startsWith("🕰")) {
-      const goal = (await ctx.ui.input(`${actor} 的目的（留空删除日程）`, agenda?.goal ?? ""))?.trim();
+      const goalRaw = await ctx.ui.input(`${actor} 的目的（清空确认则删除日程）`, agenda?.goal ?? "");
+      if (goalRaw === undefined) continue;
+      const goal = goalRaw.trim();
       if (!goal) {
-        if (agenda) rt.commitTx({ kind: "agenda_delete", actorId: actor });
+        if (agenda) {
+          rt.commitTx({ kind: "agenda_delete", actorId: actor });
+          ctx.ui.notify(`已移除「${actor}」后台日程。`, "info");
+        }
         continue;
       }
-      const currentActivity = (await ctx.ui.input("此刻幕后正在做什么", agenda?.currentActivity ?? goal))?.trim() || goal;
-      const etaStr = (await ctx.ui.input("预计几轮后抵达/触发（留空不倒计时）", agenda?.etaTurns != null ? String(agenda.etaTurns) : ""))?.trim();
+      const activityRaw = await ctx.ui.input("此刻幕后正在做什么", agenda?.currentActivity ?? goal);
+      if (activityRaw === undefined) continue;
+      const currentActivity = activityRaw.trim() || goal;
+      const etaRaw = await ctx.ui.input("预计几轮后抵达/触发（留空不倒计时）", agenda?.etaTurns != null ? String(agenda.etaTurns) : "");
+      if (etaRaw === undefined) continue;
+      const etaStr = etaRaw.trim();
       const etaTurns = etaStr && /^\d+$/.test(etaStr) ? Number(etaStr) : null;
       rt.commitTx({ kind: "agenda_upsert", agenda: { actorId: actor, goal, currentActivity, etaTurns, updatedTurn: s.turn } });
       ctx.ui.notify(`已更新「${actor}」后台日程。`, "info");
@@ -454,11 +543,11 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
         })()
       : null;
 
-    const pick = await ctx.ui.select(sheetHeader(ctx, "📍 当前场景、目标与剧情卡"), [
-      `📍 修改地点与在场人物（当前：${s.location || "未设定"}${s.presentNpcs.length ? ` · ${s.presentNpcs.join("、")}` : ""}）`,
-      `🕒 修改时间标签（当前：${s.worldTimeLabel || "未设定"}）`,
-      `🎯 设定当前场景目标（当前：${s.sceneObjective || "未设定"}）`,
-      `🃏 管理动态剧情卡 Storylets（共 ${s.storylets.size} 张 · 已触发 ${activeSt} 张）`,
+    const pick = await ctx.ui.select("📍 场景与世界", [
+      `📍 地点与在场人物（${s.location || "未设定"}${s.presentNpcs.length ? ` · ${s.presentNpcs.join("、")}` : ""}）`,
+      `🕒 时间标签（${s.worldTimeLabel || "未设定"}）`,
+      `🎯 场景目标（${s.sceneObjective || "未设定"}）`,
+      `🃏 动态剧情卡（${s.storylets.size} 张 · 已触发 ${activeSt}）`,
       `🚩 世界状态 Flags（${Object.entries(s.flags).filter(([, v]) => Boolean(v)).map(([k]) => k).slice(0, 4).join("、") || "暂无"}）`,
       ...(s.modules.clocks || clocks.length > 0
         ? [
@@ -466,9 +555,9 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
           ]
         : []),
       ...(healthRow ? [healthRow] : []),
-      "⏳ 幕间世界推演 / 切场景（推演时钟与暗流 · Alt+T）",
-      "🔦 群像镜头切换：指定下一轮主导 NPC (/rp spotlight)",
-      "🎞 零污染幕后插叙 / 小剧场 (/rp interlude)",
+      "⏳ 幕间世界推演 / 切场景",
+      "🔦 群像镜头切换（指定下一轮主导 NPC）",
+      "🎞 幕后插叙 / 小剧场",
       "← 返回主面板",
     ]);
     if (!pick || pick.startsWith("←")) return;
@@ -477,7 +566,8 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
       const loc = await ctx.ui.input("当前地点", s.location || "");
       if (loc === undefined) continue;
       const npcsStr = await ctx.ui.input("在场人物（逗号分隔，留空表示无人）", s.presentNpcs.join(", "));
-      const npcs = (npcsStr ?? "")
+      if (npcsStr === undefined) continue;
+      const npcs = npcsStr
         .split(/[,，]/)
         .map((x) => x.trim())
         .filter(Boolean);
@@ -540,7 +630,9 @@ export async function openInventoryManager(rt: DashboardRuntime, ctx: PiExtensio
       if (!actor) continue;
       const item = (await ctx.ui.input("物品名称", ""))?.trim();
       if (!item) continue;
-      const delta = Number((await ctx.ui.input("数量变动（正数添加，负数扣除）", "1"))?.trim());
+      const deltaRaw = await ctx.ui.input("数量变动（正数添加，负数扣除）", "1");
+      if (deltaRaw === undefined) continue;
+      const delta = Number(deltaRaw.trim());
       if (!Number.isFinite(delta) || delta === 0) continue;
       rt.commitTx({ kind: "inventory_patch", actorId: actor, item, delta, note: "panel" });
       rt.refreshHud(ctx);
@@ -561,7 +653,9 @@ export async function openInventoryManager(rt: DashboardRuntime, ctx: PiExtensio
       else if (op.startsWith("-1")) delta = -1;
       else if (op.startsWith("🗑")) delta = -match.qty;
       else {
-        const d = Number((await ctx.ui.input("数量变动", "1"))?.trim());
+        const dRaw = await ctx.ui.input("数量变动", "1");
+        if (dRaw === undefined) continue;
+        const d = Number(dRaw.trim());
         if (Number.isFinite(d)) delta = d;
       }
       if (delta !== 0) {
@@ -591,7 +685,7 @@ export async function openSecretsInspector(rt: DashboardRuntime, ctx: PiExtensio
       "← 返回",
     ];
     const pick = await ctx.ui.select(
-      `🔒 FANToM 秘密与认知盲区（秘密 ${secrets.length} 条 · 当前场内生效盲区 ${blindSpots.length} 处）`,
+      `🔒 秘密与认知盲区（秘密 ${secrets.length} · 场内盲区 ${blindSpots.length}）`,
       opts,
     );
     if (!pick || pick.startsWith("←")) return;
@@ -599,7 +693,8 @@ export async function openSecretsInspector(rt: DashboardRuntime, ctx: PiExtensio
     if (pick.startsWith("+")) {
       const statement = (await editLongText(ctx, "输入秘密内容（仅指定角色知情，其他角色不可穿帮）", ""))?.trim();
       if (!statement) continue;
-      const wStr = (await ctx.ui.input("谁知道这个秘密？（逗号分隔）", rt.getCard()?.identity.name ?? s.currentPersona.name)) ?? "";
+      const wStr = await ctx.ui.input("谁知道这个秘密？（逗号分隔）", rt.getCard()?.identity.name ?? s.currentPersona.name);
+      if (wStr === undefined) continue;
       const witnesses = wStr.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
       rt.commitTx({
         kind: "fact_add",
@@ -635,7 +730,8 @@ export async function openSecretsInspector(rt: DashboardRuntime, ctx: PiExtensio
       ctx.ui.notify("该秘密已公开！", "info");
     } else if (act.startsWith("👁")) {
       const cur = Array.isArray(fact.witnessIds) ? fact.witnessIds.join(", ") : "";
-      const w = (await ctx.ui.input("知情角色（逗号分隔）", cur)) ?? "";
+      const w = await ctx.ui.input("知情角色（逗号分隔）", cur);
+      if (w === undefined) continue;
       const list = w.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
       if (list.length > 0) rt.commitTx({ kind: "fact_update", factId: fact.id, witnessIds: list });
     } else if (act.startsWith("🗑")) {
@@ -654,17 +750,21 @@ async function openVoiceAnchorsManager(rt: DashboardRuntime, ctx: PiExtensionCon
       ...list.map((a) => `🎙 ${a.actorId} — ${a.backbone.slice(0, 38)} (${a.speechSamples.length} 句样本)`),
       "← 返回",
     ];
-    const pick = await ctx.ui.select(`🎙 角色口癖与防漂移底线锚点（共 ${list.length} 角色 · 近端注入不破缓存）`, opts);
+    const pick = await ctx.ui.select(`🎙 角色口癖与底线锚点（共 ${list.length} 角色）`, opts);
     if (!pick || pick.startsWith("←")) return;
 
     if (pick.startsWith("+")) {
       const actorId = (await ctx.ui.input("角色名称", rt.getCard()?.identity.name ?? ""))?.trim();
       if (!actorId) continue;
       const cur = s.voiceAnchors[actorId];
-      const backbone = (await ctx.ui.input("核心立场与防迎合底线（如：极度防备外人，绝不无端软化）", cur?.backbone ?? ""))?.trim();
-      if (!backbone) continue;
-      const samplesRaw = (await ctx.ui.input("典型说话原话样本（用 | 分隔 2-3 句，可选）", cur?.speechSamples.join(" | ") ?? "")) ?? "";
-      const taboo = (await ctx.ui.input("绝对禁止的 OOC 行为（可选）", cur?.tabooBehaviors ?? ""))?.trim() || undefined;
+      const backboneRaw = await ctx.ui.input("核心立场与防迎合底线（如：极度防备外人，绝不无端软化）", cur?.backbone ?? "");
+      if (backboneRaw === undefined || !backboneRaw.trim()) continue;
+      const samplesRaw = await ctx.ui.input("典型说话原话样本（用 | 分隔 2-3 句，可选）", cur?.speechSamples.join(" | ") ?? "");
+      if (samplesRaw === undefined) continue;
+      const tabooRaw = await ctx.ui.input("绝对禁止的 OOC 行为（可选）", cur?.tabooBehaviors ?? "");
+      if (tabooRaw === undefined) continue;
+      const backbone = backboneRaw.trim();
+      const taboo = tabooRaw.trim() || undefined;
       rt.commitTx({
         kind: "voice_anchor_upsert",
         anchor: {
@@ -686,9 +786,14 @@ async function openVoiceAnchorsManager(rt: DashboardRuntime, ctx: PiExtensionCon
       "← 返回",
     ]);
     if (act?.startsWith("✏️")) {
-      const backbone = (await ctx.ui.input("核心立场与防迎合底线", chosen.backbone))?.trim() || chosen.backbone;
-      const samplesRaw = (await ctx.ui.input("典型原话样本（用 | 分隔）", chosen.speechSamples.join(" | "))) ?? "";
-      const taboo = (await ctx.ui.input("禁止的 OOC 行为（可选）", chosen.tabooBehaviors ?? ""))?.trim() || undefined;
+      const backboneRaw = await ctx.ui.input("核心立场与防迎合底线", chosen.backbone);
+      if (backboneRaw === undefined) continue;
+      const samplesRaw = await ctx.ui.input("典型原话样本（用 | 分隔）", chosen.speechSamples.join(" | "));
+      if (samplesRaw === undefined) continue;
+      const tabooRaw = await ctx.ui.input("禁止的 OOC 行为（可选）", chosen.tabooBehaviors ?? "");
+      if (tabooRaw === undefined) continue;
+      const backbone = backboneRaw.trim() || chosen.backbone;
+      const taboo = tabooRaw.trim() || undefined;
       rt.commitTx({
         kind: "voice_anchor_upsert",
         anchor: {
@@ -742,16 +847,7 @@ async function openPhysicalSceneManager(rt: DashboardRuntime, ctx: PiExtensionCo
       actorId = chosen.actorId;
     }
     const cur = s.physicalState[actorId];
-    const attire = (await ctx.ui.input(`${actorId} 当前着装/外貌（可选）`, cur?.attire ?? ""))?.trim() || undefined;
-    const condition = (await ctx.ui.input(`${actorId} 身体状态/伤势（可选）`, cur?.condition ?? ""))?.trim() || undefined;
-    const holding = (await ctx.ui.input(`${actorId} 当前手持物（可选）`, cur?.holding ?? ""))?.trim() || undefined;
-    const position = (await ctx.ui.input(`${actorId} 当前空间站位（可选）`, cur?.position ?? ""))?.trim() || undefined;
-    rt.commitTx({
-      kind: "physical_patch",
-      snapshot: { actorId, attire, condition, holding, position, updatedTurn: s.turn },
-      reason: "panel",
-    });
-    ctx.ui.notify(`已更新「${actorId}」物理状态快照。`, "info");
+    await editPhysicalSnapshot(rt, ctx, actorId, cur, s.turn);
   }
 }
 
@@ -775,19 +871,28 @@ async function openLivingWorldManager(rt: DashboardRuntime, ctx: PiExtensionCont
       if (!actorId) continue;
       const goal = (await ctx.ui.input("TA 的长期或短期目的", ""))?.trim();
       if (!goal) continue;
-      const currentActivity = (await ctx.ui.input("此刻幕后正在做什么", goal))?.trim() || goal;
-      const etaStr = (await ctx.ui.input("预计几轮后抵达/产生波纹（留空不倒计时）", ""))?.trim();
+      const activityRaw = await ctx.ui.input("此刻幕后正在做什么", goal);
+      if (activityRaw === undefined) continue;
+      const currentActivity = activityRaw.trim() || goal;
+      const etaRaw = await ctx.ui.input("预计几轮后抵达/产生波纹（留空不倒计时）", "");
+      if (etaRaw === undefined) continue;
+      const etaStr = etaRaw.trim();
       const etaTurns = etaStr && /^\d+$/.test(etaStr) ? Number(etaStr) : null;
       rt.commitTx({ kind: "agenda_upsert", agenda: { actorId, goal, currentActivity, etaTurns, updatedTurn: s.turn } });
       ctx.ui.notify(`已设置「${actorId}」后台日程。`, "info");
     } else if (pick.startsWith("+ 新增 NPC")) {
       const actorA = (await ctx.ui.input("角色 A 名称", ""))?.trim();
+      if (!actorA) continue;
       const actorB = (await ctx.ui.input("角色 B 名称", ""))?.trim();
-      if (!actorA || !actorB || actorA === actorB) continue;
+      if (!actorB || actorA === actorB) continue;
       const stance = (await ctx.ui.input("彼此关系立场（如：暗中猜忌 / 生死同盟 / 宿敌）", ""))?.trim();
       if (!stance) continue;
-      const tension = Number((await ctx.ui.input("关系张力 (-100 敌对 ~ +100 亲密)", "0"))?.trim()) || 0;
-      const note = (await ctx.ui.input("原因或流言备注（可选）", ""))?.trim() ?? "";
+      const tensionRaw = await ctx.ui.input("关系张力 (-100 敌对 ~ +100 亲密)", "0");
+      if (tensionRaw === undefined) continue;
+      const tension = Number(tensionRaw.trim()) || 0;
+      const noteRaw = await ctx.ui.input("原因或流言备注（可选）", "");
+      if (noteRaw === undefined) continue;
+      const note = noteRaw.trim();
       const [a, b] = [actorA, actorB].sort();
       rt.commitTx({
         kind: "pair_bond_upsert",
@@ -823,17 +928,21 @@ async function openEmbeddingConfigManager(ctx: PiExtensionContext): Promise<void
   );
   if (!pick || pick.startsWith("←")) return;
   if (pick.startsWith("○")) {
-    saveUiPrefs({ embeddingConfig: { ...cur, enabled: false } });
-    ctx.ui.notify("已关闭语义向量召回，当前使用纯零依赖 BM25。", "info");
+    if (persistUiPrefsSafely({ embeddingConfig: { ...cur, enabled: false } }, ctx)) {
+      ctx.ui.notify("已关闭语义向量召回。", "info");
+    }
     return;
   }
   const endpoint = (await ctx.ui.input("Embedding 接口地址（支持 OpenAI / SiliconFlow / Ollama）", cur.endpoint))?.trim();
   if (!endpoint) return;
   const model = (await ctx.ui.input("Embedding 模型名（如 text-embedding-3-small / BAAI/bge-m3）", cur.model))?.trim();
   if (!model) return;
-  const apiKey = (await ctx.ui.input("API Key（本地 Ollama 可留空）", cur.apiKey ?? ""))?.trim() ?? "";
-  saveUiPrefs({ embeddingConfig: { enabled: true, endpoint, model, apiKey: apiKey || undefined } });
-  ctx.ui.notify(`✅ 已启用语义向量混合召回：${model}（BM25 + Cosine RRF）`, "info");
+  const apiKeyRaw = await ctx.ui.input("API Key（本地 Ollama 可留空）", cur.apiKey ?? "");
+  if (apiKeyRaw === undefined) return;
+  const apiKey = apiKeyRaw.trim();
+  if (persistUiPrefsSafely({ embeddingConfig: { enabled: true, endpoint, model, apiKey: apiKey || undefined } }, ctx)) {
+    ctx.ui.notify(`✅ 已启用语义向量混合召回：${model}`, "info");
+  }
 }
 
 export async function openCharactersSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
@@ -863,7 +972,7 @@ export async function openCharactersSection(rt: DashboardRuntime, ctx: PiExtensi
       return `👤 [${tag}] ${a} — ${summary}${ag}`;
     });
 
-    const pick = await ctx.ui.select(sheetHeader(ctx, "👥 人物与关系（点选角色一站式查看/修改）"), [
+    const pick = await ctx.ui.select("👥 人物与关系", [
       ...actorRows,
       `🕸 人物关系网（NPC↔NPC ${Object.keys(s.pairBonds).length} 条 · 后台日程 ${Object.keys(s.npcAgendas).length} 个）`,
       `🧑 切换玩家马甲（当前：${s.currentPersona.name}）`,
@@ -906,7 +1015,7 @@ async function openMemoryBookChapters(rt: DashboardRuntime, ctx: PiExtensionCont
       ),
       "← 返回",
     ];
-    const pick = await ctx.ui.select(`📚 记忆书章节 Memory Books（共 ${books.length} 章，按关键词/实体动态召回）`, opts);
+    const pick = await ctx.ui.select(`📚 记忆书章节（共 ${books.length} 章）`, opts);
     if (!pick || pick.startsWith("←")) return;
 
     if (pick.startsWith("+")) {
@@ -914,7 +1023,8 @@ async function openMemoryBookChapters(rt: DashboardRuntime, ctx: PiExtensionCont
       if (!title) continue;
       const summary = (await editLongText(ctx, `编写章节「${title}」摘要`, ""))?.trim();
       if (!summary) continue;
-      const kwStr = (await ctx.ui.input("触发关键词/人物实体（逗号分隔）", rt.getCard()?.identity.name ?? "")) ?? "";
+      const kwStr = await ctx.ui.input("触发关键词/人物实体（逗号分隔）", rt.getCard()?.identity.name ?? "");
+      if (kwStr === undefined) continue;
       const keywords = kwStr.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
       const entry: MemoryBookEntry = {
         id: `book_${Date.now().toString(36)}`,
@@ -935,14 +1045,6 @@ async function openMemoryBookChapters(rt: DashboardRuntime, ctx: PiExtensionCont
 
     if (pick.startsWith("📦")) {
       await rt.summarizeOldFloors(ctx);
-      continue;
-    }
-    if (pick.startsWith("🙈")) {
-      await rt.toggleHide?.(ctx);
-      continue;
-    }
-    if (pick.startsWith("📖")) {
-      await rt.exportNovel?.(ctx);
       continue;
     }
 
@@ -967,9 +1069,12 @@ async function openMemoryBookChapters(rt: DashboardRuntime, ctx: PiExtensionCont
         ctx.ui.notify("已保存记忆书修改。", "info");
       }
     } else if (act.startsWith("🏷")) {
-      const nextTitle = (await ctx.ui.input("章节标题", chosen.title))?.trim() || chosen.title;
-      const nextKw = (await ctx.ui.input("触发关键词（逗号分隔）", chosen.keywords.join(", "))) ?? "";
-      const kws = nextKw.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+      const nextTitleRaw = await ctx.ui.input("章节标题", chosen.title);
+      if (nextTitleRaw === undefined) continue;
+      const nextKwRaw = await ctx.ui.input("触发关键词（逗号分隔）", chosen.keywords.join(", "));
+      if (nextKwRaw === undefined) continue;
+      const nextTitle = nextTitleRaw.trim() || chosen.title;
+      const kws = nextKwRaw.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
       rt.commitTx({
         kind: "memory_book_upsert",
         entry: { ...chosen, title: nextTitle, keywords: kws, entities: Array.from(new Set([...chosen.entities, ...kws])) },
@@ -999,15 +1104,15 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     const secretCount = activeFacts.filter((f) => f.witnessIds !== "public").length;
     const { blindSpots } = partitionEpistemicFacts(activeFacts, s.presentNpcs);
     const options: string[] = [
-      `🗂 世界书完整管理（${getAllLore(rt).length} 条 · 搜索 / 编辑 / 新增 / AI生成 / 删除）`,
-      `📚 记忆书归档章节（${s.memoryBooks.size} 章 — 全文编辑/置顶/归档）`,
-      `🔒 秘密与认知盲区 FANToM（秘密 ${secretCount} 条 · 生效盲区 ${blindSpots.length} 处）`,
-      `◇ 人物信念与主观潜台词（${s.beliefs.length} 条${s.beliefs.length > 0 ? ` · 最新：${s.beliefs[s.beliefs.length - 1]!.actorId}→${s.beliefs[s.beliefs.length - 1]!.belief.slice(0, 18)}` : ""}）`,
-      "📜 查看前情提要（0 Token 瞬时合成）",
-      "📦 总结并隐藏较早的对话楼层 → 写入记忆书",
-      "🙈 隐藏或恢复对话楼层（支持一键恢复）",
-      "📖 导出纯净 Markdown 小说（至当前项目 rp-exports/）",
-      "+ 记录一条重要剧情/秘密（支持仅指定角色知情）",
+      `🗂 世界书管理（${getAllLore(rt).length} 条）`,
+      `📚 记忆书归档章节（${s.memoryBooks.size} 章）`,
+      `🔒 秘密与认知盲区（秘密 ${secretCount} · 盲区 ${blindSpots.length}）`,
+      `◇ 人物信念与潜台词（${s.beliefs.length} 条${s.beliefs.length > 0 ? ` · ${s.beliefs[s.beliefs.length - 1]!.actorId}→${s.beliefs[s.beliefs.length - 1]!.belief.slice(0, 16)}` : ""}）`,
+      "📜 查看前情提要",
+      "📦 总结并隐藏旧楼层 → 写入记忆书",
+      "🙈 隐藏或恢复对话楼层",
+      "📖 导出纯净 Markdown 小说",
+      "+ 记录一条重要剧情/秘密",
       "+ 记录一条未完约定 / 伏笔",
       ...activeFacts.slice(-14).reverse().map((f) => {
         const vis = f.witnessIds === "public" ? "" : ` [仅:${f.witnessIds.join(",")}]`;
@@ -1018,10 +1123,7 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     ];
 
     const pick = await ctx.ui.select(
-      sheetHeader(
-        ctx,
-        `📖 记忆书、事实与秘密（章节 ${s.memoryBooks.size} · 事实 ${activeFacts.length} · 盲区 ${blindSpots.length} · 伏笔 ${openHooks.length}）`,
-      ),
+      `📖 记忆、伏笔与世界书（事实 ${activeFacts.length} · 伏笔 ${openHooks.length}）`,
       options,
     );
     if (!pick || pick.startsWith("←")) return;
@@ -1050,18 +1152,29 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
       await rt.summarizeOldFloors(ctx);
       continue;
     }
+    if (pick.startsWith("🙈")) {
+      await rt.toggleHide?.(ctx);
+      continue;
+    }
+    if (pick.startsWith("📖")) {
+      await rt.exportNovel?.(ctx);
+      continue;
+    }
     if (pick.startsWith("+ 记录一条重要剧情")) {
       const statement = (await editLongText(ctx, "输入重要事件或秘密内容", ""))?.trim();
       if (!statement) continue;
-      const entitiesStr = (await ctx.ui.input("关联人物/地点（逗号分隔，可选）", "")) ?? "";
+      const entitiesStr = await ctx.ui.input("关联人物/地点（逗号分隔，可选）", "");
+      if (entitiesStr === undefined) continue;
       const entities = entitiesStr.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
       const visPick = await ctx.ui.select("谁知道这件事？", [
         "🌐 公开事件（大家都知道）",
         "🔒 私密事件（仅指定角色知情，防止其他角色穿帮）",
       ]);
+      if (!visPick) continue;
       let witnessIds: string[] | "public" = "public";
-      if (visPick?.startsWith("🔒")) {
-        const wStr = (await ctx.ui.input("知情角色名（逗号分隔）", s.currentPersona.name)) ?? "";
+      if (visPick.startsWith("🔒")) {
+        const wStr = await ctx.ui.input("知情角色名（逗号分隔）", s.currentPersona.name);
+        if (wStr === undefined) continue;
         const parsed = wStr.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
         witnessIds = parsed.length > 0 ? parsed : [s.currentPersona.name];
       }
@@ -1080,7 +1193,9 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     } else if (pick.startsWith("+ 记录一条未完约定")) {
       const summary = (await ctx.ui.input("约定或伏笔内容", ""))?.trim();
       if (!summary) continue;
-      const triggerHint = (await ctx.ui.input("何时提醒/相关线索（可选）", ""))?.trim() ?? "";
+      const triggerHintRaw = await ctx.ui.input("何时提醒/相关线索（可选）", "");
+      if (triggerHintRaw === undefined) continue;
+      const triggerHint = triggerHintRaw.trim();
       rt.commitTx({
         kind: "foresight_upsert",
         hook: {
@@ -1120,7 +1235,8 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
           ctx.ui.notify("已设为公开事实。", "info");
         } else if (vPick?.startsWith("🔒")) {
           const cur = Array.isArray(fact.witnessIds) ? fact.witnessIds.join(", ") : s.currentPersona.name;
-          const w = (await ctx.ui.input("知情角色名（逗号分隔）", cur)) ?? "";
+          const w = await ctx.ui.input("知情角色名（逗号分隔）", cur);
+          if (w === undefined) continue;
           const list = w.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
           if (list.length > 0) {
             rt.commitTx({ kind: "fact_update", factId: fact.id, witnessIds: list });
@@ -1197,7 +1313,7 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
 
     const navTop = [
       "+ 手动新建世界书条目",
-      "✨ 从最近剧情 AI 生成新世界书条目 (/rp loregen)",
+      "✨ 从最近剧情 AI 生成新条目",
       `🔍 搜索世界书${searchQuery ? `（当前：“${searchQuery}”）` : ""}`,
       `🗂 筛选：${filterLabel[filterMode]}（点击切换）`,
     ];
@@ -1217,10 +1333,7 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
     navBottom.push("← 返回主面板");
 
     const pick = await ctx.ui.select(
-      sheetHeader(
-        ctx,
-        `📚 世界书完整管理（匹配 ${filtered.length}/${allLore.length} 条 · 第 ${page + 1}/${totalPages} 页）`,
-      ),
+      `📚 世界书管理（${filtered.length}/${allLore.length} · ${page + 1}/${totalPages} 页）`,
       [...navTop, ...itemOptions, ...navBottom],
     );
     if (!pick || pick.startsWith("←")) return;
@@ -1229,11 +1342,12 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
       if (!primaryCard) continue;
       const title = (await ctx.ui.input("世界书条目标题", ""))?.trim();
       if (!title) continue;
-      const keysRaw = (await ctx.ui.input("触发词（逗号分隔）", title)) ?? "";
+      const keysRaw = await ctx.ui.input("触发词（逗号分隔）", title);
+      if (keysRaw === undefined) continue;
       const keys = keysRaw.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
       const content = (await editLongText(ctx, `编写「${title}」正文`, ""))?.trim();
       if (!content) continue;
-      const isConst = await ctx.ui.confirm("设为常驻设定？", "选择「确认」则每轮固定注入 Zone 1；选择「取消」则按关键词动态召回。");
+      const isConst = await ctx.ui.confirm("设为常驻设定？", "选择「确认」则每轮常驻生效；选择「取消」则按关键词动态召回。");
       const compiled = compileLoreBook({
         entries: [
           {
@@ -1249,8 +1363,9 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
       });
       if (compiled.entries[0]) {
         primaryCard.loreBook.entries.push(compiled.entries[0]);
-        if (s.worldDir) saveUpdatedCard(s.worldDir, primaryCard);
-        rt.reloadRuntime(ctx);
+        if (persistCardSafely(s.worldDir, primaryCard, ctx)) {
+          rt.reloadRuntime(ctx);
+        }
         ctx.ui.notify(`✅ 已新增世界书条目「${title}」`, "info");
       }
       continue;
@@ -1297,7 +1412,7 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
         ...(isPrimaryEntry
           ? [
               "🏷 编辑标题与触发词",
-              entry.constant ? "🔄 改为动态按词召回" : "📌 改为常驻设定 (Zone 1)",
+              entry.constant ? "🔄 改为动态按词召回" : "📌 改为常驻设定",
               "🗑 永久删除此条目",
             ]
           : []),
@@ -1313,29 +1428,35 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
       const edited = await editLongText(ctx, `世界书全文 · ${entry.title}`, entry.content);
       if (isPrimaryEntry && primaryCard && edited !== undefined && edited.trim() && edited.trim() !== entry.content) {
         entry.content = edited.trim();
-        if (s.worldDir) saveUpdatedCard(s.worldDir, primaryCard);
-        rt.reloadRuntime(ctx);
+        if (persistCardSafely(s.worldDir, primaryCard, ctx)) {
+          rt.reloadRuntime(ctx);
+        }
         ctx.ui.notify(`已保存「${entry.title}」正文修改。`, "info");
       }
     } else if (action.startsWith("🏷") && isPrimaryEntry && primaryCard) {
-      const nextTitle = (await ctx.ui.input("条目标题", entry.title))?.trim() || entry.title;
-      const nextKeysRaw = (await ctx.ui.input("触发词（逗号分隔）", entry.keys.join(", "))) ?? "";
-      entry.title = nextTitle;
+      const nextTitleRaw = await ctx.ui.input("条目标题", entry.title);
+      if (nextTitleRaw === undefined) continue;
+      const nextKeysRaw = await ctx.ui.input("触发词（逗号分隔）", entry.keys.join(", "));
+      if (nextKeysRaw === undefined) continue;
+      entry.title = nextTitleRaw.trim() || entry.title;
       entry.keys = nextKeysRaw.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
-      if (s.worldDir) saveUpdatedCard(s.worldDir, primaryCard);
-      rt.reloadRuntime(ctx);
+      if (persistCardSafely(s.worldDir, primaryCard, ctx)) {
+        rt.reloadRuntime(ctx);
+      }
       ctx.ui.notify("已更新标题与触发词。", "info");
     } else if ((action.startsWith("🔄") || action.startsWith("📌")) && isPrimaryEntry && primaryCard) {
       entry.constant = !entry.constant;
-      if (s.worldDir) saveUpdatedCard(s.worldDir, primaryCard);
-      rt.reloadRuntime(ctx);
-      ctx.ui.notify(`已设为：${entry.constant ? "常驻 Zone 1" : "动态召回"}`, "info");
+      if (persistCardSafely(s.worldDir, primaryCard, ctx)) {
+        rt.reloadRuntime(ctx);
+      }
+      ctx.ui.notify(`已设为：${entry.constant ? "常驻设定" : "动态召回"}`, "info");
     } else if (action.startsWith("🗑") && isPrimaryEntry && primaryCard) {
       const ok = await ctx.ui.confirm("删除世界书条目", `永久删除「${entry.title}」？`);
       if (ok) {
         primaryCard.loreBook.entries = primaryCard.loreBook.entries.filter((e) => e.id !== entry.id);
-        if (s.worldDir) saveUpdatedCard(s.worldDir, primaryCard);
-        rt.reloadRuntime(ctx);
+        if (persistCardSafely(s.worldDir, primaryCard, ctx)) {
+          rt.reloadRuntime(ctx);
+        }
         ctx.ui.notify(`已删除世界书条目「${entry.title}」`, "info");
       }
     }
@@ -1349,22 +1470,22 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
   while (true) {
     const s = rt.getState();
     const options = [
-      `🎚 切换叙事节奏（当前：${s.pacingMode} · Alt+P）`,
-      `✒️ 回复篇幅与叙事视角（${s.responseLength} · ${s.narrativePov} · /rp style）`,
-      `🚫 反 AI 套话禁词表（${s.bannedPhrases.length} 词 · /rp ban）`,
-      "✂️ 局部定向改写上一条回复 (/rp rewrite)",
-      `💭 角色内心独白 (<thought>)：${s.innerMonologue ? "● 已开启（点击关闭）" : "○ 已关闭（点击开启）"}`,
-      "⚡ 管理与触发快捷回复 / 动作宏 (Alt+E)",
-      `✨ 一键 AI 深度建档 (/rp analyze · ${rt.getCard()?.worldProfile?.source === "llm-analyzed" ? "已建档" : "启发式"})`,
-      "+ 新增导演指令 (Author's Note)",
+      `🎚 叙事节奏（${s.pacingMode}）`,
+      `✒️ 回复篇幅与视角（${s.responseLength} · ${s.narrativePov}）`,
+      `🚫 反套话禁词表（${s.bannedPhrases.length} 词）`,
+      "✂️ 局部定向改写上一条回复",
+      `💭 角色内心独白：${s.innerMonologue ? "● 已开启" : "○ 已关闭"}`,
+      "⚡ 快捷回复 / 动作宏",
+      `✨ AI 深度建档（${rt.getCard()?.worldProfile?.source === "llm-analyzed" ? "已建档" : "启发式"}）`,
+      "+ 新增导演指令",
       ...s.notes.map(
         (n, i) => `▪ #${i + 1} ${n.text.slice(0, 52)}${n.remainingTurns !== null ? ` (${n.remainingTurns}轮)` : " (常驻)"}`,
       ),
       ...(s.notes.length > 0 ? ["🧹 清空全部导演指令"] : []),
-      "⚙ 引擎高级设置、X-Ray 透视、会话总览与资产库",
+      "⚙ 高级设置、状态透视与资产库",
       "← 返回主面板",
     ];
-    const pick = await ctx.ui.select(sheetHeader(ctx, "🎬 导演台与快捷动作"), options);
+    const pick = await ctx.ui.select("🎬 导演台与设置", options);
     if (!pick || pick.startsWith("←")) return;
 
     if (pick.startsWith("✒️")) {
@@ -1398,9 +1519,11 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
     } else if (pick.startsWith("✨")) {
       await rt.analyzeCard(ctx);
     } else if (pick.startsWith("+")) {
-      const text = (await editLongText(ctx, "编写导演指令（注入尾部，不破坏前缀缓存）", ""))?.trim();
+      const text = (await editLongText(ctx, "编写导演指令", ""))?.trim();
       if (!text) continue;
-      const ttlStr = (await ctx.ui.input("生效轮数（留空=永久常驻，输入数字如 3=生效3轮）", ""))?.trim();
+      const ttlRaw = await ctx.ui.input("生效轮数（留空=常驻，输入数字如 3=生效 3 轮）", "");
+      if (ttlRaw === undefined) continue;
+      const ttlStr = ttlRaw.trim();
       const ttl = ttlStr && /^\d+$/.test(ttlStr) ? Math.max(1, Number(ttlStr)) : null;
       rt.commitTx({
         kind: "note_set",
@@ -1436,10 +1559,10 @@ async function openXRayAndAuditSection(rt: DashboardRuntime, ctx: PiExtensionCon
     const xray = rt.getLastXRay();
     const undoable = s.auditLog.filter((r) => Boolean(r.undoTx)).length;
     const summaryLine = xray
-      ? `⚡ Zone1=${xray.zone1Tokens}t (KV×${xray.cacheHitStreak}) · Zone2=${xray.zone2Tokens}t · Zone3=${xray.zone3Tokens}t · 召回 ${xray.recalled.length} 条`
-      : "尚未捕获 X-Ray 快照（发送一轮对话后自动生成）";
+      ? `总计 ~${xray.zone1Tokens + xray.zone2Tokens + xray.zone3Tokens}t · 召回 ${xray.recalled.length} 条`
+      : "尚未捕获快照（发送一轮对话后生成）";
 
-    const pick = await ctx.ui.select(sheetHeader(ctx, "🔎 上下文 X-Ray 透视 & 审计撤销"), [
+    const pick = await ctx.ui.select("🔎 上下文透视与审计撤销", [
       `🔎 输出完整 X-Ray 透视卡片（${summaryLine}）`,
       `↩ 查看状态变更审计日志并一键撤销（可撤销 ${undoable} 条）`,
       "← 返回主面板",
@@ -1466,19 +1589,19 @@ async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext
     const clockCount = Object.keys(s.clocks).length;
     const flagCount = Object.keys(s.flags).length;
 
-    const pick = await ctx.ui.select(sheetHeader(ctx, "⚙ 引擎高级设置、透视与资产库"), [
-      "🔎 上下文 X-Ray 透视 & 审计撤销",
-      "🌍 会话总览、上下文用量与导入审计",
-      `🎒 背包物品 (${invCount} 项)`,
-      `⏳ 进度时钟 (${clockCount} 个)`,
-      "🎲 快捷掷骰检定 (/rp roll)",
-      `🏁 剧情阶段 / 章节（当前：${s.era || "未启用"}）`,
-      `⚙ 世界开关 Flags (${flagCount} 项) & 引擎模块开关`,
-      `🤖 Sidecar 后台专职模型（当前：${s.sidecarModel || "跟随主模型"}）`,
-      `🧠 语义向量混合召回 Embedding（${loadUiPrefs().embeddingConfig?.enabled ? "● 开" : "○ 关"}）`,
-      `📏 动态世界书 Token 预算（当前：${s.loreTokenBudget} tokens）`,
-      `🎛 应用预设采样参数 (before_provider_request)：${s.applyPresetSampling ? "● 开" : "○ 关"}`,
-      "🗂 资产库管理（删除角色卡 / 预设 / 马甲）",
+    const pick = await ctx.ui.select("⚙ 高级设置与资产库", [
+      "🔎 上下文透视与审计撤销",
+      "🌍 会话总览与导入审计",
+      `🎒 背包物品（${invCount} 项）`,
+      `⏳ 进度时钟（${clockCount} 个）`,
+      "🎲 快捷掷骰检定",
+      `🏁 剧情阶段 / 章节（${s.era || "未启用"}）`,
+      `⚙ 世界状态 Flags（${flagCount}）与模块开关`,
+      `🤖 后台结算模型（${s.sidecarModel || "跟随主模型"}）`,
+      `🧠 语义向量召回（${loadUiPrefs().embeddingConfig?.enabled ? "● 开" : "○ 关"}）`,
+      `📏 动态世界书预算（${s.loreTokenBudget} tokens）`,
+      `🎛 应用预设采样参数：${s.applyPresetSampling ? "● 开" : "○ 关"}`,
+      "🗂 资产库管理（角色卡 / 预设 / 马甲）",
       "← 返回主面板",
     ]);
     if (!pick || pick.startsWith("←")) return;
@@ -1490,36 +1613,7 @@ async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext
     } else if (pick.startsWith("🎒")) {
       await openInventoryManager(rt, ctx);
     } else if (pick.startsWith("⏳")) {
-      const clocks = Object.values(s.clocks);
-      const sub = await ctx.ui.select("进度时钟（Blades 风格倒计时/进度条）", [
-        "+ 新建进度时钟",
-        ...clocks.map(
-          (c) =>
-            `⏳ [${c.clockId}] ${c.label}  ${renderProgressBar(c.value, c.max, 6)}  ${c.value}/${c.max}${c.completed ? " (完成)" : ""}`,
-        ),
-        "← 返回",
-      ]);
-      if (!sub || sub.startsWith("←")) continue;
-      if (sub.startsWith("+")) {
-        const label = (await ctx.ui.input("时钟名称（如：警觉度、任务倒计时）", ""))?.trim();
-        if (!label) continue;
-        const max = Math.max(1, Number((await ctx.ui.input("总格数（如 4 / 6 / 8）", "4"))?.trim()) || 4);
-        const clockId = label.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_").slice(0, 24) || `clk_${Date.now()}`;
-        rt.commitTx({ kind: "progress_clock", clockId, label, delta: 0, max });
-        rt.refreshHud(ctx);
-      } else if (sub.startsWith("⏳")) {
-        const clockId = /\[([^\]]+)\]/.exec(sub)?.[1];
-        const clk = clockId ? s.clocks[clockId] : undefined;
-        if (!clk) continue;
-        const op = await ctx.ui.select(`${clk.label} (${clk.value}/${clk.max})`, ["+1 推进一格", "-1 回退一格", "← 返回"]);
-        if (op?.startsWith("+1")) {
-          rt.commitTx({ kind: "progress_clock", clockId: clk.clockId, label: clk.label, delta: 1, max: clk.max });
-          rt.refreshHud(ctx);
-        } else if (op?.startsWith("-1")) {
-          rt.commitTx({ kind: "progress_clock", clockId: clk.clockId, label: clk.label, delta: -1, max: clk.max });
-          rt.refreshHud(ctx);
-        }
-      }
+      await openClocksManager(rt, ctx);
     } else if (pick.startsWith("🎲")) {
       await rt.quickRoll(ctx);
     } else if (pick.startsWith("🏁")) {
@@ -1537,41 +1631,15 @@ async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext
         ctx.ui.notify(`阶段已更新：${nextStage.trim() || "(已隐藏)"}`, "info");
       }
     } else if (pick.startsWith("⚙")) {
-      const modLabels = [
-        `⚙ 模块[数值 stats]：${s.modules.stats ? "● 开" : "○ 关"}`,
-        `⚙ 模块[背包 inventory]：${s.modules.inventory ? "● 开" : "○ 关"}`,
-        `⚙ 模块[时钟 clocks]：${s.modules.clocks ? "● 开" : "○ 关"}`,
-        `⚙ 模块[阶段 stages]：${s.modules.stages ? "● 开" : "○ 关"}`,
-      ];
-      const flagItems = Object.entries(s.flags).map(([k, v]) => `${v ? "● 开" : "○ 关"}  ${k}`);
-      const sub = await ctx.ui.select("世界开关 Flags 与引擎模块开关", ["+ 新增 Flag", ...modLabels, ...flagItems, "← 返回"]);
-      if (!sub || sub.startsWith("←")) continue;
-      if (sub.startsWith("+")) {
-        const name = (await ctx.ui.input("Flag 名称", ""))?.trim();
-        if (name) {
-          rt.commitTx({ kind: "flag_set", flag: name, value: true });
-          ctx.ui.notify(`已启用 Flag：${name}`, "info");
-        }
-      } else if (sub.startsWith("⚙ 模块[")) {
-        const m = /模块\[[^\s]+\s+(stats|inventory|clocks|stages)\]/.exec(sub);
-        const modKey = m?.[1] as keyof SessionRpState["modules"] | undefined;
-        if (modKey) {
-          const nextMods = { ...s.modules, [modKey]: !s.modules[modKey] };
-          rt.commitTx({ kind: "profile_apply", archetype: s.archetype, modules: nextMods });
-          rt.refreshHud(ctx);
-          ctx.ui.notify(`模块 ${modKey} 已${nextMods[modKey] ? "开启" : "关闭"}`, "info");
-        }
-      } else {
-        const name = sub.replace(/^[●○]\s+[开关]\s+/, "");
-        rt.commitTx({ kind: "flag_set", flag: name, value: !Boolean(s.flags[name]) });
-      }
+      await openFlagsAndModulesManager(rt, ctx);
     } else if (pick.startsWith("🤖")) {
       await rt.pickSidecarModel(ctx);
     } else if (pick.startsWith("🧠")) {
       await openEmbeddingConfigManager(ctx);
     } else if (pick.startsWith("📏")) {
-      const budgetStr = (await ctx.ui.input("动态世界书 Token 预算（建议 800 ~ 4000）", String(s.loreTokenBudget)))?.trim();
-      const val = Number(budgetStr);
+      const budgetRaw = await ctx.ui.input("动态世界书 Token 预算（建议 800 ~ 4000）", String(s.loreTokenBudget));
+      if (budgetRaw === undefined) continue;
+      const val = Number(budgetRaw.trim());
       if (Number.isFinite(val) && val >= 200) {
         rt.commitTx({ kind: "config_patch", loreTokenBudget: Math.min(8000, Math.round(val)) });
         ctx.ui.notify(`动态世界书预算已调整为 ${Math.min(8000, Math.round(val))} tokens`, "info");
@@ -1618,10 +1686,10 @@ async function openOverviewAndAudit(rt: DashboardRuntime, ctx: PiExtensionContex
       : []),
   ];
 
-  const pick = await ctx.ui.select(sheetHeader(ctx, "🌍 会话总览与导入审计"), [
+  const pick = await ctx.ui.select("🌍 会话总览与导入审计", [
     ...lines,
-    "📖 导出纯净 Markdown 小说（至当前项目 rp-exports/）",
-    `⌨️ 查看全部 ${RP_SHORTCUT_LIST.length} 项快捷键`,
+    "📖 导出纯净 Markdown 小说",
+    `⌨️ 查看快捷键列表（${RP_SHORTCUT_LIST.length} 项）`,
     "← 返回主面板",
   ]);
   if (pick?.startsWith("📖")) {
@@ -1630,7 +1698,7 @@ async function openOverviewAndAudit(rt: DashboardRuntime, ctx: PiExtensionContex
   }
   if (pick?.startsWith("⌨️")) {
     await ctx.ui.select(
-      sheetHeader(ctx, "RP 快捷键速查（Pi 原生 /hotkeys 可查看全部）"),
+      "RP 快捷键速查",
       [...RP_SHORTCUT_LIST.map((k) => `${k.key.padEnd(14)}  ${k.label} — ${k.description}`), "← 返回"],
     );
   }
@@ -1717,7 +1785,9 @@ async function dispatchOverlayAction(rt: DashboardRuntime, ctx: PiExtensionConte
       return true;
     case "set:budget": {
       const cur = rt.getState().loreTokenBudget;
-      const val = Number((await ctx.ui.input("动态世界书 Token 预算（200-8000）", String(cur)))?.trim());
+      const valRaw = await ctx.ui.input("动态世界书 Token 预算（200-8000）", String(cur));
+      if (valRaw === undefined) return true;
+      const val = Number(valRaw.trim());
       if (Number.isFinite(val) && val >= 200) {
         rt.commitTx({ kind: "config_patch", loreTokenBudget: Math.min(8000, Math.round(val)) });
         ctx.ui.notify(`动态世界书预算已调整为 ${Math.min(8000, Math.round(val))} tokens`, "info");
@@ -1768,10 +1838,7 @@ async function openLedgerOverview(rt: DashboardRuntime, ctx: PiExtensionContext)
       "← 返回主面板",
     ];
 
-    const pick = await ctx.ui.select(
-      `📋 本局全部账本一览（最近写入 / Flags / 事实 / 信念 / 伏笔）`,
-      opts,
-    );
+    const pick = await ctx.ui.select("📋 本局动态一览", opts);
     if (!pick || pick.startsWith("←")) return;
     if (pick.startsWith("📝")) {
       await rt.undoLast(ctx, false);
@@ -1797,7 +1864,7 @@ export async function openRpDashboard(
 ): Promise<void> {
   const state = rt.getState();
   if (!state.active) {
-    ctx.ui.notify("当前会话未开启 RP 模式。按 Alt+R 或输入 /rp 打开启动器。", "info");
+    ctx.ui.notify("当前会话未开启 RP 模式，请先加载一张角色卡。", "info");
     return;
   }
 
@@ -1831,23 +1898,17 @@ export async function openRpDashboard(
     if (!s.active) return;
     const card = rt.getCard();
     const openHooks = Array.from(s.foresights.values()).filter((h) => h.status === "open").length;
-    const xray = rt.getLastXRay();
-
-    const invCount = Object.values(s.inventory).reduce((acc, rec) => acc + Object.keys(rec).length, 0);
     const activeFactsList = getActiveFacts(s);
-    const secretCount = activeFactsList.filter((f) => f.witnessIds !== "public").length;
-    const title = sheetHeader(
-      ctx,
-      `◆ ${[card?.identity.name ?? s.cardSlug ?? "RP", s.era, s.worldTimeLabel, `T${s.turn}`].filter(Boolean).join(" · ")}`,
-    );
+    const title = `◆ ${[card?.identity.name ?? s.cardSlug ?? "RP", s.era, s.worldTimeLabel, `T${s.turn}`].filter(Boolean).join(" · ")}`;
     const activeFlagsCount = Object.values(s.flags).filter(Boolean).length;
+    const lastUndoable = s.auditLog.filter((r) => Boolean(r.undoTx)).at(-1);
     const choice = await ctx.ui.select(title, [
-      `1. 📋 本局动态一览（近期写入 ${s.auditLog.length} · 事实 ${activeFactsList.length} · 信念 ${s.beliefs.length} · 伏笔 ${openHooks}${activeFlagsCount ? ` · Flags ${activeFlagsCount}` : ""}）`,
-      `2. 📍 场景与世界（${s.location || "未设定"}${activeFlagsCount ? ` · Flags ${activeFlagsCount}` : ""} · 时钟 ${Object.keys(s.clocks).length} · 推演/镜头）`,
-      `3. 👥 人物与关系（按角色一站式档案 · 关系网 · 马甲：${s.currentPersona.name}）`,
-      `4. 📖 记忆、伏笔与世界书（事实 ${activeFactsList.length} · 信念 ${s.beliefs.length} · 伏笔 ${openHooks} · 世界书 ${getAllLore(rt).length} · 导出小说）`,
-      `5. 🎬 导演台与设置（节奏:${s.pacingMode} · 篇幅/视角 · 禁词 · 改写 · 高级设置/X-Ray）`,
-      ...(s.auditLog.length > 0 ? [`↩ 撤销上次状态变更（${s.auditLog[s.auditLog.length - 1]!.summary.slice(0, 26)}）`] : []),
+      `1. 📋 本局动态一览（写入 ${s.auditLog.length} · 事实 ${activeFactsList.length} · 伏笔 ${openHooks}${activeFlagsCount ? ` · Flags ${activeFlagsCount}` : ""}）`,
+      `2. 📍 场景与世界（${s.location || "未设定"} · 时钟 ${Object.keys(s.clocks).length}）`,
+      `3. 👥 人物与关系（档案 · 关系网 · 马甲：${s.currentPersona.name}）`,
+      `4. 📖 记忆、伏笔与世界书（事实 ${activeFactsList.length} · 世界书 ${getAllLore(rt).length} · 导出）`,
+      `5. 🎬 导演台与设置（节奏:${s.pacingMode} · 风格 · 高级设置）`,
+      ...(lastUndoable ? [`↩ 撤销上次状态变更（${lastUndoable.summary.slice(0, 26)}）`] : []),
       "6. 🚪 彻底退出本会话 RP 模式",
       "✕ 关闭面板",
     ]);

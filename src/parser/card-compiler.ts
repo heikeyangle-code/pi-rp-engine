@@ -248,12 +248,18 @@ export function compileCharacterCard(
         continue;
       }
       if (uri) {
-        assets.push({
-          type,
-          name: assetName,
-          localPath: rewriteEmbeddedAssetUri(uri),
-          ext,
-        });
+        try {
+          assets.push({
+            type,
+            name: assetName,
+            localPath: rewriteEmbeddedAssetUri(uri),
+            ext,
+          });
+        } catch (err) {
+          const msg = (err as Error).message;
+          skippedAssets.push({ type, name: assetName, reason: `非法资产路径: ${msg}` });
+          warnings.push(`跳过非法资产路径「${assetName}」: ${msg}`);
+        }
       }
     }
   }

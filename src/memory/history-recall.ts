@@ -12,7 +12,7 @@
  */
 
 import { createHash } from "node:crypto";
-import type { PiContentBlock, PiSessionEntry } from "../types.js";
+import type { PiContentBlock, PiMessage, PiSessionEntry } from "../types.js";
 import { type Bm25Index, bm25Scores, buildBm25Index, hasPosting, tokenizeBigram } from "./bm25.js";
 
 export interface CommittedRoundMessage {
@@ -75,7 +75,16 @@ function extractPlainContent(content: unknown): string {
   return "";
 }
 
-/** Extract committed story rounds from Pi's session branch (including hidden/compacted floors and `rp:greeting`/`rp:rewrite`). */
+function isToolCallAssistantMessage(m: PiMessage): boolean {
+  if (m.role !== "assistant") return false;
+  if (m.stopReason === "toolUse" || m.stopReason === "tool_calls") return true;
+  if (Array.isArray(m.content)) {
+    return m.content.some((b) => b && typeof b === "object" && (b.type === "toolCall" || b.type === "tool_use"));
+  }
+  return false;
+}
+
+/** Extract committed story rounds from Pi's session branch (keeping rp:greeting as Turn 0 so turns align with state.turn). */
 export function extractCommittedRounds(branch: PiSessionEntry[]): CommittedRound[] {
   const rounds: CommittedRound[] = [];
   let pendingUsers: CommittedRoundMessage[] = [];
@@ -84,13 +93,32 @@ export function extractCommittedRounds(branch: PiSessionEntry[]): CommittedRound
   for (const e of branch) {
     if (e.type === "message" && e.message) {
       const m = e.message;
-      if (m.customType === "rp:ooc" || m.customType === "rp:event") continue;
+      if (
+        m.customType === "rp:ooc" ||
+        m.customType === "rp:event" ||
+        m.customType === "rp:error" ||
+        m.customType === "rp:recovery"
+      ) {
+        continue;
+      }
+      if (m.display === false && m.customType !== "rp:greeting") continue;
+      if (m.stopReason === "error" || m.stopReason === "aborted") continue;
+      if (isToolCallAssistantMessage(m)) continue;
+
       const text = extractPlainContent(m.content).trim();
       if (!text || text.startsWith("[OOC")) continue;
 
+      if (m.customType === "rp:greeting") {
+        rounds.push({
+          turn: 0,
+          messages: [{ role: "assistant", text }],
+        });
+        continue;
+      }
+
       if (m.role === "user") {
         pendingUsers.push({ role: "user", text });
-      } else if (m.role === "assistant" || m.customType === "rp:greeting" || m.customType === "rp:rewrite") {
+      } else if (m.role === "assistant" || m.customType === "rp:rewrite") {
         turnCounter += 1;
         rounds.push({
           turn: turnCounter,
@@ -103,8 +131,16 @@ export function extractCommittedRounds(branch: PiSessionEntry[]): CommittedRound
 
     if (e.type === "custom_message") {
       if (e.customType !== "rp:greeting" && e.customType !== "rp:rewrite") continue;
+      if ((e as { display?: boolean }).display === false && e.customType !== "rp:greeting") continue;
       const text = extractPlainContent((e as { content?: unknown }).content).trim();
-      if (!text) continue;
+      if (!text || text.startsWith("[OOC")) continue;
+      if (e.customType === "rp:greeting") {
+        rounds.push({
+          turn: 0,
+          messages: [{ role: "assistant", text }],
+        });
+        continue;
+      }
       turnCounter += 1;
       rounds.push({
         turn: turnCounter,
@@ -148,10 +184,12 @@ function hitExcerpts(text: string, terms: string[], radius = 60, count = 3): str
   const merged: Array<[number, number]> = [];
   for (const win of windows) {
     const last = merged[merged.length - 1];
-    if (last && win[0] <= last[1] && win[1] - last[0] <= radius * 4) {
-      last[1] = Math.max(last[1], win[1]);
-    } else if (last && win[0] < last[1]) {
-      continue;
+    if (last && win[0] <= last[1]) {
+      if (win[1] - last[0] <= radius * 4) {
+        last[1] = Math.max(last[1], win[1]);
+      } else if (win[1] > last[1]) {
+        merged.push([last[1], win[1]]);
+      }
     } else {
       merged.push([win[0], win[1]]);
     }
@@ -293,9 +331,12 @@ export function recallHistory(options: {
     }
     ranked.sort((a, b) => b.score - a.score || b.turn - a.turn);
 
+    let anyMatchedCooling = false;
     const top = ranked.slice(0, limit).map((m) => {
       const anchors = excerptAnchors(queryTokens, corpus, m.docIdx);
-      const cooledMark = isCooling(rounds[m.docIdx]!) ? "〔全文已读过·摘要复查〕" : "";
+      const cooling = isCooling(rounds[m.docIdx]!);
+      if (cooling) anyMatchedCooling = true;
+      const cooledMark = cooling ? "〔全文已读过·摘要复查〕" : "";
       return {
         turn: m.turn,
         excerpt: cooledMark + hitExcerpts(corpus.texts[m.docIdx] ?? "", anchors.length ? anchors : terms),
@@ -308,7 +349,7 @@ export function recallHistory(options: {
         found: ranked.length > 0,
         matches: top,
         terms: termTurns(rounds, terms),
-        notice: activeCooldowns.length > 0 ? "已召回全文的轮次处于 10 轮冷却期，本次命中只显示摘要复查。" : "",
+        notice: anyMatchedCooling ? "已召回全文的轮次处于 10 轮冷却期，本次命中只显示摘要复查。" : "",
       },
       nextCooldowns: activeCooldowns,
     };

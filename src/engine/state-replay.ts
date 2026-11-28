@@ -14,6 +14,7 @@
 import * as crypto from "node:crypto";
 import type {
   PersonaProfile,
+  PhysicalSnapshot,
   PiMessage,
   PiSessionEntry,
   RpTxEntry,
@@ -24,6 +25,19 @@ import { computeCheckedStatValue, normalizeCfsmAxisDef } from "./cfsm.js";
 
 export const RP_ENTRY_TYPE = "rp:tx";
 const MAX_AUDIT_LOG = 24;
+
+const auditSeqMap = new WeakMap<SessionRpState, number>();
+
+function nextAuditSeq(state: SessionRpState): number {
+  const next = (auditSeqMap.get(state) ?? 0) + 1;
+  auditSeqMap.set(state, next);
+  return next;
+}
+
+function isUndoTx(tx: RpTxEntry): boolean {
+  const rec = tx as { reason?: string; note?: string };
+  return rec.reason === "undo" || rec.note === "undo";
+}
 
 const DEFAULT_PERSONA: PersonaProfile = {
   id: "default",
@@ -116,11 +130,12 @@ export function createInitialRpState(): SessionRpState {
 function resetWorldStateInPlace(state: SessionRpState): void {
   const fresh = createInitialRpState();
   Object.assign(state, fresh);
+  auditSeqMap.set(state, 0);
 }
 
 function pushAudit(state: SessionRpState, rec: Omit<TxAuditRecord, "id" | "turn">): void {
   state.auditLog.push({
-    id: `tx_${state.turn}_${state.auditLog.length}`,
+    id: `tx_${state.turn}_${nextAuditSeq(state)}`,
     turn: state.turn,
     ...rec,
   });
@@ -184,15 +199,20 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     case "persona_set":
       if (state.initialPersona === null && state.turn === 0) {
         state.initialPersona = { ...tx.persona };
-      } else if (
-        state.initialPersona &&
-        (state.initialPersona.name !== tx.persona.name ||
-          state.initialPersona.description !== tx.persona.description)
-      ) {
-        state.personaChangedMidSession = true;
+        state.personaChangedMidSession = false;
+      } else if (state.initialPersona) {
+        const isOriginal =
+          state.initialPersona.id === tx.persona.id &&
+          state.initialPersona.name === tx.persona.name &&
+          state.initialPersona.description === tx.persona.description;
+        state.personaChangedMidSession = !isOriginal;
       } else if (state.initialPersona === null && state.turn > 0) {
         state.initialPersona = { ...state.currentPersona };
-        state.personaChangedMidSession = true;
+        const isOriginal =
+          state.initialPersona.id === tx.persona.id &&
+          state.initialPersona.name === tx.persona.name &&
+          state.initialPersona.description === tx.persona.description;
+        state.personaChangedMidSession = !isOriginal;
       }
       state.currentPersona = { ...tx.persona };
       break;
@@ -261,14 +281,14 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       }
       state.location = tx.location;
       state.presentNpcs = [...tx.presentNpcs];
-      if (prevLoc !== tx.location || prevNpcs.join("|") !== tx.presentNpcs.join("|")) {
+      if (!isUndoTx(tx) && (prevLoc !== tx.location || prevNpcs.join("|") !== tx.presentNpcs.join("|"))) {
         const isInitialHydration = state.turn === 0 && !prevLoc && prevNpcs.length === 0;
         if (!isInitialHydration) {
           state.lastMeaningfulProgressTurn = state.turn;
           pushAudit(state, {
             summary: `地点: ${tx.location || "(空)"}${tx.presentNpcs.length ? ` [${tx.presentNpcs.join("、")}]` : ""}`,
             source: "tool",
-            undoTx: { kind: "location_set", location: prevLoc, presentNpcs: prevNpcs },
+            undoTx: { kind: "location_set", location: prevLoc, presentNpcs: prevNpcs, reason: "undo" } as RpTxEntry,
           });
         }
       }
@@ -286,13 +306,13 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       const hadPrev = Object.prototype.hasOwnProperty.call(state.flags, tx.flag);
       const prev = Boolean(state.flags[tx.flag]);
       state.flags[tx.flag] = tx.value;
-      if (prev !== tx.value) {
+      if (!isUndoTx(tx) && prev !== tx.value) {
         if (!(state.turn === 0 && !hadPrev)) {
           state.lastMeaningfulProgressTurn = state.turn;
           pushAudit(state, {
             summary: `Flag ${tx.flag} = ${tx.value ? "开" : "关"}`,
             source: "tool",
-            undoTx: { kind: "flag_set", flag: tx.flag, value: prev },
+            undoTx: { kind: "flag_set", flag: tx.flag, value: prev, reason: "undo" } as RpTxEntry,
           });
         }
       }
@@ -325,7 +345,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         updatedTurn: tx.turn,
         reason: tx.reason,
       };
-      if (tx.reason !== "undo") {
+      if (!isUndoTx(tx)) {
         if (prev !== tx.to) state.lastMeaningfulProgressTurn = state.turn;
         pushAudit(state, {
           summary: `心态 ${tx.actorId}.${tx.axis}: ${prev} → ${tx.to}`,
@@ -359,7 +379,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       if (checked.ok && checked.clampedValue !== undefined) {
         state.stats[tx.actorId]![tx.key] = checked.clampedValue;
         const src = inferSourceFromReason(tx.reason);
-        if (src !== "system" && tx.reason !== "undo") {
+        if (src !== "system" && !isUndoTx(tx)) {
           if (!hadPrev || prevVal !== checked.clampedValue) {
             state.lastMeaningfulProgressTurn = state.turn;
           }
@@ -377,19 +397,21 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
 
     case "inventory_patch": {
       if (!state.inventory[tx.actorId]) state.inventory[tx.actorId] = {};
-      const next = (state.inventory[tx.actorId]![tx.item] ?? 0) + tx.delta;
-      if (next <= 0) {
+      const prevVal = state.inventory[tx.actorId]![tx.item] ?? 0;
+      const nextVal = Math.max(0, prevVal + tx.delta);
+      const appliedDelta = nextVal - prevVal;
+      if (nextVal <= 0) {
         delete state.inventory[tx.actorId]![tx.item];
       } else {
-        state.inventory[tx.actorId]![tx.item] = next;
+        state.inventory[tx.actorId]![tx.item] = nextVal;
       }
       const src = inferSourceFromReason(tx.note);
-      if (src !== "system" && tx.note !== "undo") {
-        if (tx.delta !== 0) state.lastMeaningfulProgressTurn = state.turn;
+      if (src !== "system" && !isUndoTx(tx) && appliedDelta !== 0) {
+        state.lastMeaningfulProgressTurn = state.turn;
         pushAudit(state, {
-          summary: `物品 ${tx.actorId}·${tx.item} ${tx.delta > 0 ? `+${tx.delta}` : tx.delta}`,
+          summary: `物品 ${tx.actorId}·${tx.item} ${appliedDelta > 0 ? `+${appliedDelta}` : appliedDelta}`,
           source: src,
-          undoTx: { kind: "inventory_patch", actorId: tx.actorId, item: tx.item, delta: -tx.delta, note: "undo" },
+          undoTx: { kind: "inventory_patch", actorId: tx.actorId, item: tx.item, delta: -appliedDelta, note: "undo" },
         });
       }
       break;
@@ -397,8 +419,10 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
 
     case "progress_clock": {
       const prev = state.clocks[tx.clockId];
+      const prevVal = prev?.value ?? 0;
       const max = tx.max > 0 ? tx.max : prev?.max ?? 4;
-      const val = Math.min(max, Math.max(0, (prev?.value ?? 0) + tx.delta));
+      const val = Math.min(max, Math.max(0, prevVal + tx.delta));
+      const appliedDelta = val - prevVal;
       state.clocks[tx.clockId] = {
         clockId: tx.clockId,
         label: tx.label || prev?.label || tx.clockId,
@@ -406,12 +430,19 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         max,
         completed: tx.completed ?? val >= max,
       };
-      if (tx.delta !== 0 && !(state.turn === 0 && !prev)) {
+      if (!isUndoTx(tx) && appliedDelta !== 0 && !(state.turn === 0 && !prev)) {
         state.lastMeaningfulProgressTurn = state.turn;
         pushAudit(state, {
           summary: `时钟 ${state.clocks[tx.clockId]!.label} ${val}/${max}`,
           source: "tool",
-          undoTx: { kind: "progress_clock", clockId: tx.clockId, label: state.clocks[tx.clockId]!.label, delta: -tx.delta, max },
+          undoTx: {
+            kind: "progress_clock",
+            clockId: tx.clockId,
+            label: state.clocks[tx.clockId]!.label,
+            delta: -appliedDelta,
+            max,
+            reason: "undo",
+          } as RpTxEntry,
         });
       }
       break;
@@ -425,7 +456,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         eventTimeLabel: tx.fact.eventTimeLabel ?? (state.worldTimeLabel || undefined),
       };
       state.facts.set(stamped.id, stamped);
-      if (!stamped.id.startsWith("fact_init_")) {
+      if (!isUndoTx(tx) && !stamped.id.startsWith("fact_init_")) {
         state.lastMeaningfulProgressTurn = state.turn;
         pushAudit(state, {
           summary: `+事实 ${stamped.statement.slice(0, 32)}`,
@@ -457,12 +488,16 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
           validUntilTurn: tx.validUntilTurn,
           supersededBy: tx.supersededBy,
         });
-        if (tx.reason !== "undo") {
+        if (!isUndoTx(tx)) {
           state.lastMeaningfulProgressTurn = state.turn;
           pushAudit(state, {
             summary: `失效事实 ${existing.statement.slice(0, 30)}`,
             source: inferSourceFromReason(tx.reason),
-            undoTx: { kind: "fact_add", fact: { ...existing, validUntilTurn: null, supersededBy: undefined } },
+            undoTx: {
+              kind: "fact_add",
+              fact: { ...existing, validUntilTurn: null, supersededBy: undefined },
+              reason: "undo",
+            } as RpTxEntry,
           });
         }
       }
@@ -487,7 +522,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       } else {
         state.beliefs.push(record);
       }
-      if (!id.startsWith("belief_init_")) {
+      if (!isUndoTx(tx) && !id.startsWith("belief_init_")) {
         state.lastMeaningfulProgressTurn = state.turn;
         pushAudit(state, {
           summary: `印象 ${tx.actorId}→${tx.target}: ${tx.belief.slice(0, 26)}`,
@@ -534,7 +569,9 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       state.storylets.set(nextStorylet.id, nextStorylet);
       // Automatically apply Storylet postconditions upon transitioning into completed
       if (nextStorylet.status === "completed" && prevStorylet?.status !== "completed") {
-        state.lastMeaningfulProgressTurn = state.turn;
+        if (!isUndoTx(tx)) {
+          state.lastMeaningfulProgressTurn = state.turn;
+        }
         const pe = nextStorylet.postEffects;
         if (pe?.setFlags) {
           for (const [flag, val] of Object.entries(pe.setFlags)) {
@@ -544,11 +581,15 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         if (pe?.nextObjective && pe.nextObjective.trim()) {
           state.sceneObjective = pe.nextObjective.trim();
         }
-        pushAudit(state, {
-          summary: `剧情卡完成: ${nextStorylet.title}`,
-          source: "sidecar",
-          undoTx: prevStorylet ? { kind: "storylet_upsert", storylet: prevStorylet } : undefined,
-        });
+        if (!isUndoTx(tx)) {
+          pushAudit(state, {
+            summary: `剧情卡完成: ${nextStorylet.title}`,
+            source: "sidecar",
+            undoTx: prevStorylet
+              ? ({ kind: "storylet_upsert", storylet: prevStorylet, reason: "undo" } as RpTxEntry)
+              : undefined,
+          });
+        }
       }
       break;
     }
@@ -603,22 +644,30 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       if (actor) {
         const prev = state.physicalState[actor] ? { ...state.physicalState[actor]! } : undefined;
         const prevSpatial = state.spatialNotes;
-        const merged = {
+        const cleanedSnapshot: Partial<PhysicalSnapshot> = {};
+        for (const [k, v] of Object.entries(tx.snapshot)) {
+          if (v !== undefined) {
+            (cleanedSnapshot as Record<string, unknown>)[k] = v;
+          }
+        }
+        const merged: PhysicalSnapshot = {
           ...(prev ?? { actorId: actor, updatedTurn: state.turn }),
-          ...tx.snapshot,
+          ...cleanedSnapshot,
           actorId: actor,
           updatedTurn: tx.snapshot.updatedTurn ?? state.turn,
         };
         state.physicalState[actor] = merged;
         if (tx.spatialNotes !== undefined) state.spatialNotes = tx.spatialNotes.trim();
-        const details = [merged.attire, merged.condition, merged.holding, merged.position].filter(Boolean).join(" / ");
-        pushAudit(state, {
-          summary: `状态外貌 ${actor}: ${details.slice(0, 42) || "更新"}`,
-          source: inferSourceFromReason(tx.reason),
-          undoTx: prev
-            ? { kind: "physical_patch", snapshot: prev, spatialNotes: prevSpatial, reason: "undo" }
-            : undefined,
-        });
+        if (!isUndoTx(tx)) {
+          const details = [merged.attire, merged.condition, merged.holding, merged.position].filter(Boolean).join(" / ");
+          pushAudit(state, {
+            summary: `状态外貌 ${actor}: ${details.slice(0, 42) || "更新"}`,
+            source: inferSourceFromReason(tx.reason),
+            undoTx: prev
+              ? { kind: "physical_patch", snapshot: prev, spatialNotes: prevSpatial, reason: "undo" }
+              : undefined,
+          });
+        }
       } else if (tx.spatialNotes !== undefined) {
         state.spatialNotes = tx.spatialNotes.trim();
       }
@@ -628,13 +677,18 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     case "agenda_upsert": {
       const actor = tx.agenda.actorId.trim();
       if (!actor) break;
+      const prev = state.npcAgendas[actor] ? { ...state.npcAgendas[actor]! } : undefined;
       state.npcAgendas[actor] = { ...tx.agenda, actorId: actor };
-      state.lastMeaningfulProgressTurn = state.turn;
-      pushAudit(state, {
-        summary: `日程 ${actor}: ${tx.agenda.currentActivity.slice(0, 32)}`,
-        source: "sidecar",
-        undoTx: { kind: "agenda_delete", actorId: actor },
-      });
+      if (!isUndoTx(tx)) {
+        state.lastMeaningfulProgressTurn = state.turn;
+        pushAudit(state, {
+          summary: `日程 ${actor}: ${tx.agenda.currentActivity.slice(0, 32)}`,
+          source: "sidecar",
+          undoTx: prev
+            ? ({ kind: "agenda_upsert", agenda: prev, reason: "undo" } as RpTxEntry)
+            : { kind: "agenda_delete", actorId: actor },
+        });
+      }
       break;
     }
 
@@ -647,12 +701,16 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       if (!id) break;
       const prev = state.pairBonds[id] ? { ...state.pairBonds[id]! } : undefined;
       state.pairBonds[id] = { ...tx.bond, id, tension: Math.max(-100, Math.min(100, Math.round(tx.bond.tension))) };
-      state.lastMeaningfulProgressTurn = state.turn;
-      pushAudit(state, {
-        summary: `关系 ${tx.bond.actorA}↔${tx.bond.actorB}: ${tx.bond.stance}`,
-        source: "sidecar",
-        undoTx: prev ? { kind: "pair_bond_upsert", bond: prev } : { kind: "pair_bond_delete", id },
-      });
+      if (!isUndoTx(tx)) {
+        state.lastMeaningfulProgressTurn = state.turn;
+        pushAudit(state, {
+          summary: `关系 ${tx.bond.actorA}↔${tx.bond.actorB}: ${tx.bond.stance}`,
+          source: "sidecar",
+          undoTx: prev
+            ? ({ kind: "pair_bond_upsert", bond: prev, reason: "undo" } as RpTxEntry)
+            : { kind: "pair_bond_delete", id },
+        });
+      }
       break;
     }
 
@@ -674,6 +732,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
  */
 export function replayBranchState(branch: PiSessionEntry[]): SessionRpState {
   const state = createInitialRpState();
+  auditSeqMap.set(state, 0);
 
   for (const entry of branch) {
     if (entry.type !== "custom" || entry.customType !== RP_ENTRY_TYPE) continue;

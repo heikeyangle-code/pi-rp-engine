@@ -2,20 +2,30 @@
  * Hybrid CJK + Latin token estimator & deterministic priority budget trimmer.
  */
 
-const CJK_CHAR_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3000-\u303f\uff00-\uffef]/u;
+const HAN_CHAR_RE = /[\p{Script=Han}\u3000-\u303f\uff00-\uffef]/u;
+const KANA_CHAR_RE = /[\p{Script=Hiragana}\p{Script=Katakana}]/u;
+const HANGUL_CHAR_RE = /[\p{Script=Hangul}]/u;
 
 export function estimateTokens(text: string): number {
   if (!text) return 0;
-  let cjk = 0;
+  let tokens = 0;
   let other = 0;
   for (const ch of text) {
-    if (CJK_CHAR_RE.test(ch)) {
-      cjk++;
+    if (ch.length > 1) {
+      // Surrogate-pair emojis / astral code points (~2 tokens each)
+      tokens += 2;
+    } else if (HAN_CHAR_RE.test(ch)) {
+      // Modern tokenizers (DeepSeek/GPT/Claude) average ~1.0 token per Han char
+      tokens += 1.0;
+    } else if (KANA_CHAR_RE.test(ch)) {
+      tokens += 1.4;
+    } else if (HANGUL_CHAR_RE.test(ch)) {
+      tokens += 1.6;
     } else {
-      other += ch.length;
+      other += 1;
     }
   }
-  return Math.ceil(cjk * 1.45 + other / 3.8);
+  return Math.ceil(tokens + other / 3.8);
 }
 
 export interface BudgetedItem<T> {

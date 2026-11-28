@@ -399,7 +399,14 @@ export function createRpOverlayController(options: {
       const rows = getRows();
       clampSelection(rows);
 
-      if (data === "\x1b" || data === "q" || data === "Q" || data === "\x03" || options.keybindings?.matches?.(data, "cancel")) {
+      if (
+        data === "\x1b" ||
+        data === "q" ||
+        data === "Q" ||
+        data === "\x03" ||
+        options.keybindings?.matches?.(data, "tui.select.cancel") ||
+        options.keybindings?.matches?.(data, "cancel")
+      ) {
         options.done({ kind: "close", tab });
         return;
       }
@@ -442,7 +449,12 @@ export function createRpOverlayController(options: {
         return;
       }
 
-      if (data === "\r" || data === "\n" || options.keybindings?.matches?.(data, "submit")) {
+      if (
+        data === "\r" ||
+        data === "\n" ||
+        options.keybindings?.matches?.(data, "tui.select.confirm") ||
+        options.keybindings?.matches?.(data, "submit")
+      ) {
         const chosen = rows[selectedIdx];
         if (chosen) {
           options.done({ kind: "open_section", tab, actionKey: chosen.actionKey });

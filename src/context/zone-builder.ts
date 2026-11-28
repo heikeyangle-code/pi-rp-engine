@@ -12,10 +12,10 @@
  *  - Zone 3 (Transient tail frame via `context` hook): Attached ONLY to the final user message
  *    (or final message if none) of the outbound copy — NEVER persisted to JSONL. Includes:
  *    `<rp_state_frame>` (with scene objective, milestones & flags), RoleMemo DualMem beliefs,
- *    recalled lore + Memory Book chapters (with preset `wiFormat` & dynamic `outlet` expansion),
- *    bi-temporal facts with FANToM blind spots, open foresights, condition-gated Storylets,
- *    optional Inner Monologue cue, Director Pacing & notes, preset tail prompts, `depth_prompt`,
- *    and `post_history_instructions`.
+ *    recalled lore + Zone 3 constant lore (position 2/3/4) + Memory Book chapters (with preset
+ *    `wiFormat` & dynamic `outlet` expansion), bi-temporal facts with FANToM blind spots, open
+ *    foresights, condition-gated Storylets, optional Inner Monologue cue, Director Pacing & notes,
+ *    preset tail prompts, `depth_prompt`, and `post_history_instructions`.
  */
 
 import { createHash } from "node:crypto";
@@ -115,10 +115,15 @@ export function evaluateActiveStorylets(state: SessionRpState): StoryletEntry[] 
   return active;
 }
 
-function collectStaticOutlets(card: CompiledCard, macroCtx: MacroContext): Record<string, string> {
+function collectStaticOutlets(
+  card: CompiledCard,
+  macroCtx: MacroContext,
+  loreOverrides?: Record<string, boolean>,
+): Record<string, string> {
   const outlets: Record<string, string> = {};
   for (const e of card.loreBook.entries) {
-    if (e.enabled && e.constant && e.position === 7 && e.outletName && e.content.trim()) {
+    const effectiveEnabled = loreOverrides?.[e.id] ?? e.enabled;
+    if (effectiveEnabled && e.constant && e.position === 7 && e.outletName && e.content.trim()) {
       const prev = outlets[e.outletName];
       const rendered = evaluateMacros(e.content, macroCtx).trim();
       outlets[e.outletName] = prev ? `${prev}\n${rendered}` : rendered;
@@ -153,8 +158,9 @@ export function buildZone1FrozenPrefix(options: {
   extraCastCards?: CompiledCard[];
   preset?: CompiledPreset | null;
   initialPersona: PersonaProfile;
+  loreOverrides?: Record<string, boolean>;
 }): string {
-  const { card, extraCastCards = [], preset, initialPersona } = options;
+  const { card, extraCastCards = [], preset, initialPersona, loreOverrides } = options;
   const charName = card.identity.nickname || card.identity.name;
   const groupMembers = [charName, ...extraCastCards.map((c) => c.identity.nickname || c.identity.name)];
   // Stable per-session deterministic seed ensures {{random}} / {{roll}} in Zone 1 NEVER break KV-Cache!
@@ -166,13 +172,17 @@ export function buildZone1FrozenPrefix(options: {
     groupMembers,
     deterministicSeed: zone1Seed,
   };
-  const staticOutlets = collectStaticOutlets(card, baseMacroCtx);
+  const staticOutlets = collectStaticOutlets(card, baseMacroCtx, loreOverrides);
   const macroCtx: MacroContext = { ...baseMacroCtx, outlets: staticOutlets };
 
   const loreById = new Map(card.loreBook.entries.map((e) => [e.id, e]));
   const constantEntries = card.frozen.constantLoreIds
     .map((id) => loreById.get(id))
-    .filter((e): e is CompiledLoreEntry => Boolean(e && e.enabled && e.content.trim()));
+    .filter((e): e is CompiledLoreEntry => {
+      if (!e || !e.content.trim()) return false;
+      const effectiveEnabled = loreOverrides?.[e.id] ?? e.enabled;
+      return effectiveEnabled;
+    });
 
   const loreBeforeChar = constantEntries.filter((e) => e.position === 0);
   const loreAfterChar = constantEntries.filter((e) => e.position === 1);
@@ -278,6 +288,7 @@ export function buildZone3TransientTail(options: {
   lastUserMessage?: string;
   lastCharMessage?: string;
   narrativeHealth?: NarrativeHealthReport;
+  maxZone3Tokens?: number;
 }): string {
   const {
     card,
@@ -291,6 +302,7 @@ export function buildZone3TransientTail(options: {
     lastUserMessage,
     lastCharMessage,
     narrativeHealth,
+    maxZone3Tokens,
   } = options;
   const charName = card.identity.nickname || card.identity.name;
   const groupMembers = [charName, ...extraCastCards.map((c) => c.identity.nickname || c.identity.name)];
@@ -303,10 +315,26 @@ export function buildZone3TransientTail(options: {
     }
   }
 
-  // Collect dynamic outlet entries (position=7)
+  // Include constant lore entries with Zone 3 positions (2=an_top, 3=an_bottom, 4=in_chat/@D)
+  // so ST @D constant entries are never silently dropped!
+  const zone3ConstantLore = card.loreBook.entries.filter((e) => {
+    const effectiveEnabled = state.loreOverrides[e.id] ?? e.enabled;
+    return (
+      effectiveEnabled &&
+      e.constant &&
+      (e.position === 2 || e.position === 3 || e.position === 4) &&
+      e.content.trim().length > 0 &&
+      evaluateGate(e.gate, state)
+    );
+  });
+
+  // Collect dynamic outlet entries (position=7) and deduplicate Zone 3 constant + recalled lore
   const dynamicOutlets: Record<string, string> = {};
   const normalRecalledLore: CompiledLoreEntry[] = [];
-  for (const e of recalledLore) {
+  const seenLoreIds = new Set<string>();
+  for (const e of [...zone3ConstantLore, ...recalledLore]) {
+    if (seenLoreIds.has(e.id)) continue;
+    seenLoreIds.add(e.id);
     if (e.position === 7 && e.outletName) {
       const prev = dynamicOutlets[e.outletName];
       dynamicOutlets[e.outletName] = prev ? `${prev}\n${e.content}` : e.content;
@@ -328,7 +356,11 @@ export function buildZone3TransientTail(options: {
     lastCharMessage,
   };
 
-  const parts: string[] = [];
+  // Track sections with priority (1 = essential / never drop, 2 = important, 3 = droppable first under tight budget)
+  const sections: Array<{ text: string; priority: 1 | 2 | 3 }> = [];
+  const pushSection = (text: string, priority: 1 | 2 | 3) => {
+    if (text) sections.push({ text, priority });
+  };
 
   // 1. Deterministic <rp_state_frame>
   const activeFlags = Object.entries(state.flags)
@@ -370,25 +402,27 @@ export function buildZone3TransientTail(options: {
           )
         : undefined,
   };
-  parts.push(`<rp_state_frame>\n${stableStringify(compactState)}\n</rp_state_frame>`);
+  pushSection(`<rp_state_frame>\n${stableStringify(compactState)}\n</rp_state_frame>`, 1);
 
   // 1b. Last-round state delta highlight (ported from dsh-tavern foreground-variable-changes.js)
   const recentAudit = state.auditLog
     .filter((a) => a.turn >= Math.max(0, state.turn - 1) && a.summary.trim().length > 0)
     .slice(-8);
   if (recentAudit.length > 0) {
-    parts.push(
+    pushSection(
       `<rp_recent_changes>\nRecent state changes (write this turn respecting these latest values):\n${recentAudit
         .map((a) => `- [T${a.turn}] ${a.summary}`)
         .join("\n")}\n</rp_recent_changes>`,
+      3,
     );
   }
 
   // 2. Mid-session persona switch notice (keeps Zone 1 frozen)
   if (state.personaChangedMidSession) {
     const pDesc = state.currentPersona.description.trim();
-    parts.push(
+    pushSection(
       `<rp_persona_update>\nCurrent player persona is now: ${state.currentPersona.name}${pDesc ? ` — ${pDesc}` : ""}\n</rp_persona_update>`,
+      1,
     );
   }
 
@@ -469,7 +503,7 @@ export function buildZone3TransientTail(options: {
   }
 
   if (recalledSections.length > 0) {
-    parts.push(`<rp_recalled_context>\n${recalledSections.join("\n\n")}\n</rp_recalled_context>`);
+    pushSection(`<rp_recalled_context>\n${recalledSections.join("\n\n")}\n</rp_recalled_context>`, 1);
   }
 
   // 3b. Lightweight Worldbook Title Hints for budget-dropped entries (<=256 tokens, ported from dsh-tavern)
@@ -480,15 +514,16 @@ export function buildZone3TransientTail(options: {
     for (const item of budgetDroppedLore) {
       const title = Array.from(String(item.title || "").trim()).slice(0, 80).join("");
       if (!title || seenTitles.has(title)) continue;
-      const cost = Math.ceil(title.length * 1.45) + 2;
+      const cost = estimateTokens(title) + 2;
       if (usedHintTokens + cost > 256 || hintTitles.length >= 12) break;
       seenTitles.add(title);
       hintTitles.push(title);
       usedHintTokens += cost;
     }
     if (hintTitles.length > 0) {
-      parts.push(
+      pushSection(
         `<lorebook_title_hints>\n可能用到的世界书条目（超出预算未自动展开，如需细节可调用 rp_recall(action="read", query="标题") 按需查阅）：${hintTitles.join("、")}\n</lorebook_title_hints>`,
+        3,
       );
     }
   }
@@ -517,8 +552,9 @@ export function buildZone3TransientTail(options: {
     if (state.spatialNotes.trim()) {
       physLines.push(`- Space/Occlusion: ${state.spatialNotes.trim()}`);
     }
-    parts.push(
+    pushSection(
       `<rp_physical_scene>\nRespect physical continuity, line-of-sight, and audio occlusion (no teleportation or telepathic eavesdropping):\n${physLines.join("\n")}\n</rp_physical_scene>`,
+      2,
     );
   }
 
@@ -546,8 +582,9 @@ export function buildZone3TransientTail(options: {
     for (const bond of relevantBonds) {
       lwLines.push(`- NPC Bond (${bond.actorA} <-> ${bond.actorB}): ${bond.stance} (tension ${bond.tension}) — ${bond.note}`);
     }
-    parts.push(
+    pushSection(
       `<rp_living_world>\nBackground world continuity (off-screen agendas are narrator-only; never let ignorant present NPCs know them until revealed):\n${lwLines.join("\n")}\n</rp_living_world>`,
+      3,
     );
   }
 
@@ -568,8 +605,9 @@ export function buildZone3TransientTail(options: {
       const taboo = a.tabooBehaviors ? ` | never: ${a.tabooBehaviors}` : "";
       return `- ${a.actorId}: ${a.backbone}${quotes}${taboo}`;
     });
-    parts.push(
+    pushSection(
       `<rp_voice_anchors>\nMaintain distinct character speech cadence and non-negotiable backbone (never flatten into generic AI tone or unearned compliance):\n${vaLines.join("\n")}\n</rp_voice_anchors>`,
+      2,
     );
   }
 
@@ -624,13 +662,14 @@ export function buildZone3TransientTail(options: {
     ...state.notes.map((n) => `- ${n.text}`),
   ];
   if (noteLines.length > 0) {
-    parts.push(`<rp_director_note>\n${noteLines.join("\n")}\n</rp_director_note>`);
+    pushSection(`<rp_director_note>\n${noteLines.join("\n")}\n</rp_director_note>`, 1);
   }
 
   // 4b. Optional Inner Monologue cue (styled cleanly by Markdown transformer)
   if (state.innerMonologue) {
-    parts.push(
+    pushSection(
       `<rp_monologue_cue>\nBefore the visible narrative prose, briefly include 1-2 intimate sentences of the focal character's unspoken inner monologue wrapped in <thought>...</thought>. Keep it deeply in-character and never leak out-of-world meta commentary.\n</rp_monologue_cue>`,
+      1,
     );
   }
 
@@ -638,19 +677,38 @@ export function buildZone3TransientTail(options: {
   if (preset && preset.zone3Prompts.length > 0) {
     for (const p of preset.zone3Prompts) {
       const evaluated = evaluateMacros(p.content, macroCtx).trim();
-      if (evaluated) parts.push(evaluated);
+      if (evaluated) pushSection(evaluated, 1);
     }
   }
 
   // 6. Card depth_prompt & post_history_instructions (100% preserved at highest recency position)
   if (card.tailInstructions.depthPrompt?.content.trim()) {
-    parts.push(evaluateMacros(card.tailInstructions.depthPrompt.content, macroCtx).trim());
+    pushSection(evaluateMacros(card.tailInstructions.depthPrompt.content, macroCtx).trim(), 1);
   }
   if (card.tailInstructions.postHistoryInstructions.trim()) {
-    parts.push(evaluateMacros(card.tailInstructions.postHistoryInstructions, macroCtx).trim());
+    pushSection(evaluateMacros(card.tailInstructions.postHistoryInstructions, macroCtx).trim(), 1);
   }
 
-  return parts.join("\n\n");
+  // Enforce a total Zone 3 token budget cap by dropping lower-priority optional sections first
+  const zone3Cap = maxZone3Tokens ?? Math.max(6000, (state.loreTokenBudget || 1800) * 2 + 2400);
+  let totalTokens = sections.reduce((sum, s) => sum + estimateTokens(s.text), 0);
+  if (totalTokens > zone3Cap) {
+    const keepFlags = sections.map(() => true);
+    for (const dropPrio of [3, 2] as const) {
+      for (let i = sections.length - 1; i >= 0 && totalTokens > zone3Cap; i--) {
+        if (keepFlags[i] && sections[i]!.priority === dropPrio) {
+          keepFlags[i] = false;
+          totalTokens -= estimateTokens(sections[i]!.text);
+        }
+      }
+    }
+    return sections
+      .filter((_, idx) => keepFlags[idx])
+      .map((s) => s.text)
+      .join("\n\n");
+  }
+
+  return sections.map((s) => s.text).join("\n\n");
 }
 
 /**

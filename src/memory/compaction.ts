@@ -23,9 +23,26 @@ function extractMessagePlainText(msg: PiMessage): string {
   return "";
 }
 
+function stripCompactionNoise(raw: string): string {
+  return raw
+    .replace(/<(?:think|thinking|thought|reasoning)\b[^>]*>[\s\S]*?<\/(?:think|thinking|thought|reasoning)\s*>/gi, "")
+    .replace(/<rp_state_frame>[\s\S]*?<\/rp_state_frame>/gi, "")
+    .replace(/<rp_recalled_context>[\s\S]*?<\/rp_recalled_context>/gi, "")
+    .replace(/<rp_director_note>[\s\S]*?<\/rp_director_note>/gi, "")
+    .replace(/<lorebook_title_hints>[\s\S]*?<\/lorebook_title_hints>/gi, "")
+    .replace(/<rp_recent_changes>[\s\S]*?<\/rp_recent_changes>/gi, "")
+    .replace(/<rp_voice_anchors>[\s\S]*?<\/rp_voice_anchors>/gi, "")
+    .replace(/<rp_physical_scene>[\s\S]*?<\/rp_physical_scene>/gi, "")
+    .replace(/<rp_living_world>[\s\S]*?<\/rp_living_world>/gi, "")
+    .replace(/<rp_persona_update>[\s\S]*?<\/rp_persona_update>/gi, "")
+    .replace(/<rp_monologue_cue>[\s\S]*?<\/rp_monologue_cue>/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 /** Condense a slice of historical Pi messages into compact narrative beat bullets (local deterministic fallback). */
 export function condenseMessagesToBeats(messages: PiMessage[] | undefined, maxBeats = 10): string {
-  if (!messages || messages.length === 0) return "";
+  if (!messages || messages.length === 0 || maxBeats <= 0) return "";
   const dialog = messages.filter(
     (m) => (m.role === "user" || m.role === "assistant") && m.customType !== "rp:ooc" && m.customType !== "rp:event",
   );
@@ -34,6 +51,8 @@ export function condenseMessagesToBeats(messages: PiMessage[] | undefined, maxBe
   const picked: PiMessage[] = [];
   if (dialog.length <= maxBeats) {
     picked.push(...dialog);
+  } else if (maxBeats === 1) {
+    picked.push(dialog[dialog.length - 1]!);
   } else {
     const step = (dialog.length - 1) / (maxBeats - 1);
     for (let i = 0; i < maxBeats; i++) {
@@ -43,12 +62,7 @@ export function condenseMessagesToBeats(messages: PiMessage[] | undefined, maxBe
 
   const lines: string[] = [];
   for (const m of picked) {
-    const clean = extractMessagePlainText(m)
-      .replace(/<rp_state_frame>[\s\S]*?<\/rp_state_frame>/gi, "")
-      .replace(/<rp_recalled_context>[\s\S]*?<\/rp_recalled_context>/gi, "")
-      .replace(/<rp_director_note>[\s\S]*?<\/rp_director_note>/gi, "")
-      .replace(/\s+/g, " ")
-      .trim();
+    const clean = stripCompactionNoise(extractMessagePlainText(m));
     if (!clean) continue;
     const tag = m.role === "user" ? "玩家" : "叙事";
     lines.push(`- [${tag}] ${clean.slice(0, 140)}${clean.length > 140 ? "…" : ""}`);
@@ -62,6 +76,7 @@ export function buildMemSceneCompactionSummary(
     messagesToSummarize?: PiMessage[];
     previousSummary?: string;
     droppedMessagesSummary?: string;
+    signal?: AbortSignal;
   },
 ): string {
   const lines: string[] = [
@@ -128,6 +143,7 @@ export function buildMemSceneCompactionSummary(
 /**
  * Semantic LLM-powered EverMemOS MemScene Compaction for `session_before_compact`.
  * Uses `state.sidecarModel` (or `ctx.model`) to synthesize causal plot progression instead of hard 140-char truncation.
+ * Preserves newest messages via head + tail budget allocation so recent beats are never truncated away.
  * Always falls back safely to `buildMemSceneCompactionSummary` on error/timeout/offline.
  */
 export async function buildSemanticMemSceneCompaction(
@@ -148,26 +164,51 @@ export async function buildSemanticMemSceneCompaction(
     return buildMemSceneCompactionSummary(state, options);
   }
 
-  // Build compact transcript capped to ~8000 chars so compaction stays fast and cheap
-  const lines: string[] = [];
-  let charBudget = 8000;
+  const allSnippets: string[] = [];
   for (const m of dialog) {
-    const clean = extractMessagePlainText(m)
-      .replace(/<rp_state_frame>[\s\S]*?<\/rp_state_frame>/gi, "")
-      .replace(/<rp_recalled_context>[\s\S]*?<\/rp_recalled_context>/gi, "")
-      .replace(/<rp_director_note>[\s\S]*?<\/rp_director_note>/gi, "")
-      .replace(/\s+/g, " ")
-      .trim();
+    const clean = stripCompactionNoise(extractMessagePlainText(m));
     if (!clean) continue;
     const speaker = m.role === "user" ? state.currentPersona.name : "叙事";
-    const snippet = `[${speaker}] ${clean.slice(0, 420)}`;
-    if (charBudget - snippet.length < 0) break;
-    charBudget -= snippet.length;
-    lines.push(snippet);
+    allSnippets.push(`[${speaker}] ${clean.slice(0, 420)}`);
   }
 
-  if (lines.length === 0) {
+  if (allSnippets.length === 0) {
     return buildMemSceneCompactionSummary(state, options);
+  }
+
+  // Head + Tail budget allocation (~8000 chars total: 2000 head + 6000 tail) so newest messages are ALWAYS preserved!
+  const TOTAL_BUDGET = 8000;
+  const HEAD_BUDGET = 2000;
+  const TAIL_BUDGET = TOTAL_BUDGET - HEAD_BUDGET;
+
+  const totalChars = allSnippets.reduce((sum, s) => sum + s.length, 0);
+  let lines: string[];
+  if (totalChars <= TOTAL_BUDGET) {
+    lines = allSnippets;
+  } else {
+    const head: string[] = [];
+    let headUsed = 0;
+    let headCount = 0;
+    for (let i = 0; i < allSnippets.length; i++) {
+      const s = allSnippets[i]!;
+      if (headUsed + s.length > HEAD_BUDGET && head.length > 0) break;
+      head.push(s);
+      headUsed += s.length;
+      headCount = i + 1;
+    }
+
+    const tail: string[] = [];
+    let tailUsed = 0;
+    for (let i = allSnippets.length - 1; i >= headCount; i--) {
+      const s = allSnippets[i]!;
+      if (tailUsed + s.length > TAIL_BUDGET && tail.length > 0) break;
+      tail.push(s);
+      tailUsed += s.length;
+    }
+    tail.reverse();
+
+    const omitted = allSnippets.length - head.length - tail.length;
+    lines = omitted > 0 ? [...head, `[... ${omitted} earlier turns omitted ...]`, ...tail] : [...head, ...tail];
   }
 
   try {
