@@ -98,7 +98,7 @@ function buildEngineProtocol(
     toolHints.push("`rp_fact_commit` for major new/invalidated facts, character belief shifts, or planted/resolved foresights");
   }
   if (has("rp_recall")) {
-    toolHints.push("`rp_recall` to search/read worldbook or archived facts");
+    toolHints.push("`rp_recall(action=\"list\"|\"read\"|\"search\")` to browse/read giant character card chapters, worldbook entries, or archived facts whenever a TOC item needs verbatim details");
   }
   if (has("rp_history_recall")) {
     toolHints.push("`rp_history_recall` to recall exact earlier dialogue turns");

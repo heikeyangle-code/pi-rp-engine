@@ -18,7 +18,7 @@ import { canonicalizeActorName, isNonCharacterEntity, sanitizeNpcList } from "./
 import { makeRouteId, normalizePlaceName } from "./world-sim.js";
 import { findSupersededFactsForStatement } from "../memory/bitemporal.js";
 import { validateCfsmTransition } from "./cfsm.js";
-import { computeCalendarAnchor, parseTimeSpan } from "./temporal.js";
+import { buildContinuityDirective, computeCalendarAnchor, detectLifespanProfile, parseTimeSpan } from "./temporal.js";
 import type { EntityRegistry } from "../memory/entity-registry.js";
 
 const DELTA_OPEN_RE = /\[\[RP_DELTA\]\]/i;
@@ -82,6 +82,7 @@ export function parseAndValidateInlineDelta(
   rawBlock: string,
   state: SessionRpState,
   registry?: EntityRegistry,
+  worldContextText?: string,
 ): ParsedDeltaResult {
   const txs: RpTxEntry[] = [];
   const applied: string[] = [];
@@ -128,6 +129,15 @@ export function parseAndValidateInlineDelta(
         }
       }
       txs.push({ kind: "clock_tick", beatDelta: 0, dayDelta, worldTimeLabel: nextLabel });
+      if (span.years >= 15) {
+        const lifespan = detectLifespanProfile(worldContextText || state.worldTimeLabel || "");
+        const mode = lifespan === "mortal" && span.years >= 50 ? "generational_legacy" : "natural_aging";
+        const directive = buildContinuityDirective(mode, span.years, lifespan);
+        txs.push({
+          kind: "note_set",
+          note: { id: `temporal_guard_t${state.turn}`, text: directive, remainingTurns: 2 },
+        });
+      }
       applied.push(`time=${nextLabel}`);
       continue;
     }

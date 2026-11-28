@@ -191,6 +191,24 @@ export function inferHeuristicWorldProfile(input: {
     initialPresentNpcs: [],
     initialInventory: [],
     suggestedCfsmAxes: [],
+    initialStorylets: (() => {
+      const seeds: NonNullable<CardWorldProfile["initialStorylets"]> = [];
+      const combined = `${input.description.slice(0, 12000)}\n${input.scenario}\n${input.firstMes}`;
+      const hookLines = combined
+        .split(/[\n。！？]/)
+        .map((l) => l.trim())
+        .filter((l) => l.length >= 12 && l.length <= 90 && /(?:秘密|冤案|阴谋|危机|伏笔|暗中|追查|失踪|契约|悬念|禁令|死因|真相|刺杀|背叛)/.test(l));
+      for (const line of hookLines.slice(0, 2)) {
+        const cleanTitle = line.replace(/^[#\-*•\s【】]+/, "").slice(0, 18);
+        seeds.push({
+          title: `线索：${cleanTitle}`,
+          triggerPrompt: `当剧情推进至相关人物或地点时，自然引出并深化这一悬念：${line}`,
+          gate: { minTurn: 4 },
+          oneTime: true,
+        });
+      }
+      return seeds.length > 0 ? seeds : undefined;
+    })(),
     entityAliases: {},
     suggestedLoreGates: [],
     source: "heuristic",

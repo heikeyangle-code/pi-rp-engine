@@ -248,6 +248,7 @@ export function maybeBuildAutoSceneChapter(
   prevLocation: string,
   prevEra: string,
   recentProseHighlight?: string,
+  branchMessages?: PiMessage[],
 ): MemoryBookEntry | null {
   if (!state.active || state.turn < 5) return null;
 
@@ -292,6 +293,15 @@ export function maybeBuildAutoSceneChapter(
   const bullets = [...sliceFacts, ...sliceHooks, ...sliceEchoes];
   if (bullets.length === 0 && sliceAudit.length > 0) {
     bullets.push(...sliceAudit.slice(0, 4));
+  }
+  if (bullets.length === 0 && branchMessages && branchMessages.length > 0) {
+    const recentSlice = branchMessages.slice(-Math.min(12, span * 2));
+    const condensed = condenseMessagesToBeats(recentSlice, 4);
+    if (condensed) {
+      for (const line of condensed.split("\n").filter(Boolean)) {
+        bullets.push(line.replace(/^-\s*/, ""));
+      }
+    }
   }
   if (bullets.length === 0 && recentProseHighlight && recentProseHighlight.trim().length >= 16) {
     bullets.push(`在「${label}」的关键情节：${recentProseHighlight.replace(/\s+/g, " ").trim().slice(0, 260)}`);

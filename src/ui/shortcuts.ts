@@ -25,6 +25,7 @@ export const RP_SHORTCUT_LIST: RpShortcutSpec[] = [
   { key: "alt+q", label: "场外提问", description: "零污染场外提问" },
   { key: "alt+o", label: "导演指令", description: "管理导演指令" },
   { key: "alt+x", label: "检索透视", description: "查看上下文与召回透视 (X-Ray)" },
+  { key: "alt+y", label: "知识图谱", description: "打开卡体知识库与实体图谱" },
 ];
 
 export interface RpShortcutHandlers {
@@ -40,6 +41,7 @@ export interface RpShortcutHandlers {
   directorNote(ctx: PiExtensionContext): Promise<void>;
   // Optional legacy handler slots kept for backward compatibility with callers
   openXRay?(ctx: PiExtensionContext): Promise<void>;
+  openKnowledge?(ctx: PiExtensionContext): Promise<void>;
   actionIdeas?(ctx: PiExtensionContext): Promise<void>;
   cyclePacing?(ctx: PiExtensionContext): Promise<void>;
   styleControl?(ctx: PiExtensionContext): Promise<void>;
@@ -129,5 +131,19 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
   pi.registerShortcut("alt+o", {
     description: "🎬 导演指令",
     handler: requireActive((ctx) => handlers.directorNote(ctx)),
+  });
+
+  pi.registerShortcut("alt+x", {
+    description: "🔍 检索透视",
+    handler: requireActive((ctx) =>
+      handlers.openXRay ? handlers.openXRay(ctx) : handlers.openDashboard(ctx),
+    ),
+  });
+
+  pi.registerShortcut("alt+y", {
+    description: "🧠 知识图谱",
+    handler: requireActive((ctx) =>
+      handlers.openKnowledge ? handlers.openKnowledge(ctx) : handlers.openDashboard(ctx),
+    ),
   });
 }

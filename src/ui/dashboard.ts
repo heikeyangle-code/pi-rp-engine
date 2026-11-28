@@ -1496,7 +1496,10 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
       return `▪ #${i + 1} [T${f.validFromTurn}]${vis} ${f.statement.slice(0, 38)}`;
     });
     const hookRows = openHooks.map((h, i) => `◇ 伏笔 #${i + 1}：${h.summary.slice(0, 38)}`);
+    const cardForKi = rt.getCard();
+    const kiStats = cardForKi?.knowledgeIndex;
     const options: string[] = [
+      `🧠 卡体知识库与实体图谱（${kiStats ? `${kiStats.chapters.length} 章 · ${kiStats.entities.length} 实体` : "查看"}）`,
       `🗂 世界书管理（${getAllLore(rt).length} 条）`,
       `📚 记忆书归档章节（${s.memoryBooks.size} 章）`,
       `🌀 因果回响（待触发 ${Array.from(s.consequences.values()).filter((e) => e.status === "pending").length} · 共 ${s.consequences.size} 条）`,
@@ -1533,6 +1536,10 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     }
     if (pick.startsWith("◇ 人物信念")) {
       await openBeliefsManager(rt, ctx);
+      continue;
+    }
+    if (pick.startsWith("🧠")) {
+      await openCardKnowledgeInspector(rt, ctx);
       continue;
     }
     if (pick.startsWith("🗂 世界书")) {
@@ -2530,8 +2537,9 @@ export async function openRpDashboard(
       `3. 👥 人物与关系（马甲：${personaShort}）`,
       `4. 📖 记忆与世界书（事实 ${activeFactsList.length} · 因果 ${pendingEchoes} · 书 ${getAllLore(rt).length}）`,
       `5. 🎬 导演台与设置（节奏：${PACING_ZH[s.pacingMode]} · 风格 · 存档）`,
+      `6. 🧠 知识库与实体图谱（${card?.knowledgeIndex ? `${card.knowledgeIndex.chapters.length} 章 · ${card.knowledgeIndex.entities.length} 实体` : "检视"}）`,
       ...(lastUndoable ? [`↩ 撤销上次变更（${clipChars(formatUndoSummary(lastUndoable.summary), 20)}）`] : []),
-      "6. 🚪 退出本会话角色扮演",
+      "7. 🚪 退出本会话角色扮演",
     ]);
 
     if (!choice || choice.startsWith("✕")) return;
@@ -2544,7 +2552,8 @@ export async function openRpDashboard(
     else if (choice.startsWith("3.")) await openCharactersSection(rt, ctx);
     else if (choice.startsWith("4.")) { if ((await openMemoryBookSection(rt, ctx)) === "close") return; }
     else if (choice.startsWith("5.")) { if ((await openNotesAndPacing(rt, ctx)) === "close") return; }
-    else if (choice.startsWith("6.")) {
+    else if (choice.startsWith("6.")) await openCardKnowledgeInspector(rt, ctx);
+    else if (choice.startsWith("7.")) {
       await rt.exitRp(ctx, true);
       return;
     }

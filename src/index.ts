@@ -87,7 +87,7 @@ import {
   bindCardToCurrentSession,
 } from "./ui/actions.js";
 import { makeDashboardRuntime, openRpMenu, registerRpCommands } from "./ui/commands.js";
-import { openRpDashboard } from "./ui/dashboard.js";
+import { openCardKnowledgeInspector, openRpDashboard } from "./ui/dashboard.js";
 import { registerRpShortcuts } from "./ui/shortcuts.js";
 
 function extractMessageText(msg: PiMessage | undefined): string {
@@ -487,6 +487,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     openDashboard: (ctx) => openRpDashboard(makeDashboardRuntime(runtime), ctx),
     quickReplies: (ctx) => actionQuickReplies(runtime, ctx, ""),
     openXRay: (ctx) => actionXRay(runtime, ctx),
+    openKnowledge: (ctx) => openCardKnowledgeInspector(makeDashboardRuntime(runtime), ctx),
     impersonate: (ctx) => actionImpersonate(runtime, ctx, ""),
     sidePrompt: (ctx) => actionSidePrompt(runtime, ctx, ""),
     rerollLast: (ctx) => actionReroll(runtime, ctx, ""),
@@ -1105,7 +1106,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       }
       if (rawBlock) {
         const turnRegistry = buildEntityRegistry({ card: activeCard, extraCastCards, state });
-        const parsedDelta = parseAndValidateInlineDelta(rawBlock, state, turnRegistry);
+        const worldContextText = `${activeCard.frozen.description.slice(0, 4000)}\n${activeCard.frozen.scenario.slice(0, 1000)}`;
+        const parsedDelta = parseAndValidateInlineDelta(rawBlock, state, turnRegistry, worldContextText);
         for (const dtx of parsedDelta.txs) {
           commitTx(dtx);
         }
@@ -1127,7 +1129,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
 
     // Automatic Episodic -> Semantic Scene Consolidation (zero LLM cost)
     if (!thisTurnOoc) {
-      const autoChapter = maybeBuildAutoSceneChapter(state, prevLocBeforeDelta, prevEraBeforeDelta, lastAssistantText);
+      const branchMsgs: PiMessage[] = (ctx?.sessionManager?.getBranch?.() ?? []).flatMap((e) => (e.type === "message" && e.message ? [e.message] : []));
+      const autoChapter = maybeBuildAutoSceneChapter(state, prevLocBeforeDelta, prevEraBeforeDelta, lastAssistantText, branchMsgs);
       if (autoChapter) {
         commitTx({ kind: "memory_book_upsert", entry: autoChapter });
       }
