@@ -24,6 +24,7 @@ import type {
   PiExtensionContext,
   SalvagedVariable,
   StoryletEntry,
+  VoiceAnchor,
   WorldProfileModules,
 } from "../types.js";
 import { completeWithRegistry, extractJsonObject, resolveSidecarModel } from "../engine/llm-helper.js";
@@ -86,6 +87,48 @@ function parseGateFromRaw(r: Record<string, unknown>): GateCondition | undefined
     if (checks.length > 0) gate.statChecks = checks;
   }
   return Object.keys(gate).length > 0 ? gate : undefined;
+}
+
+
+/**
+ * L0 Zero-LLM Voice & Backbone Anchor Extractor (ContextEcho / Three-Years-ST mitigation):
+ * Pulls 2-3 verbatim quoted dialogue samples from mes_example/first_mes + a concise backbone summary
+ * so EVERY card immediately gets anti-drift voice anchoring without waiting for `/rp analyze`.
+ */
+export function extractHeuristicVoiceAnchor(card: CompiledCard): VoiceAnchor | null {
+  const actorId = (card.identity.nickname || card.identity.name || "").trim();
+  if (!actorId) return null;
+
+  const samples: string[] = [];
+  const seen = new Set<string>();
+  const sources = [card.frozen.mesExample, card.greetings.firstMes];
+  const quoteRe = /[「“"]([^「」“”"\n]{6,68})[」”"]/g;
+  for (const src of sources) {
+    if (!src) continue;
+    let m: RegExpExecArray | null;
+    while ((m = quoteRe.exec(src)) !== null) {
+      const q = m[1]!.replace(/\s+/g, " ").trim();
+      if (!q || seen.has(q) || /^\[/.test(q)) continue;
+      seen.add(q);
+      samples.push(q);
+      if (samples.length >= 3) break;
+    }
+    if (samples.length >= 3) break;
+  }
+
+  const rawPersonality = (card.frozen.personality || card.frozen.description || "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const backbone = rawPersonality
+    ? rawPersonality.split(/[。！？.!?;；]/).filter((x) => x.trim().length >= 6).slice(0, 2).join("；").slice(0, 120)
+    : "";
+
+  if (samples.length === 0 && !backbone) return null;
+  return {
+    actorId,
+    speechSamples: samples,
+    backbone: backbone || `严格保持「${actorId}」原有立场、防备心与说话口吻，绝不无端讨好或退化成通用 AI 腔。`,
+  };
 }
 
 export function buildAnalyzePrompt(card: CompiledCard): { systemPrompt: string; userPrompt: string } {
@@ -162,6 +205,14 @@ Return ONLY a strict JSON object (no markdown fences, no commentary) matching th
     }
   ],
   "initialClocks": [{ "clockId": string, "label": string, "value": number, "max": number }],
+  "voiceAnchors": [
+    {
+      "actorId": "<npcName>",
+      "speechSamples": ["<verbatim short dialogue line 1>", "<line 2>"],
+      "backbone": "<core non-negotiable stance / self-interest / anti-sycophancy boundary>",
+      "tabooBehaviors": "<what this character would NEVER do out of character>"
+    }
+  ],
   "entityAliases": { "<canonicalName>": ["<alias1>", "<alias2>"] },
   "suggestedLoreGates": [
     {
@@ -480,6 +531,28 @@ export function parseAnalyzeResponse(rawText: string, card: CompiledCard): Analy
       initialForesights: initialForesights.length > 0 ? initialForesights : undefined,
       initialStorylets: initialStorylets.length > 0 ? initialStorylets : undefined,
       initialClocks: initialClocks.length > 0 ? initialClocks : undefined,
+      voiceAnchors: (() => {
+        const out: VoiceAnchor[] = [];
+        if (Array.isArray(parsed.voiceAnchors)) {
+          for (const row of parsed.voiceAnchors) {
+            if (!row || typeof row !== "object") continue;
+            const r = row as Record<string, unknown>;
+            const actorId = asOptStr(r.actorId);
+            const backbone = asOptStr(r.backbone);
+            const speechSamples = Array.isArray(r.speechSamples)
+              ? r.speechSamples.map((x) => String(x).trim()).filter(Boolean).slice(0, 3)
+              : [];
+            if (!actorId || (!backbone && speechSamples.length === 0)) continue;
+            out.push({
+              actorId,
+              speechSamples,
+              backbone: backbone ?? "",
+              tabooBehaviors: asOptStr(r.tabooBehaviors),
+            });
+          }
+        }
+        return out.length > 0 ? out : undefined;
+      })(),
       entityAliases,
       suggestedLoreGates,
       source: "llm-analyzed",

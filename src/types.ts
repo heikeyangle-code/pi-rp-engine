@@ -334,6 +334,7 @@ export interface CardWorldProfile {
     max: number;
   }>;
   entityAliases: Record<string, string[]>;
+  voiceAnchors?: VoiceAnchor[];
   suggestedLoreGates: Array<{ entryId: string; title: string; gate: GateCondition; reason: string }>;
   source: "heuristic" | "llm-analyzed";
 }
@@ -655,6 +656,52 @@ export interface ContextXRaySnapshot {
   stagnantTurns?: number;
 }
 
+
+export interface VoiceAnchor {
+  actorId: string;
+  /** 2-3 verbatim short dialogue samples capturing cadence, slang, and speech rhythm */
+  speechSamples: string[];
+  /** Non-negotiable core stance / self-interest / anti-sycophancy boundary */
+  backbone: string;
+  /** Behaviors this character will NEVER do out of character */
+  tabooBehaviors?: string;
+}
+
+export interface PhysicalSnapshot {
+  actorId: string;
+  attire?: string;
+  condition?: string;
+  holding?: string;
+  position?: string;
+  updatedTurn: number;
+}
+
+export interface NpcAgenda {
+  actorId: string;
+  goal: string;
+  currentActivity: string;
+  /** Optional countdown turns until arrival / off-screen milestone triggers (0 = due now) */
+  etaTurns?: number | null;
+  updatedTurn: number;
+}
+
+export interface NpcPairBond {
+  id: string;
+  actorA: string;
+  actorB: string;
+  stance: string;
+  tension: number;
+  note: string;
+  updatedTurn: number;
+}
+
+export interface EmbeddingConfig {
+  enabled: boolean;
+  endpoint: string;
+  model: string;
+  apiKey?: string;
+}
+
 export type SettlementMode = "off" | "tool-assisted" | "sidecar-light";
 export type HudMode = "minimal" | "full" | "off";
 export type PacingMode = "relaxed" | "balanced" | "dramatic";
@@ -749,6 +796,13 @@ export type RpTxEntry =
       initialStage?: string;
       initialTime?: string;
     }
+  | { kind: "voice_anchor_upsert"; anchor: VoiceAnchor }
+  | { kind: "voice_anchor_delete"; actorId: string }
+  | { kind: "physical_patch"; snapshot: PhysicalSnapshot; spatialNotes?: string; reason?: string }
+  | { kind: "agenda_upsert"; agenda: NpcAgenda }
+  | { kind: "agenda_delete"; actorId: string }
+  | { kind: "pair_bond_upsert"; bond: NpcPairBond }
+  | { kind: "pair_bond_delete"; id: string }
   | { kind: "lore_runtime"; sticky: Record<string, number>; cooldown: Record<string, number>; consumedOneShots: string[] };
 
 export interface SessionRpState {
@@ -807,5 +861,11 @@ export interface SessionRpState {
   loreConsumedOneShots: Set<string>;
   /** Turn index of last meaningful world mutation (used by real stagnation detector) */
   lastMeaningfulProgressTurn: number;
+  initialLocation: string;
+  voiceAnchors: Record<string, VoiceAnchor>;
+  physicalState: Record<string, PhysicalSnapshot>;
+  spatialNotes: string;
+  npcAgendas: Record<string, NpcAgenda>;
+  pairBonds: Record<string, NpcPairBond>;
   auditLog: TxAuditRecord[];
 }

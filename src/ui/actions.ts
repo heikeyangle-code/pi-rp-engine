@@ -32,7 +32,7 @@ import type {
 } from "../types.js";
 import { unpackFile } from "../parser/unpack.js";
 import { compileCharacterCard } from "../parser/card-compiler.js";
-import { analyzeCardWithModel, applyAnalyzedProfileToCard } from "../parser/analyzer.js";
+import { analyzeCardWithModel, applyAnalyzedProfileToCard, extractHeuristicVoiceAnchor } from "../parser/analyzer.js";
 import { compileLoreBook } from "../parser/lore-compiler.js";
 import { compileSillyTavernPreset } from "../parser/preset.js";
 import { evaluateMacros } from "../parser/macros.js";
@@ -333,6 +333,19 @@ export function hydrateWorldProfileAndVariables(
           max: ck.max,
         });
       }
+    }
+  }
+
+  // 7b. Voice & Backbone Anchors (L1 /rp analyze or zero-cost L0 heuristic fallback)
+  const anchorsToHydrate = wp?.voiceAnchors && wp.voiceAnchors.length > 0
+    ? wp.voiceAnchors
+    : (() => {
+        const h = extractHeuristicVoiceAnchor(card);
+        return h ? [h] : [];
+      })();
+  for (const va of anchorsToHydrate) {
+    if (!rt.getState().voiceAnchors[va.actorId]) {
+      rt.commitTx({ kind: "voice_anchor_upsert", anchor: va });
     }
   }
 

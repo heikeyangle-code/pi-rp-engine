@@ -21,9 +21,12 @@ import {
   type HistoryRecallCooldown,
   type HistoryRecallTurnScope,
   createTurnRecallScope,
+  extractCommittedRounds,
   recallHistory,
   renderHistoryRecall,
 } from "../memory/history-recall.js";
+import { rankBySemanticSimilarity, reciprocalRankFusion } from "../memory/embedding.js";
+import { loadUiPrefs } from "../ui/file-picker.js";
 import { isFactVisibleToActor } from "../engine/gates.js";
 import { createLinesComponent, styleBold, styleDim, styleFg, wrapDisplayLine } from "../ui/renderers.js";
 
@@ -234,6 +237,22 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             required: ["actor", "axis", "to"],
           },
         },
+
+        physical: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              actor: { type: "string" },
+              attire: { type: "string" },
+              condition: { type: "string" },
+              holding: { type: "string" },
+              position: { type: "string" },
+            },
+            required: ["actor"],
+          },
+        },
+        spatial_notes: { type: "string", description: "Room layout, visibility, or audio occlusion notes" },
       },
     },
     renderCall(args, theme) {
@@ -387,6 +406,36 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           rt.commitTx({ kind: "cfsm_transition", actorId, axis, from, to, reason, turn: state.turn });
           applied.push(`cfsm ${actorId}.${axis}: ${from}->${to}`);
         }
+      }
+
+      const spatialNote = typeof params.spatial_notes === "string" ? params.spatial_notes.trim() : undefined;
+      if (Array.isArray(params.physical)) {
+        for (const ph of params.physical as Array<Record<string, unknown>>) {
+          const actorId = String(ph.actor ?? "").trim();
+          if (!actorId) continue;
+          rt.commitTx({
+            kind: "physical_patch",
+            snapshot: {
+              actorId,
+              attire: typeof ph.attire === "string" ? ph.attire.trim() || undefined : undefined,
+              condition: typeof ph.condition === "string" ? ph.condition.trim() || undefined : undefined,
+              holding: typeof ph.holding === "string" ? ph.holding.trim() || undefined : undefined,
+              position: typeof ph.position === "string" ? ph.position.trim() || undefined : undefined,
+              updatedTurn: state.turn,
+            },
+            spatialNotes: spatialNote,
+            reason: "tool",
+          });
+          applied.push(`physical[${actorId}]`);
+        }
+      } else if (spatialNote !== undefined) {
+        rt.commitTx({
+          kind: "physical_patch",
+          snapshot: { actorId: "", updatedTurn: state.turn },
+          spatialNotes: spatialNote,
+          reason: "tool",
+        });
+        applied.push("spatial_notes");
       }
 
       rt.refreshHud(ctx);
@@ -825,6 +874,31 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           cacheScopeId: state.cardSlug ?? "rp",
         });
         rt.setHistoryRecallCooldowns?.(nextCooldowns);
+
+        // Optional Hybrid Semantic RRF fusion when Embedding endpoint is configured in Settings
+        const embCfg = loadUiPrefs().embeddingConfig;
+        if (result.mode === "search" && embCfg?.enabled && typeof params.query === "string" && params.query.trim()) {
+          const allRounds = extractCommittedRounds(branch);
+          const docs = allRounds.map((r) => r.messages.map((m) => m.text).join("\n").slice(0, 1200));
+          const semRanked = await rankBySemanticSimilarity(embCfg, params.query.trim(), docs, 0.28);
+          if (semRanked && semRanked.length > 0) {
+            const bm25Turns = result.matches.map((m) => m.turn);
+            const semTurns = semRanked.slice(0, 8).map((x) => allRounds[x.index]!.turn);
+            const fused = reciprocalRankFusion(bm25Turns, semTurns);
+            const existingByTurn = new Map(result.matches.map((m) => [m.turn, m]));
+            const maxOut = Math.min(8, Math.max(1, Number(params.limit) || 5));
+            const mergedMatches = fused.slice(0, maxOut).map(({ id: t }) => {
+              const ex = existingByTurn.get(t);
+              if (ex) return ex;
+              const round = allRounds.find((r) => r.turn === t);
+              const snippet = round ? round.messages.map((m) => m.text).join(" ").replace(/\s+/g, " ").slice(0, 220) : "";
+              return { turn: t, excerpt: `〔语义召回〕${snippet}` };
+            });
+            result.matches = mergedMatches;
+            if (mergedMatches.length > 0) result.found = true;
+          }
+        }
+
         return {
           content: [{ type: "text", text: renderHistoryRecall(result) }],
           details: {

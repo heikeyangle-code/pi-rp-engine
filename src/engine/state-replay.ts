@@ -103,6 +103,12 @@ export function createInitialRpState(): SessionRpState {
     loreCooldown: {},
     loreConsumedOneShots: new Set<string>(),
     lastMeaningfulProgressTurn: 0,
+    initialLocation: "",
+    voiceAnchors: {},
+    physicalState: {},
+    spatialNotes: "",
+    npcAgendas: {},
+    pairBonds: {},
     auditLog: [],
   };
 }
@@ -235,6 +241,11 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         state.notes = state.notes
           .map((n) => (n.remainingTurns === null ? n : { ...n, remainingTurns: n.remainingTurns - 1 }))
           .filter((n) => n.remainingTurns === null || n.remainingTurns > 0);
+        for (const ag of Object.values(state.npcAgendas)) {
+          if (typeof ag.etaTurns === "number" && ag.etaTurns > 0) {
+            ag.etaTurns = Math.max(0, ag.etaTurns - 1);
+          }
+        }
       }
       if (tx.dayDelta) state.day += tx.dayDelta;
       if (tx.worldTimeLabel !== undefined) state.worldTimeLabel = tx.worldTimeLabel;
@@ -245,6 +256,9 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     case "location_set": {
       const prevLoc = state.location;
       const prevNpcs = [...state.presentNpcs];
+      if (!state.initialLocation && tx.location.trim()) {
+        state.initialLocation = tx.location.trim();
+      }
       state.location = tx.location;
       state.presentNpcs = [...tx.presentNpcs];
       if (prevLoc !== tx.location || prevNpcs.join("|") !== tx.presentNpcs.join("|")) {
@@ -566,6 +580,84 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       state.modules = { ...tx.modules };
       if (tx.initialStage && !state.era) state.era = tx.initialStage;
       if (tx.initialTime && !state.worldTimeLabel) state.worldTimeLabel = tx.initialTime;
+      break;
+
+    case "voice_anchor_upsert": {
+      const actor = tx.anchor.actorId.trim();
+      if (!actor) break;
+      state.voiceAnchors[actor] = {
+        actorId: actor,
+        speechSamples: tx.anchor.speechSamples.map((x) => x.trim()).filter(Boolean).slice(0, 4),
+        backbone: tx.anchor.backbone.trim(),
+        tabooBehaviors: tx.anchor.tabooBehaviors?.trim() || undefined,
+      };
+      break;
+    }
+
+    case "voice_anchor_delete":
+      delete state.voiceAnchors[tx.actorId];
+      break;
+
+    case "physical_patch": {
+      const actor = tx.snapshot.actorId.trim();
+      if (actor) {
+        const prev = state.physicalState[actor] ? { ...state.physicalState[actor]! } : undefined;
+        const prevSpatial = state.spatialNotes;
+        const merged = {
+          ...(prev ?? { actorId: actor, updatedTurn: state.turn }),
+          ...tx.snapshot,
+          actorId: actor,
+          updatedTurn: tx.snapshot.updatedTurn ?? state.turn,
+        };
+        state.physicalState[actor] = merged;
+        if (tx.spatialNotes !== undefined) state.spatialNotes = tx.spatialNotes.trim();
+        const details = [merged.attire, merged.condition, merged.holding, merged.position].filter(Boolean).join(" / ");
+        pushAudit(state, {
+          summary: `状态外貌 ${actor}: ${details.slice(0, 42) || "更新"}`,
+          source: inferSourceFromReason(tx.reason),
+          undoTx: prev
+            ? { kind: "physical_patch", snapshot: prev, spatialNotes: prevSpatial, reason: "undo" }
+            : undefined,
+        });
+      } else if (tx.spatialNotes !== undefined) {
+        state.spatialNotes = tx.spatialNotes.trim();
+      }
+      break;
+    }
+
+    case "agenda_upsert": {
+      const actor = tx.agenda.actorId.trim();
+      if (!actor) break;
+      state.npcAgendas[actor] = { ...tx.agenda, actorId: actor };
+      state.lastMeaningfulProgressTurn = state.turn;
+      pushAudit(state, {
+        summary: `日程 ${actor}: ${tx.agenda.currentActivity.slice(0, 32)}`,
+        source: "sidecar",
+        undoTx: { kind: "agenda_delete", actorId: actor },
+      });
+      break;
+    }
+
+    case "agenda_delete":
+      delete state.npcAgendas[tx.actorId];
+      break;
+
+    case "pair_bond_upsert": {
+      const id = tx.bond.id.trim();
+      if (!id) break;
+      const prev = state.pairBonds[id] ? { ...state.pairBonds[id]! } : undefined;
+      state.pairBonds[id] = { ...tx.bond, id, tension: Math.max(-100, Math.min(100, Math.round(tx.bond.tension))) };
+      state.lastMeaningfulProgressTurn = state.turn;
+      pushAudit(state, {
+        summary: `关系 ${tx.bond.actorA}↔${tx.bond.actorB}: ${tx.bond.stance}`,
+        source: "sidecar",
+        undoTx: prev ? { kind: "pair_bond_upsert", bond: prev } : { kind: "pair_bond_delete", id },
+      });
+      break;
+    }
+
+    case "pair_bond_delete":
+      delete state.pairBonds[tx.id];
       break;
 
     case "lore_runtime":

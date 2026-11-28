@@ -39,6 +39,7 @@ import { selectActiveForesights } from "../memory/foresight.js";
 import { selectRelevantBeliefs } from "../memory/graph-ppr.js";
 import { detectRepeatedCliches, type NarrativeHealthReport } from "../engine/stagnation.js";
 import { estimateTokens } from "./token-budget.js";
+import { extractHeuristicVoiceAnchor } from "../parser/analyzer.js";
 
 function fnv1aSeed(str: string): number {
   let h = 2166136261;
@@ -434,9 +435,19 @@ export function buildZone3TransientTail(options: {
     }
   }
 
-  // RoleMemo DualMem Character Beliefs (query-relevant ranking by present NPCs + entity/token overlap + recency)
+  // RoleMemo DualMem Character Beliefs with HEART-Bench Per-Character Perspective Filtering:
+  // Avoid mixing off-screen characters' private beliefs into present characters' decision context!
   if (state.beliefs.length > 0) {
-    const relevantBeliefs = selectRelevantBeliefs(state, recentText, 6);
+    const presentSet = new Set(state.presentNpcs.map((n) => n.toLowerCase()));
+    const recentLower = recentText.toLowerCase();
+    const relevantBeliefs = selectRelevantBeliefs(state, recentText, 8)
+      .filter((b) => {
+        if (presentSet.size === 0) return true;
+        const actorLower = b.actorId.toLowerCase();
+        if (presentSet.has(actorLower) || actorLower === charName.toLowerCase()) return true;
+        return recentLower.includes(actorLower);
+      })
+      .slice(0, 6);
     if (relevantBeliefs.length > 0) {
       recalledSections.push(
         `## Character Beliefs (DREAM ABC) · DualMem\n${relevantBeliefs
@@ -482,6 +493,86 @@ export function buildZone3TransientTail(options: {
     }
   }
 
+  // 3c. Dynamic Scene Physical State & Spatial Occlusion (attire / wounds / holding / position)
+  const presentLowerSet = new Set([
+    ...state.presentNpcs.map((n) => n.toLowerCase()),
+    state.currentPersona.name.toLowerCase(),
+    "player",
+  ]);
+  const visiblePhysical = Object.values(state.physicalState).filter(
+    (ps) => state.presentNpcs.length === 0 || presentLowerSet.has(ps.actorId.toLowerCase()) || ps.actorId.toLowerCase() === charName.toLowerCase(),
+  );
+  if (visiblePhysical.length > 0 || state.spatialNotes.trim()) {
+    const physLines = visiblePhysical.slice(0, 6).map((ps) => {
+      const attrs = [
+        ps.attire ? `attire=${ps.attire}` : null,
+        ps.condition ? `condition=${ps.condition}` : null,
+        ps.holding ? `holding=${ps.holding}` : null,
+        ps.position ? `position=${ps.position}` : null,
+      ]
+        .filter(Boolean)
+        .join(" | ");
+      return `- ${ps.actorId}: ${attrs}`;
+    });
+    if (state.spatialNotes.trim()) {
+      physLines.push(`- Space/Occlusion: ${state.spatialNotes.trim()}`);
+    }
+    parts.push(
+      `<rp_physical_scene>\nRespect physical continuity, line-of-sight, and audio occlusion (no teleportation or telepathic eavesdropping):\n${physLines.join("\n")}\n</rp_physical_scene>`,
+    );
+  }
+
+  // 3d. Living World: Off-Screen NPC Agendas & NPC<->NPC Pair Bonds (narrator-only awareness)
+  const agendaList = Object.values(state.npcAgendas).slice(0, 5);
+  const relevantBonds = Object.values(state.pairBonds)
+    .filter(
+      (b) =>
+        state.presentNpcs.length === 0 ||
+        presentLowerSet.has(b.actorA.toLowerCase()) ||
+        presentLowerSet.has(b.actorB.toLowerCase()),
+    )
+    .slice(0, 5);
+  if (agendaList.length > 0 || relevantBonds.length > 0) {
+    const lwLines: string[] = [];
+    for (const ag of agendaList) {
+      const etaTag =
+        ag.etaTurns === 0
+          ? " [DUE/ARRIVING NOW]"
+          : typeof ag.etaTurns === "number" && ag.etaTurns > 0
+            ? ` [ETA: ${ag.etaTurns}t]`
+            : "";
+      lwLines.push(`- Off-screen Agenda (${ag.actorId}${etaTag}): ${ag.currentActivity} (goal: ${ag.goal})`);
+    }
+    for (const bond of relevantBonds) {
+      lwLines.push(`- NPC Bond (${bond.actorA} <-> ${bond.actorB}): ${bond.stance} (tension ${bond.tension}) — ${bond.note}`);
+    }
+    parts.push(
+      `<rp_living_world>\nBackground world continuity (off-screen agendas are narrator-only; never let ignorant present NPCs know them until revealed):\n${lwLines.join("\n")}\n</rp_living_world>`,
+    );
+  }
+
+  // 3e. ContextEcho Voice & Backbone Anchors (Anti-Drift + Anti-Sycophancy, <=90 tokens for focal characters)
+  const anchorEntries = Object.values(state.voiceAnchors).filter(
+    (a) =>
+      state.presentNpcs.length === 0 ||
+      presentLowerSet.has(a.actorId.toLowerCase()) ||
+      a.actorId.toLowerCase() === charName.toLowerCase(),
+  );
+  if (anchorEntries.length === 0) {
+    const fallbackAnchor = extractHeuristicVoiceAnchor(card);
+    if (fallbackAnchor) anchorEntries.push(fallbackAnchor);
+  }
+  if (anchorEntries.length > 0) {
+    const vaLines = anchorEntries.slice(0, 3).map((a) => {
+      const quotes = a.speechSamples.length > 0 ? ` | voice: ${a.speechSamples.slice(0, 2).map((q) => `“${q}”`).join(" / ")}` : "";
+      const taboo = a.tabooBehaviors ? ` | never: ${a.tabooBehaviors}` : "";
+      return `- ${a.actorId}: ${a.backbone}${quotes}${taboo}`;
+    });
+    parts.push(
+      `<rp_voice_anchors>\nMaintain distinct character speech cadence and non-negotiable backbone (never flatten into generic AI tone or unearned compliance):\n${vaLines.join("\n")}\n</rp_voice_anchors>`,
+    );
+  }
+
   // 4. Optional Director Pacing, Active Storylets, Genuine Narrative Health Guards & Active Director Notes
   const pacingCue = PACING_HINTS[state.pacingMode];
   const lengthCue =
@@ -505,7 +596,23 @@ export function buildZone3TransientTail(options: {
       ? `Avoid repeating these overused phrases/clichés: ${combinedBans.join(" / ")}.`
       : null;
   const activeStorylets = evaluateActiveStorylets(state);
+  const pointInTimeOverride =
+    state.turn >= 4 &&
+    ((state.initialLocation && state.location && state.location !== state.initialLocation) || state.era.trim().length > 0)
+      ? "Continuity override: Current <rp_state_frame> location, time, and physical state strictly supersede any opening-scene situation written in the static character card."
+      : null;
+  const trimmedUser = (lastUserMessage ?? "").trim();
+  const shortInputCue =
+    trimmedUser.length > 0 &&
+    trimmedUser.length <= 16 &&
+    !trimmedUser.startsWith("[OOC") &&
+    state.responseLength !== "concise"
+      ? "Mobile brief-input cue: The player sent a short cue; maintain full literary prose depth, sensory grounding, and proactive scene momentum rather than mirroring brevity."
+      : null;
+
   const noteLines = [
+    ...(pointInTimeOverride ? [`- ${pointInTimeOverride}`] : []),
+    ...(shortInputCue ? [`- ${shortInputCue}`] : []),
     ...(state.sceneObjective ? [`- Scene Objective: ${state.sceneObjective}`] : []),
     ...activeStorylets.map((s) => `- [Triggered Storylet · ${s.title}] ${s.triggerPrompt}`),
     ...(pacingCue ? [`- ${pacingCue}`] : []),

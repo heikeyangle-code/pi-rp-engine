@@ -1,3 +1,4 @@
+import type { EmbeddingConfig } from "../types.js";
 /**
  * Humanized Interactive File Picker & Smart Asset Sniffer for `/rp import`.
  *
@@ -29,6 +30,7 @@ export interface CandidateFile {
 }
 
 interface UiPrefs {
+  embeddingConfig?: EmbeddingConfig;
   lastImportDir?: string;
   lastPersonaId?: string;
   quickReplies?: QuickReplyItem[];

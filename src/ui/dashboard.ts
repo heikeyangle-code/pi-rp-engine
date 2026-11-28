@@ -34,6 +34,7 @@ import { compileLoreBook } from "../parser/lore-compiler.js";
 import { saveUpdatedCard } from "../storage/workspace-store.js";
 import { renderProgressBar, renderSmartStatBar } from "./renderers.js";
 import { RP_SHORTCUT_LIST } from "./shortcuts.js";
+import { loadUiPrefs, saveUiPrefs } from "./file-picker.js";
 import { openTuiOverlayDashboard, type OverlayTabIndex } from "./tui-overlay.js";
 
 export interface DashboardRuntime {
@@ -377,6 +378,198 @@ export async function openSecretsInspector(rt: DashboardRuntime, ctx: PiExtensio
   }
 }
 
+
+async function openVoiceAnchorsManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const list = Object.values(s.voiceAnchors);
+    const opts = [
+      "+ 新增/更新角色口癖与底线锚点",
+      ...list.map((a) => `🎙 ${a.actorId} — ${a.backbone.slice(0, 38)} (${a.speechSamples.length} 句样本)`),
+      "← 返回",
+    ];
+    const pick = await ctx.ui.select(`🎙 角色口癖与防漂移底线锚点（共 ${list.length} 角色 · 近端注入不破缓存）`, opts);
+    if (!pick || pick.startsWith("←")) return;
+
+    if (pick.startsWith("+")) {
+      const actorId = (await ctx.ui.input("角色名称", rt.getCard()?.identity.name ?? ""))?.trim();
+      if (!actorId) continue;
+      const cur = s.voiceAnchors[actorId];
+      const backbone = (await ctx.ui.input("核心立场与防迎合底线（如：极度防备外人，绝不无端软化）", cur?.backbone ?? ""))?.trim();
+      if (!backbone) continue;
+      const samplesRaw = (await ctx.ui.input("典型说话原话样本（用 | 分隔 2-3 句，可选）", cur?.speechSamples.join(" | ") ?? "")) ?? "";
+      const taboo = (await ctx.ui.input("绝对禁止的 OOC 行为（可选）", cur?.tabooBehaviors ?? ""))?.trim() || undefined;
+      rt.commitTx({
+        kind: "voice_anchor_upsert",
+        anchor: {
+          actorId,
+          speechSamples: samplesRaw.split("|").map((x) => x.trim()).filter(Boolean).slice(0, 3),
+          backbone,
+          tabooBehaviors: taboo,
+        },
+      });
+      ctx.ui.notify(`已保存「${actorId}」的口癖与底线锚点。`, "info");
+      continue;
+    }
+
+    const chosen = list[opts.indexOf(pick) - 1];
+    if (!chosen) continue;
+    const act = await ctx.ui.select(`🎙 ${chosen.actorId}`, [
+      "✏️ 编辑立场与口癖样本",
+      "🗑 删除此锚点",
+      "← 返回",
+    ]);
+    if (act?.startsWith("✏️")) {
+      const backbone = (await ctx.ui.input("核心立场与防迎合底线", chosen.backbone))?.trim() || chosen.backbone;
+      const samplesRaw = (await ctx.ui.input("典型原话样本（用 | 分隔）", chosen.speechSamples.join(" | "))) ?? "";
+      const taboo = (await ctx.ui.input("禁止的 OOC 行为（可选）", chosen.tabooBehaviors ?? ""))?.trim() || undefined;
+      rt.commitTx({
+        kind: "voice_anchor_upsert",
+        anchor: {
+          actorId: chosen.actorId,
+          speechSamples: samplesRaw.split("|").map((x) => x.trim()).filter(Boolean).slice(0, 3),
+          backbone,
+          tabooBehaviors: taboo,
+        },
+      });
+      ctx.ui.notify(`已更新「${chosen.actorId}」锚点。`, "info");
+    } else if (act?.startsWith("🗑")) {
+      rt.commitTx({ kind: "voice_anchor_delete", actorId: chosen.actorId });
+      ctx.ui.notify(`已删除「${chosen.actorId}」锚点。`, "info");
+    }
+  }
+}
+
+async function openPhysicalSceneManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const list = Object.values(s.physicalState);
+    const opts = [
+      "+ 更新某角色当前着装/伤势/手持/站位",
+      `📐 空间布局与视线遮挡备注（${s.spatialNotes ? s.spatialNotes.slice(0, 32) : "未设定"}）`,
+      ...list.map((p) => {
+        const parts = [p.attire, p.condition, p.holding, p.position].filter(Boolean).join(" · ");
+        return `🧥 ${p.actorId}：${parts.slice(0, 44) || "(空)"}`;
+      }),
+      "← 返回",
+    ];
+    const pick = await ctx.ui.select(`🧥 动态外貌、物理状态与空间站位（防瞬移与着装失忆）`, opts);
+    if (!pick || pick.startsWith("←")) return;
+
+    if (pick.startsWith("📐")) {
+      const next = await ctx.ui.input("输入当前空间站位与视线/听觉遮挡说明（留空清除）", s.spatialNotes);
+      if (next !== undefined) {
+        rt.commitTx({ kind: "physical_patch", snapshot: { actorId: "", updatedTurn: s.turn }, spatialNotes: next, reason: "panel" });
+        ctx.ui.notify("已更新空间布局备注。", "info");
+      }
+      continue;
+    }
+
+    let actorId = rt.getCard()?.identity.name ?? "player";
+    if (pick.startsWith("+")) {
+      const entered = (await ctx.ui.input("角色名（或 player）", actorId))?.trim();
+      if (!entered) continue;
+      actorId = entered;
+    } else {
+      const chosen = list[opts.indexOf(pick) - 2];
+      if (!chosen) continue;
+      actorId = chosen.actorId;
+    }
+    const cur = s.physicalState[actorId];
+    const attire = (await ctx.ui.input(`${actorId} 当前着装/外貌（可选）`, cur?.attire ?? ""))?.trim() || undefined;
+    const condition = (await ctx.ui.input(`${actorId} 身体状态/伤势（可选）`, cur?.condition ?? ""))?.trim() || undefined;
+    const holding = (await ctx.ui.input(`${actorId} 当前手持物（可选）`, cur?.holding ?? ""))?.trim() || undefined;
+    const position = (await ctx.ui.input(`${actorId} 当前空间站位（可选）`, cur?.position ?? ""))?.trim() || undefined;
+    rt.commitTx({
+      kind: "physical_patch",
+      snapshot: { actorId, attire, condition, holding, position, updatedTurn: s.turn },
+      reason: "panel",
+    });
+    ctx.ui.notify(`已更新「${actorId}」物理状态快照。`, "info");
+  }
+}
+
+async function openLivingWorldManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const agendas = Object.values(s.npcAgendas);
+    const bonds = Object.values(s.pairBonds);
+    const opts = [
+      "+ 新增离线 NPC 后台日程 (Agenda)",
+      "+ 新增 NPC↔NPC 人物关系网 (Pair Bond)",
+      ...agendas.map((a) => `🕰 [日程] ${a.actorId}${typeof a.etaTurns === "number" ? ` (剩余${a.etaTurns}轮)` : ""}：${a.currentActivity.slice(0, 32)}`),
+      ...bonds.map((b) => `🕸 [关系] ${b.actorA}↔${b.actorB}：${b.stance} (${b.tension})`),
+      "← 返回",
+    ];
+    const pick = await ctx.ui.select(`🕸 鲜活世界：NPC 后台日程 (${agendas.length}) 与人物关系网 (${bonds.length})`, opts);
+    if (!pick || pick.startsWith("←")) return;
+
+    if (pick.startsWith("+ 新增离线")) {
+      const actorId = (await ctx.ui.input("NPC 名称", ""))?.trim();
+      if (!actorId) continue;
+      const goal = (await ctx.ui.input("TA 的长期或短期目的", ""))?.trim();
+      if (!goal) continue;
+      const currentActivity = (await ctx.ui.input("此刻幕后正在做什么", goal))?.trim() || goal;
+      const etaStr = (await ctx.ui.input("预计几轮后抵达/产生波纹（留空不倒计时）", ""))?.trim();
+      const etaTurns = etaStr && /^\d+$/.test(etaStr) ? Number(etaStr) : null;
+      rt.commitTx({ kind: "agenda_upsert", agenda: { actorId, goal, currentActivity, etaTurns, updatedTurn: s.turn } });
+      ctx.ui.notify(`已设置「${actorId}」后台日程。`, "info");
+    } else if (pick.startsWith("+ 新增 NPC")) {
+      const actorA = (await ctx.ui.input("角色 A 名称", ""))?.trim();
+      const actorB = (await ctx.ui.input("角色 B 名称", ""))?.trim();
+      if (!actorA || !actorB || actorA === actorB) continue;
+      const stance = (await ctx.ui.input("彼此关系立场（如：暗中猜忌 / 生死同盟 / 宿敌）", ""))?.trim();
+      if (!stance) continue;
+      const tension = Number((await ctx.ui.input("关系张力 (-100 敌对 ~ +100 亲密)", "0"))?.trim()) || 0;
+      const note = (await ctx.ui.input("原因或流言备注（可选）", ""))?.trim() ?? "";
+      const [a, b] = [actorA, actorB].sort();
+      rt.commitTx({
+        kind: "pair_bond_upsert",
+        bond: { id: `${a}::${b}`, actorA: a!, actorB: b!, stance, tension, note, updatedTurn: s.turn },
+      });
+      ctx.ui.notify(`已记录 ${a} ↔ ${b} 关系。`, "info");
+    } else if (pick.startsWith("🕰")) {
+      const idx = opts.indexOf(pick) - 2;
+      const ag = agendas[idx];
+      if (!ag) continue;
+      const del = await ctx.ui.confirm(`移除「${ag.actorId}」后台日程？`, `${ag.currentActivity}（目标：${ag.goal}）`);
+      if (del) rt.commitTx({ kind: "agenda_delete", actorId: ag.actorId });
+    } else if (pick.startsWith("🕸")) {
+      const idx = opts.indexOf(pick) - 2 - agendas.length;
+      const bond = bonds[idx];
+      if (!bond) continue;
+      const del = await ctx.ui.confirm(`移除 ${bond.actorA}↔${bond.actorB} 关系？`, `${bond.stance} (${bond.tension}) ${bond.note}`);
+      if (del) rt.commitTx({ kind: "pair_bond_delete", id: bond.id });
+    }
+  }
+}
+
+async function openEmbeddingConfigManager(ctx: PiExtensionContext): Promise<void> {
+  const prefs = loadUiPrefs();
+  const cur = prefs.embeddingConfig ?? { enabled: false, endpoint: "http://localhost:11434/v1/embeddings", model: "bge-m3", apiKey: "" };
+  const pick = await ctx.ui.select(
+    `🧠 语义向量混合召回 Embedding（当前：${cur.enabled ? `● 已开启 · ${cur.model}` : "○ 未开启 · 纯零依赖 BM25"}）`,
+    [
+      cur.enabled ? "○ 关闭语义向量（退回纯 BM25）" : "● 开启并配置 OpenAI/Ollama Embedding 端点",
+      "✏️ 修改 Endpoint / 模型 / API Key",
+      "← 返回",
+    ],
+  );
+  if (!pick || pick.startsWith("←")) return;
+  if (pick.startsWith("○")) {
+    saveUiPrefs({ embeddingConfig: { ...cur, enabled: false } });
+    ctx.ui.notify("已关闭语义向量召回，当前使用纯零依赖 BM25。", "info");
+    return;
+  }
+  const endpoint = (await ctx.ui.input("Embedding 接口地址（支持 OpenAI / SiliconFlow / Ollama）", cur.endpoint))?.trim();
+  if (!endpoint) return;
+  const model = (await ctx.ui.input("Embedding 模型名（如 text-embedding-3-small / BAAI/bge-m3）", cur.model))?.trim();
+  if (!model) return;
+  const apiKey = (await ctx.ui.input("API Key（本地 Ollama 可留空）", cur.apiKey ?? ""))?.trim() ?? "";
+  saveUiPrefs({ embeddingConfig: { enabled: true, endpoint, model, apiKey: apiKey || undefined } });
+  ctx.ui.notify(`✅ 已启用语义向量混合召回：${model}（BM25 + Cosine RRF）`, "info");
+}
+
 export async function openCharactersSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
   while (true) {
     const s = rt.getState();
@@ -389,6 +582,9 @@ export async function openCharactersSection(rt: DashboardRuntime, ctx: PiExtensi
       `📊 角色数值与变量 (${statCount} 项 · 双极刻度 / =设负值 / +/-增减)`,
       ...(s.modules.inventory || invCount > 0 ? [`🎒 随身物品与装备 (${invCount} 项)`] : []),
       `◇ DualMem 人物信念与潜台词 (${s.beliefs.length} 条 · 可查看全文与删除)`,
+      `🎙 角色口癖与防漂移底线锚点 (${Object.keys(s.voiceAnchors).length} 角色)`,
+      `🧥 当前外貌、伤势与空间站位 (${Object.keys(s.physicalState).length} 角色)`,
+      `🕸 NPC 后台日程与人物关系网 (${Object.keys(s.npcAgendas).length} 日程 · ${Object.keys(s.pairBonds).length} 关系)`,
       `🧑 切换玩家马甲（当前：${s.currentPersona.name}）`,
       `👥 同场共演管理（当前：${s.activeCharacters.length} 张卡）`,
       "← 返回主面板",
@@ -568,6 +764,12 @@ export async function openCharactersSection(rt: DashboardRuntime, ctx: PiExtensi
           ctx.ui.notify("已删除该条信念。", "info");
         }
       }
+    } else if (pick.startsWith("🎙")) {
+      await openVoiceAnchorsManager(rt, ctx);
+    } else if (pick.startsWith("🧥")) {
+      await openPhysicalSceneManager(rt, ctx);
+    } else if (pick.startsWith("🕸")) {
+      await openLivingWorldManager(rt, ctx);
     } else if (pick.startsWith("🧑")) {
       await rt.switchPersona(ctx);
     } else if (pick.startsWith("👥")) {
@@ -1146,6 +1348,7 @@ async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext
       `🏁 剧情阶段 / 章节（当前：${s.era || "未启用"}）`,
       `⚙ 世界开关 Flags (${flagCount} 项) & 引擎模块开关`,
       `🤖 Sidecar 后台专职模型（当前：${s.sidecarModel || "跟随主模型"}）`,
+      `🧠 语义向量混合召回 Embedding（${loadUiPrefs().embeddingConfig?.enabled ? "● 开" : "○ 关"}）`,
       `📏 动态世界书 Token 预算（当前：${s.loreTokenBudget} tokens）`,
       `🎛 应用预设采样参数 (before_provider_request)：${s.applyPresetSampling ? "● 开" : "○ 关"}`,
       "🗂 资产库管理（删除角色卡 / 预设 / 马甲）",
@@ -1233,6 +1436,8 @@ async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext
       }
     } else if (pick.startsWith("🤖")) {
       await rt.pickSidecarModel(ctx);
+    } else if (pick.startsWith("🧠")) {
+      await openEmbeddingConfigManager(ctx);
     } else if (pick.startsWith("📏")) {
       const budgetStr = (await ctx.ui.input("动态世界书 Token 预算（建议 800 ~ 4000）", String(s.loreTokenBudget)))?.trim();
       const val = Number(budgetStr);

@@ -114,6 +114,10 @@ export async function runSidecarLightSettlement(options: {
     `"completedStoryletIds": ["storylet_id"]`,
     `"newStorylets": [{"title":"...","triggerPrompt":"...","requiredFlags":["..."],"minTurn":number|null}]`,
     `"cfsm": [{"actorId":"...","axis":"...","to":"...","reason":"..."}]`,
+    `"physical": [{"actorId":"...","attire":"...","condition":"...","holding":"...","position":"..."}]`,
+    `"spatialNotes": string|null`,
+    `"agendas": [{"actorId":"...","goal":"...","currentActivity":"...","etaTurns":number|null}]`,
+    `"pairBonds": [{"actorA":"...","actorB":"...","stance":"...","tension":number,"note":"..."}]`,
   ];
   if (state.modules.stats) {
     schemaFields.push(`"stats": [{"actorId":"...","key":"...","op":"set"|"add","value":number|string|boolean,"reason":"..."}]`);
@@ -207,6 +211,10 @@ export async function runSidecarLightSettlement(options: {
       stats?: Array<{ actorId?: string; key?: string; op?: "set" | "add"; value?: number | string | boolean; reason?: string }>;
       inventory?: Array<{ actorId?: string; item?: string; delta?: number; note?: string }>;
       clocks?: Array<{ clockId?: string; label?: string; delta?: number; max?: number }>;
+      physical?: Array<{ actorId?: string; attire?: string; condition?: string; holding?: string; position?: string }>;
+      spatialNotes?: string | null;
+      agendas?: Array<{ actorId?: string; goal?: string; currentActivity?: string; etaTurns?: number | null }>;
+      pairBonds?: Array<{ actorA?: string; actorB?: string; stance?: string; tension?: number; note?: string }>;
     }>(rawText);
     if (!parsed) return 0;
 
@@ -409,6 +417,71 @@ export async function runSidecarLightSettlement(options: {
         const max = typeof ck.max === "number" && ck.max > 0 ? Math.trunc(ck.max) : state.clocks[clockId]?.max ?? 4;
         commit({ kind: "progress_clock", clockId, label: ck.label?.trim() || clockId, delta, max });
       }
+    }
+
+    // 8. Dynamic Scene Physical State (attire / wounds / holding / position / spatialNotes)
+    const nextSpatial = typeof parsed.spatialNotes === "string" && parsed.spatialNotes.trim() ? parsed.spatialNotes.trim() : undefined;
+    for (const ph of parsed.physical ?? []) {
+      const actorId = typeof ph.actorId === "string" ? ph.actorId.trim() : "";
+      if (!actorId) continue;
+      const attire = typeof ph.attire === "string" && ph.attire.trim() ? ph.attire.trim() : undefined;
+      const condition = typeof ph.condition === "string" && ph.condition.trim() ? ph.condition.trim() : undefined;
+      const holding = typeof ph.holding === "string" && ph.holding.trim() ? ph.holding.trim() : undefined;
+      const position = typeof ph.position === "string" && ph.position.trim() ? ph.position.trim() : undefined;
+      if (!attire && !condition && !holding && !position) continue;
+      commit({
+        kind: "physical_patch",
+        snapshot: { actorId, attire, condition, holding, position, updatedTurn: state.turn },
+        spatialNotes: nextSpatial,
+        reason: "sidecar",
+      });
+    }
+    if (nextSpatial && (!parsed.physical || parsed.physical.length === 0) && nextSpatial !== state.spatialNotes) {
+      commit({
+        kind: "physical_patch",
+        snapshot: { actorId: "", updatedTurn: state.turn },
+        spatialNotes: nextSpatial,
+        reason: "sidecar",
+      });
+    }
+
+    // 9. Off-Screen NPC Agendas
+    for (const ag of parsed.agendas ?? []) {
+      const actorId = typeof ag.actorId === "string" ? ag.actorId.trim() : "";
+      const goal = typeof ag.goal === "string" ? ag.goal.trim() : "";
+      const currentActivity = typeof ag.currentActivity === "string" ? ag.currentActivity.trim() : "";
+      if (!actorId || (!goal && !currentActivity)) continue;
+      commit({
+        kind: "agenda_upsert",
+        agenda: {
+          actorId,
+          goal: goal || currentActivity,
+          currentActivity: currentActivity || goal,
+          etaTurns: typeof ag.etaTurns === "number" && Number.isFinite(ag.etaTurns) ? Math.max(0, Math.round(ag.etaTurns)) : null,
+          updatedTurn: state.turn,
+        },
+      });
+    }
+
+    // 10. NPC<->NPC Pair Bonds
+    for (const pb of parsed.pairBonds ?? []) {
+      const actorA = typeof pb.actorA === "string" ? pb.actorA.trim() : "";
+      const actorB = typeof pb.actorB === "string" ? pb.actorB.trim() : "";
+      const stance = typeof pb.stance === "string" ? pb.stance.trim() : "";
+      if (!actorA || !actorB || actorA === actorB || !stance) continue;
+      const [a, b] = [actorA, actorB].sort();
+      commit({
+        kind: "pair_bond_upsert",
+        bond: {
+          id: `${a}::${b}`,
+          actorA: a!,
+          actorB: b!,
+          stance,
+          tension: typeof pb.tension === "number" && Number.isFinite(pb.tension) ? pb.tension : 0,
+          note: typeof pb.note === "string" ? pb.note.trim() : "",
+          updatedTurn: state.turn,
+        },
+      });
     }
 
     return committed;
