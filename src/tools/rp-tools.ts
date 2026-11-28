@@ -14,6 +14,7 @@ import type {
 } from "../types.js";
 import { RP_ENTRY_TYPE, applyRpTx } from "../engine/state-replay.js";
 import { rollDiceCheck } from "../engine/dice.js";
+import { computeCalendarAnchor, detectLifespanProfile } from "../engine/temporal.js";
 import { computeCheckedStatValue, validateCfsmTransition, validateInventoryPatch } from "../engine/cfsm.js";
 import { recallLoreWithGraphPpr, tokenizeHybrid } from "../memory/graph-ppr.js";
 import { getActiveFacts } from "../memory/bitemporal.js";
@@ -1061,12 +1062,26 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         });
       }
 
+      let temporalNote = "";
+      if (typeof params.day_delta === "number" && params.day_delta >= 365) {
+        const yrs = Math.round(params.day_delta / 365);
+        const anchor = computeCalendarAnchor(state.worldTimeLabel, yrs, params.day_delta);
+        if (anchor) temporalNote += ` | ${anchor.exactHint}`;
+        const card = rt.getCard();
+        const profile = detectLifespanProfile(
+          `${card?.frozen.description ?? ""} ${card?.frozen.scenario ?? ""} ${state.archetype}`,
+        );
+        if (profile === "mortal" && yrs >= 60) {
+          temporalNote += ` | Temporal warning: +${yrs} years exceeds normal mortal lifespan; reflect aging/mortality or generational shift rather than keeping mortal characters ageless.`;
+        }
+      }
+
       rt.refreshHud(ctx);
       return {
         content: [
           {
             type: "text",
-            text: `Era advanced: ${fromEra} -> ${toEra}${milestones.length ? ` (milestones: ${milestones.join(", ")})` : ""}`,
+            text: `Era advanced: ${fromEra} -> ${toEra}${milestones.length ? ` (milestones: ${milestones.join(", ")})` : ""}${temporalNote}`,
           },
         ],
         details: { fromEra, toEra, milestones },

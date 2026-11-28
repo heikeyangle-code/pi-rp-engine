@@ -445,7 +445,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
         isOocTurn = true;
         return {
           action: "transform",
-          text: `[OOC - Out of Character Discussion; do NOT advance the story or modify world state]\n${inner}`,
+          text: `[OOC - Meta/Director Discussion; do NOT advance story prose. Answer accurately using full context/tools; ONLY call rp_state_patch/rp_fact_commit if the user explicitly asks to fix or update state/memory.]\n${inner}`,
         };
       }
     }
@@ -719,6 +719,39 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
 
     const thisTurnOoc = isOocTurn;
     lastTurnWasOoc = thisTurnOoc;
+
+    // Auto-hide OOC Q&A pair from subsequent story LLM context (zero OOC context pollution!)
+    // Messages stay visible in the user's chat UI, but future story turns never see OOC chatter.
+    if (thisTurnOoc && msg) {
+      const hideIds: string[] = [];
+      const hideFps: string[] = [computeMessageFingerprint(msg)];
+      const assistantId = typeof msg.entryId === "string" ? msg.entryId : typeof msg.id === "string" ? msg.id : null;
+      if (assistantId) hideIds.push(assistantId);
+      const branch = ctx?.sessionManager?.getBranch?.() ?? [];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const e = branch[i]!;
+        if (e.type === "message" && e.message) {
+          const t = extractMessageText(e.message).trim();
+          if (e.message.role === "user" && (/^\[OOC\b/i.test(t) || /^(?:\(\(|（（)/.test(t))) {
+            hideIds.push(e.id);
+            hideFps.push(computeMessageFingerprint(e.message));
+            break;
+          }
+          if (e.message.role === "assistant" && !assistantId) {
+            hideIds.push(e.id);
+            hideFps.push(computeMessageFingerprint(e.message));
+          }
+        } else if (e.type === "custom_message" && e.customType === "rp:ooc") {
+          hideIds.push(e.id);
+          const content = (e as { content?: PiMessage["content"] }).content;
+          if (content !== undefined) {
+            hideFps.push(computeMessageFingerprint({ role: "custom", content }));
+          }
+          break;
+        }
+      }
+      commitTx({ kind: "hide_toggle", entryIds: Array.from(new Set(hideIds)), fingerprints: Array.from(new Set(hideFps)), hidden: true });
+    }
 
     runDeterministicTurnSettlement({
       pi,

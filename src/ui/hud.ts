@@ -57,22 +57,32 @@ function formatKvBadge(xray?: ContextXRaySnapshot | null): string | null {
   return null;
 }
 
+function clampSeg(text: string, maxChars: number): string {
+  const clean = text.replace(/\s+/g, " ").trim();
+  const chars = Array.from(clean);
+  return chars.length > maxChars ? chars.slice(0, maxChars - 1).join("") + "…" : clean;
+}
+
 export function formatRpStatusLine(
   state: SessionRpState,
   card: CompiledCard | null,
   xray?: ContextXRaySnapshot | null,
 ): string {
-  const charName = card ? card.identity.nickname || card.identity.name : state.cardSlug ?? "RP";
-  const parts = [`◆ ${charName}`, state.era, state.worldTimeLabel].filter(Boolean);
-  if (state.location) parts.push(state.location);
+  const charName = clampSeg(card ? card.identity.nickname || card.identity.name : state.cardSlug ?? "RP", 10);
+  const parts = [`◆ ${charName}`];
+  if (state.location) parts.push(clampSeg(state.location, 12));
+  if (state.worldTimeLabel) parts.push(clampSeg(state.worldTimeLabel, 12));
+  else if (state.era) parts.push(clampSeg(state.era, 12));
   parts.push(`T${state.turn}`);
+  const activeFlags = Object.values(state.flags).filter(Boolean).length;
+  if (activeFlags > 0) parts.push(`🚩${activeFlags}`);
   const openHooks = Array.from(state.foresights.values()).filter((h) => h.status === "open").length;
   if (openHooks > 0) parts.push(`伏笔:${openHooks}`);
   if (state.memoryBooks.size > 0) parts.push(`书:${state.memoryBooks.size}`);
-  if (xray && xray.blindSpotCount > 0) parts.push(`🔒盲区:${xray.blindSpotCount}`);
-  if (state.pacingMode !== "balanced") parts.push(`节奏:${PACING_LABEL[state.pacingMode]}`);
+  if (xray && xray.blindSpotCount > 0) parts.push(`🔒${xray.blindSpotCount}`);
+  if (state.pacingMode !== "balanced") parts.push(PACING_LABEL[state.pacingMode]);
   if (state.innerMonologue) parts.push("💭");
-  if (state.notes.length > 0) parts.push(`指令:${state.notes.length}`);
+  if (state.notes.length > 0) parts.push(`导:${state.notes.length}`);
   const kv = formatKvBadge(xray);
   if (kv && (kv.startsWith("⚠") || (xray && xray.cacheHitStreak >= 2))) parts.push(kv);
   return parts.join(" · ");
@@ -110,20 +120,21 @@ function buildHudRawLines(
 
   const openHooks = Array.from(state.foresights.values()).filter((h) => h.status === "open").length;
   const kvBadge = formatKvBadge(xray);
+  const activeFlagNames = Object.entries(state.flags).filter(([, v]) => Boolean(v)).map(([k]) => k);
   const metaParts = [
     `扮演:${state.currentPersona.name}`,
-    `类型:${ARCHETYPE_LABEL[state.archetype] ?? state.archetype}`,
     `节奏:${PACING_LABEL[state.pacingMode]}`,
-    `结算:${state.settlementMode}`,
     openHooks > 0 ? `伏笔:${openHooks}` : null,
     state.memoryBooks.size > 0 ? `记忆书:${state.memoryBooks.size}` : null,
     xray && xray.blindSpotCount > 0 ? `🔒盲区:${xray.blindSpotCount}` : null,
     state.activeCharacters.length > 1 ? `共演:${state.activeCharacters.length}卡` : null,
     state.innerMonologue ? "💭内心戏" : null,
-    state.rawPassthrough ? "原味直通" : null,
     kvBadge,
   ].filter(Boolean);
   lines.push(`│ ${metaParts.join(" · ")}`);
+  if (activeFlagNames.length > 0) {
+    lines.push(`│ 🚩 状态  ${activeFlagNames.slice(0, 5).join(" · ")}${activeFlagNames.length > 5 ? ` (+${activeFlagNames.length - 5})` : ""}`);
+  }
 
   if (state.sceneObjective) {
     lines.push(`│ 🎯 目标  ${state.sceneObjective}`);
@@ -207,7 +218,7 @@ function buildHudRawLines(
     );
   }
 
-  lines.push("╰─ Alt+R 菜单 · Ctrl+Shift+R 面板 · Alt+E 快捷回复 · Alt+X X-Ray · Alt+W 重摇 · Alt+H HUD");
+  lines.push("╰─ /rp 菜单 · /rp panel 世界面板 · /rp hud 切换或隐藏");
   return lines;
 }
 

@@ -1,3 +1,4 @@
+import { computeCalendarAnchor, detectLifespanProfile, parseTimeSpan } from "../src/engine/temporal.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -233,4 +234,61 @@ test("deep-water-4: Hybrid Semantic Embedding Cosine + RRF Fusion & 50-Turn Long
   });
   assert.equal(recalled.result.found, true, "BM25 must recall Turn-2 promise at Turn 50");
   assert.equal(recalled.result.matches[0]!.turn, 2);
+});
+
+test("deep-water-5: OOC ((...)) turn auto-hides OOC Q&A from future story context (zero pollution) without advancing turn", async () => {
+  const { default: rpExt } = await import("../src/index.js");
+  const { attachZone3ToMessages } = await import("../src/context/zone-builder.js");
+  const { computeMessageFingerprint } = await import("../src/engine/state-replay.js");
+
+  const card = compileCharacterCard({ name: "黑水", description: "测试", first_mes: "开场" }, "v2");
+  const state = createInitialRpState();
+  state.active = true;
+  const oocUser = { role: "user", content: "[OOC - Meta/Director Discussion]\n现在伏笔有哪些？", timestamp: 1000 };
+  const oocReply = { role: "assistant", content: "当前有两条未回收伏笔。", timestamp: 1001 };
+  const storyUser = { role: "user", content: "我推开客栈的门。", timestamp: 2000 };
+
+  applyRpTx(state, {
+    kind: "hide_toggle",
+    entryIds: [],
+    fingerprints: [computeMessageFingerprint(oocUser), computeMessageFingerprint(oocReply)],
+    hidden: true,
+  });
+
+  const filtered = attachZone3ToMessages(
+    [oocUser, oocReply, storyUser],
+    "<rp_state_frame>{}</rp_state_frame>",
+    state.hiddenEntryIds,
+    state.hiddenFingerprints,
+  );
+  assert.equal(filtered.length, 1, "OOC Q&A must be stripped from subsequent story context");
+  assert.ok(String(filtered[0]!.content).includes("我推开客栈的门"));
+  assert.equal(typeof rpExt, "function");
+});
+
+
+test("deep-water-6: temporal parser & calendar arithmetic prevent era/lifespan hallucinations", () => {
+  assert.equal(parseTimeSpan("320年后").years, 320);
+  assert.equal(parseTimeSpan("八十年后").years, 80);
+  assert.equal(parseTimeSpan("3天后").dayDelta, 3);
+  assert.equal(parseTimeSpan("半年后").dayDelta, 183);
+
+  const a80 = computeCalendarAnchor("崇祯七年深秋", 80, 29200);
+  assert.ok(a80);
+  assert.equal(a80.sourceYear, 1634);
+  assert.equal(a80.targetYear, 1714);
+  assert.ok(a80.targetEraLabel?.includes("康熙53年"));
+
+  const a320 = computeCalendarAnchor("崇祯七年深秋", 320, 116800);
+  assert.ok(a320);
+  assert.equal(a320.targetYear, 1954);
+  assert.equal(a320.targetEraLabel, "公元1954年");
+
+  const greg = computeCalendarAnchor("2026年3月", 15, 5475);
+  assert.ok(greg);
+  assert.equal(greg.targetYear, 2041);
+
+  assert.equal(detectLifespanProfile("明末运河游医，市井江湖"), "mortal");
+  assert.equal(detectLifespanProfile("修仙宗门，筑基金丹长生大道"), "long_lived");
+  assert.equal(detectLifespanProfile("星际殖民船冷冻舱休眠苏醒"), "scifi_stasis");
 });

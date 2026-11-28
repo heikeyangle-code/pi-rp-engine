@@ -37,6 +37,13 @@ import { compileLoreBook } from "../parser/lore-compiler.js";
 import { compileSillyTavernPreset } from "../parser/preset.js";
 import { evaluateMacros } from "../parser/macros.js";
 import { rollDiceCheck } from "../engine/dice.js";
+import {
+  buildContinuityDirective,
+  computeCalendarAnchor,
+  detectLifespanProfile,
+  parseTimeSpan,
+  type ContinuityMode,
+} from "../engine/temporal.js";
 import { computeMessageFingerprint } from "../engine/state-replay.js";
 import { getActiveFacts } from "../memory/bitemporal.js";
 import {
@@ -885,7 +892,7 @@ export async function actionOoc(rt: RpRuntimeHandle, ctx: PiExtensionContext, ar
   rt.pi.sendMessage(
     {
       customType: "rp:ooc",
-      content: `[OOC - Out of Character Discussion; do NOT advance the story or modify world state]\n${text}`,
+      content: `[OOC - Meta/Director Discussion; do NOT advance story prose. Answer accurately using full context/tools; ONLY call rp_state_patch/rp_fact_commit if the user explicitly asks to fix or update state/memory.]\n${text}`,
       display: true,
       details: { kind: "ooc" },
     },
@@ -1428,22 +1435,60 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
     }
   }
 
-  const dayMatch = /(\d+)\s*(天|日|days?)/i.exec(desc);
-  const weekMatch = /(\d+)\s*(周|星期|weeks?)/i.exec(desc);
-  const monthMatch = /(\d+)\s*(个?月|months?)/i.exec(desc);
-  const dayDelta = dayMatch
-    ? Number(dayMatch[1])
-    : weekMatch
-      ? Number(weekMatch[1]) * 7
-      : monthMatch
-        ? Number(monthMatch[1]) * 30
-        : /次日|明天|隔日|翌/i.test(desc)
-          ? 1
-          : /半月/i.test(desc)
-            ? 15
-            : 0;
+  const parsedSpan = parseTimeSpan(desc);
+  const dayDelta = parsedSpan.dayDelta;
   const isStageChange = /(?:第[一二三四五六七八九十0-9]+[幕章篇卷]|纪元|Act\s+[IVX0-9]+|Chapter)/i.test(desc);
   const nextEra = isStageChange ? desc : state.era;
+
+  const worldSignalText = [
+    card.identity.name,
+    card.frozen.description,
+    card.frozen.scenario,
+    state.archetype,
+  ].join("\n");
+  const lifespanProfile = detectLifespanProfile(worldSignalText);
+  const calendarAnchor = computeCalendarAnchor(state.worldTimeLabel, parsedSpan.years, dayDelta);
+
+  let continuityMode: ContinuityMode =
+    lifespanProfile === "long_lived"
+      ? "immortal_span"
+      : lifespanProfile === "scifi_stasis" && parsedSpan.years >= 30
+        ? "stasis_or_portal"
+        : "natural_aging";
+
+  if (parsedSpan.years >= 30) {
+    const yearNote = calendarAnchor?.targetEraLabel ? ` → 推算年份：${calendarAnchor.targetEraLabel}` : "";
+    const mortalWarning =
+      lifespanProfile === "mortal" && parsedSpan.years >= 60
+        ? `⚠️ 跨度 ${parsedSpan.years} 年已超出凡人自然寿命${yearNote}，请选择延续方式：`
+        : `⏳ 长跨度时间跃迁（${parsedSpan.years} 年${yearNote}），请选择世界延续方式：`;
+
+    const modeOptions =
+      lifespanProfile === "mortal" && parsedSpan.years >= 60
+        ? [
+            "🧬 世代更替（旧角色老去/作古，改以遗产、后人或新主角承接）",
+            "❄️ 休眠 / 封印 / 穿越（主角肉身停滞，醒来故人多已不在）",
+            "🕰️ 强行按长生/奇幻处理（主角存活，凡人世界沧海桑田）",
+            "✏️ 取消并返回缩短时间跨度",
+          ]
+        : [
+            "🕰️ 自然衰老 / 正常度过（按当前世界观寿命自然演进）",
+            "🧬 世代更替（切换至下一代/继承者视角）",
+            "❄️ 休眠 / 封印 / 穿越（主角停滞，外界沧海桑田）",
+            "✏️ 取消并返回修改跨度",
+          ];
+
+    const pickedMode = await ctx.ui.select(mortalWarning, modeOptions);
+    if (!pickedMode || pickedMode.startsWith("✏️")) {
+      ctx.ui.notify("已取消本次超长跨度推进。", "info");
+      return;
+    }
+    if (pickedMode.startsWith("🧬")) continuityMode = "generational_legacy";
+    else if (pickedMode.startsWith("❄️")) continuityMode = "stasis_or_portal";
+    else if (pickedMode.startsWith("🕰️")) {
+      continuityMode = lifespanProfile === "long_lived" || parsedSpan.years >= 60 ? "immortal_span" : "natural_aging";
+    }
+  }
 
   interface DowntimeSimResult {
     worldTimeLabel?: string;
@@ -1463,22 +1508,31 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
       .filter((h) => h.status === "open")
       .slice(0, 4)
       .map((h) => h.summary);
+    const activeAgendas = Object.values(state.npcAgendas)
+      .slice(0, 4)
+      .map((ag) => `${ag.actorId}: ${ag.goal}${ag.currentActivity ? ` (${ag.currentActivity})` : ""}`);
     const recentFacts = getActiveFacts(state)
       .slice(-6)
       .map((f) => f.statement);
 
+    const continuityDirective = buildContinuityDirective(continuityMode, parsedSpan.years, lifespanProfile);
+
     const simPrompt =
       `You are an off-screen world simulator for "${card.identity.name}". ` +
-      `Given a time jump ("${desc}") and the player's downtime intent, simulate what realistically happens off-screen across factions, clocks, and open threads. ` +
+      `Given a time jump ("${desc}") and the player's downtime intent, simulate what realistically happens off-screen across factions, clocks, NPC agendas, and open threads. ` +
+      `${continuityDirective} ` +
+      (calendarAnchor ? `${calendarAnchor.exactHint} ` : "") +
       `Return ONLY strict JSON:\n` +
       `{"worldTimeLabel":"new in-world time string","location":"new or same location","presentNpcs":["names"],"clockDeltas":[{"clockId":"existing_id","delta":1,"reason":"why"}],"offscreenEvents":[{"statement":"concise event","public":true,"entities":["name"]}],"openingBeat":"1-2 sentence concrete opening sensory hook for the new scene"}\n` +
       `Rules: Keep clockDeltas grounded to existing clockIds (0-2 entries, delta 1-2). OffscreenEvents: 1-2 realistic developments (mark secret faction moves public:false). Match the story's language.`;
 
     const simInput =
       `Current time: ${state.worldTimeLabel || "unset"} | Location: ${state.location || "unset"} | Present: ${state.presentNpcs.join(", ") || "none"}\n` +
-      `Time jump: ${desc}\n` +
+      `World lifespan profile: ${lifespanProfile} | Time jump: ${desc} (≈${dayDelta} days / ${parsedSpan.years} years)\n` +
+      (calendarAnchor ? `Authoritative target year: ${calendarAnchor.targetEraLabel ?? calendarAnchor.targetYear}\n` : "") +
       (playerPlan ? `Player downtime activity: ${playerPlan}\n` : "") +
       (activeClocks.length ? `Active clocks: ${activeClocks.join("; ")}\n` : "") +
+      (activeAgendas.length ? `Active NPC agendas: ${activeAgendas.join("; ")}\n` : "") +
       (openHooks.length ? `Open foresights: ${openHooks.join("; ")}\n` : "") +
       (recentFacts.length ? `Recent facts: ${recentFacts.join(" | ")}\n` : "");
 
@@ -1528,6 +1582,7 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
 
   const nextTimeLabel =
     sim?.worldTimeLabel?.trim() ||
+    calendarAnchor?.targetEraLabel ||
     (dayDelta > 0 && !/第\s*\d+\s*天/.test(desc) ? `第 ${state.day + dayDelta} 天 · ${desc}` : desc);
   rt.commitTx({
     kind: "clock_tick",
@@ -2207,17 +2262,73 @@ export async function actionSidePrompt(rt: RpRuntimeHandle, ctx: PiExtensionCont
     }
   }
 
-  const recent = collectRecentDialogueLines(ctx, state, 8);
-  const facts = getActiveFacts(state).slice(-8).map((f) => `- [T${f.validFromTurn}] ${f.statement}`);
+  const recent = collectRecentDialogueLines(ctx, state, 10);
+  const activeFacts = getActiveFacts(state)
+    .slice(-14)
+    .map((f) => {
+      const vis = f.witnessIds === "public" ? "公开" : `仅:${f.witnessIds.join(",")}`;
+      return `- [T${f.validFromTurn}|${vis}] ${f.statement}`;
+    });
+  const activeFlags = Object.entries(state.flags).filter(([, v]) => Boolean(v)).map(([k]) => k);
+  const cfsmList: string[] = [];
+  for (const [actor, axes] of Object.entries(state.cfsmStates)) {
+    for (const [axis, rec] of Object.entries(axes)) cfsmList.push(`${actor}.${axis}=${rec.state}`);
+  }
+  const statList: string[] = [];
+  for (const [actor, rec] of Object.entries(state.stats)) {
+    for (const [k, v] of Object.entries(rec)) statList.push(`${actor}.${k}=${String(v)}`);
+  }
+  const clockList = Object.values(state.clocks).map((c) => `${c.label}:${c.value}/${c.max}${c.completed ? "(完成)" : ""}`);
+  const physList = Object.values(state.physicalState).map(
+    (ps) => `- ${ps.actorId}: ${[ps.attire, ps.condition, ps.holding, ps.position].filter(Boolean).join(" | ")}`,
+  );
+  const beliefList = state.beliefs
+    .slice(-8)
+    .map((b) => `- [T${b.turn}] ${b.actorId}→${b.target}: ${b.belief}${b.subjectiveInsight ? ` (潜台词:${b.subjectiveInsight})` : ""}`);
+  const hookList = Array.from(state.foresights.values())
+    .filter((h) => h.status === "open")
+    .slice(0, 8)
+    .map((h) => `- ${h.summary}${h.triggerHint ? ` (线索:${h.triggerHint})` : ""}`);
+  const memBookList = Array.from(state.memoryBooks.values())
+    .filter((b) => b.enabled)
+    .slice(-5)
+    .map((b) => `- [${b.title} T${b.turnRange[0]}-${b.turnRange[1]}] ${b.summary.slice(0, 180)}`);
+  const agendaList = Object.values(state.npcAgendas).map(
+    (a) => `- ${a.actorId}${typeof a.etaTurns === "number" ? `(剩${a.etaTurns}轮)` : ""}: ${a.currentActivity} (目的:${a.goal})`,
+  );
+  const bondList = Object.values(state.pairBonds).map((b) => `- ${b.actorA}↔${b.actorB}: ${b.stance} (${b.tension}) ${b.note}`);
+
   const systemPrompt =
-    `You are an out-of-character (OOC) story assistant for the user playing "${card.identity.name}". ` +
-    `Answer the user's question directly, concisely, and insightfully in the user's language. Do NOT continue the roleplay prose.`;
-  const userPrompt =
-    `Character core: ${card.identity.name} — ${card.frozen.description.slice(0, 500)}\n` +
-    `Current state: ${[state.era, state.worldTimeLabel, state.location].filter(Boolean).join(" · ") || "unset"} | Turn ${state.turn}\n` +
-    (facts.length ? `Established facts:\n${facts.join("\n")}\n\n` : "") +
-    (recent.length ? `Recent dialogue:\n${recent.join("\n")}\n\n` : "") +
-    `User's OOC question: ${question}`;
+    `You are an omniscient out-of-character (OOC) story & engine copilot for the user playing "${card.identity.name}" inside tavern-next (Pi RP extension). ` +
+    `You have the COMPLETE live world state, memory ledger, beliefs, foresights, agendas, and extension feature map below. ` +
+    `Answer the user's question directly, accurately, and concisely in the user's language. Do NOT write roleplay prose. ` +
+    `Extension UI map (if the user asks how to manage or edit anything): ` +
+    `世界面板(Ctrl+Shift+R) has 5 sections: 1.本局动态一览(近期写入/一键撤销/Flags/事实/信念/伏笔), 2.场景与世界(地点/时间/目标/Flags/时钟/剧情卡/幕间推演/镜头聚焦/幕后插叙), ` +
+    `3.人物与关系(按角色一站式档案:心态/数值/外貌伤势站位/口癖底线/看法/背包/日程 + 关系网/马甲/共演), ` +
+    `4.记忆、伏笔与世界书(世界书/记忆书/秘密盲区/信念/事实/伏笔/前情提要/隐藏恢复楼层/导出小说至rp-exports), ` +
+    `5.导演台与设置(节奏/篇幅视角/禁词表/局部改写/导演指令/内心独白/快捷回复/AI建档/高级设置含Sidecar与语义向量Embedding).`;
+
+  const userPrompt = [
+    `Character core: ${card.identity.name} — ${card.frozen.description.slice(0, 1000)}`,
+    card.frozen.personality ? `Personality: ${card.frozen.personality.slice(0, 400)}` : null,
+    `Live world state: ${[state.era, state.worldTimeLabel, state.location, `Turn ${state.turn}`].filter(Boolean).join(" · ")} | Present: ${state.presentNpcs.join(", ") || "none"} | Player: ${state.currentPersona.name}`,
+    state.sceneObjective ? `Scene objective: ${state.sceneObjective}` : null,
+    activeFlags.length ? `Active Flags: ${activeFlags.join(", ")}` : null,
+    cfsmList.length ? `Character CFSM: ${cfsmList.join(" | ")}` : null,
+    statList.length ? `Stats: ${statList.slice(0, 16).join(" | ")}` : null,
+    clockList.length ? `Clocks: ${clockList.join(" | ")}` : null,
+    physList.length ? `Physical state:\n${physList.join("\n")}${state.spatialNotes ? `\nSpace: ${state.spatialNotes}` : ""}` : null,
+    memBookList.length ? `Archived Memory Books:\n${memBookList.join("\n")}` : null,
+    activeFacts.length ? `Established Facts & Secrets:\n${activeFacts.join("\n")}` : null,
+    beliefList.length ? `Character Beliefs:\n${beliefList.join("\n")}` : null,
+    hookList.length ? `Open Foresights:\n${hookList.join("\n")}` : null,
+    agendaList.length ? `Off-screen NPC Agendas:\n${agendaList.join("\n")}` : null,
+    bondList.length ? `NPC Pair Bonds:\n${bondList.join("\n")}` : null,
+    recent.length ? `Recent dialogue:\n${recent.join("\n")}` : null,
+    `User's OOC question: ${question}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 
   ctx.ui.setWorkingMessage?.("场外分析思考中（不写入历史）…");
   let answer = "";
