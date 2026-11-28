@@ -36,6 +36,7 @@ import { createHash } from "node:crypto";
 import { RP_ENTRY_TYPE, applyRpTx, computeMessageFingerprint, createInitialRpState, replayBranchState } from "./engine/state-replay.js";
 import { loadCompiledCard, loadCompiledPreset, resolveCardBySlug } from "./storage/workspace-store.js";
 import { recallLoreWithGraphPpr, recallMemoryBooks } from "./memory/graph-ppr.js";
+import { type HistoryRecallCooldown, createTurnRecallScope } from "./memory/history-recall.js";
 import { buildSemanticMemSceneCompaction } from "./memory/compaction.js";
 import { getActiveFacts, selectFactsForZone3 } from "./memory/bitemporal.js";
 import { partitionEpistemicFacts } from "./engine/gates.js";
@@ -110,6 +111,17 @@ export function isMalformedToolLeakText(text: string): boolean {
   return stripped.length === 0;
 }
 
+/** Detect reasoning-only or completely empty assistant stops (ported from dsh-tavern body-generation-failure.js). */
+export function isReasoningOnlyOrEmptyStop(msg: PiMessage | undefined): boolean {
+  if (!msg || msg.role !== "assistant") return false;
+  if (msg.stopReason === "toolUse" || msg.stopReason === "tool_calls" || msg.stopReason === "aborted") return false;
+  if (Array.isArray(msg.content)) {
+    const hasToolCall = msg.content.some((b) => b && typeof b === "object" && (b.type === "toolCall" || b.type === "tool_use"));
+    if (hasToolCall) return false;
+  }
+  return extractMessageText(msg).trim().length === 0;
+}
+
 export default function rpEngineExtension(pi: PiExtensionAPI): void {
   let state: SessionRpState = createInitialRpState();
   let activeCard: CompiledCard | null = null;
@@ -123,6 +135,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   let lastAssistantText = "";
   let lastSidecarSettledTurn = -1;
   let consecutiveLeakRecoveries = 0;
+  let turnHistoryRecallScope = createTurnRecallScope();
+  let historyRecallCooldowns: HistoryRecallCooldown[] = [];
   let lastToolsHash = "";
   let lastZone1Hash = "";
   let lastZone1Tokens = 0;
@@ -160,6 +174,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     lastAssistantText = "";
     lastSidecarSettledTurn = -1;
     consecutiveLeakRecoveries = 0;
+    turnHistoryRecallScope = createTurnRecallScope();
+    historyRecallCooldowns = [];
     lastToolsHash = "";
     lastZone1Hash = "";
     lastZone1Tokens = 0;
@@ -320,6 +336,11 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     getExtraCastCards: () => extraCastCards,
     commitTx,
     refreshHud,
+    getHistoryRecallScope: () => turnHistoryRecallScope,
+    getHistoryRecallCooldowns: () => historyRecallCooldowns,
+    setHistoryRecallCooldowns: (next) => {
+      historyRecallCooldowns = next;
+    },
   });
 
   // Register custom editorial TUI message renderers
@@ -434,6 +455,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   // Zone 1 Frozen Prefix (KV-Cache 100% byte-identical across turns, fingerprinted via SHA-256)
   pi.on("before_agent_start", (event) => {
     if (!state.active || !activeCard) return;
+    turnHistoryRecallScope = createTurnRecallScope();
 
     if (typeof event?.prompt === "string") {
       lastUserText = event.prompt;
@@ -529,6 +551,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       preset: activePreset,
       recalledLore: recall.selected,
       recalledMemoryBooks: memBookRecall.chapters,
+      budgetDroppedLore: recall.budgetDropped,
       recentText,
       lastUserMessage: lastUserMsg,
       lastCharMessage: lastCharMsg,
@@ -656,8 +679,10 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
 
     if (msg) {
       lastAssistantText = extractMessageText(msg);
-      // Auto-recover from DeepSeek V4 DSML / malformed `<rp_state_patch">` stop without burning a turn or polluting history!
-      if (isMalformedToolLeakText(lastAssistantText)) {
+      // Auto-recover from DeepSeek V4 DSML / malformed `<rp_state_patch">` OR reasoning-only/empty stop without burning a turn!
+      const isMalformed = isMalformedToolLeakText(lastAssistantText);
+      const isEmptyStop = !isMalformed && isReasoningOnlyOrEmptyStop(msg);
+      if (isMalformed || isEmptyStop) {
         const fp = computeMessageFingerprint(msg);
         const entryId = typeof msg.entryId === "string" ? msg.entryId : typeof msg.id === "string" ? msg.id : null;
         commitTx({
@@ -668,12 +693,18 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
         });
         if (consecutiveLeakRecoveries < 1) {
           consecutiveLeakRecoveries += 1;
-          ctx?.ui?.notify?.("检测到模型输出残缺工具标签，已自动静默恢复生成正文…", "info");
+          ctx?.ui?.notify?.(
+            isEmptyStop
+              ? "检测到模型仅输出思考/空响应，已自动静默恢复生成正文…"
+              : "检测到模型输出残缺工具标签，已自动静默恢复生成正文…",
+            "info",
+          );
           pi.sendMessage(
             {
               customType: "rp:event",
-              content:
-                "[Auto-recovery: the previous output contained only malformed tool markup. Output the narrative prose directly now.]",
+              content: isEmptyStop
+                ? "[Auto-recovery: the previous response produced no visible story prose (reasoning-only/empty stop). Output the narrative prose directly now.]"
+                : "[Auto-recovery: the previous output contained only malformed tool markup. Output the narrative prose directly now.]",
               display: false,
               details: { kind: "leak_recovery" },
             },

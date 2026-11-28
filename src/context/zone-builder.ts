@@ -272,6 +272,7 @@ export function buildZone3TransientTail(options: {
   preset?: CompiledPreset | null;
   recalledLore: CompiledLoreEntry[];
   recalledMemoryBooks?: MemoryBookEntry[];
+  budgetDroppedLore?: Array<{ title: string; tokens?: number }>;
   recentText: string;
   lastUserMessage?: string;
   lastCharMessage?: string;
@@ -284,6 +285,7 @@ export function buildZone3TransientTail(options: {
     preset,
     recalledLore,
     recalledMemoryBooks = [],
+    budgetDroppedLore = [],
     recentText,
     lastUserMessage,
     lastCharMessage,
@@ -369,6 +371,18 @@ export function buildZone3TransientTail(options: {
   };
   parts.push(`<rp_state_frame>\n${stableStringify(compactState)}\n</rp_state_frame>`);
 
+  // 1b. Last-round state delta highlight (ported from dsh-tavern foreground-variable-changes.js)
+  const recentAudit = state.auditLog
+    .filter((a) => a.turn >= Math.max(0, state.turn - 1) && a.summary.trim().length > 0)
+    .slice(-8);
+  if (recentAudit.length > 0) {
+    parts.push(
+      `<rp_recent_changes>\nRecent state changes (write this turn respecting these latest values):\n${recentAudit
+        .map((a) => `- [T${a.turn}] ${a.summary}`)
+        .join("\n")}\n</rp_recent_changes>`,
+    );
+  }
+
   // 2. Mid-session persona switch notice (keeps Zone 1 frozen)
   if (state.personaChangedMidSession) {
     const pDesc = state.currentPersona.description.trim();
@@ -445,6 +459,27 @@ export function buildZone3TransientTail(options: {
 
   if (recalledSections.length > 0) {
     parts.push(`<rp_recalled_context>\n${recalledSections.join("\n\n")}\n</rp_recalled_context>`);
+  }
+
+  // 3b. Lightweight Worldbook Title Hints for budget-dropped entries (<=256 tokens, ported from dsh-tavern)
+  if (budgetDroppedLore.length > 0) {
+    const seenTitles = new Set<string>();
+    const hintTitles: string[] = [];
+    let usedHintTokens = 28;
+    for (const item of budgetDroppedLore) {
+      const title = Array.from(String(item.title || "").trim()).slice(0, 80).join("");
+      if (!title || seenTitles.has(title)) continue;
+      const cost = Math.ceil(title.length * 1.45) + 2;
+      if (usedHintTokens + cost > 256 || hintTitles.length >= 12) break;
+      seenTitles.add(title);
+      hintTitles.push(title);
+      usedHintTokens += cost;
+    }
+    if (hintTitles.length > 0) {
+      parts.push(
+        `<lorebook_title_hints>\n可能用到的世界书条目（超出预算未自动展开，如需细节可调用 rp_recall(action="read", query="标题") 按需查阅）：${hintTitles.join("、")}\n</lorebook_title_hints>`,
+      );
+    }
   }
 
   // 4. Optional Director Pacing, Active Storylets, Genuine Narrative Health Guards & Active Director Notes

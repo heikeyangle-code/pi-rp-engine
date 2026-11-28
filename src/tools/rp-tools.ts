@@ -17,6 +17,13 @@ import { rollDiceCheck } from "../engine/dice.js";
 import { computeCheckedStatValue, validateCfsmTransition, validateInventoryPatch } from "../engine/cfsm.js";
 import { recallLoreWithGraphPpr, tokenizeHybrid } from "../memory/graph-ppr.js";
 import { getActiveFacts } from "../memory/bitemporal.js";
+import {
+  type HistoryRecallCooldown,
+  type HistoryRecallTurnScope,
+  createTurnRecallScope,
+  recallHistory,
+  renderHistoryRecall,
+} from "../memory/history-recall.js";
 import { isFactVisibleToActor } from "../engine/gates.js";
 import { createLinesComponent, styleBold, styleDim, styleFg, wrapDisplayLine } from "../ui/renderers.js";
 
@@ -25,6 +32,7 @@ export const RP_TOOL_NAMES = [
   "rp_state_patch",
   "rp_fact_commit",
   "rp_recall",
+  "rp_history_recall",
   "rp_era_advance",
   "rp_npc_deliberate",
 ] as const;
@@ -35,6 +43,9 @@ export interface RpToolRuntime {
   getExtraCastCards(): CompiledCard[];
   commitTx(tx: RpTxEntry): void;
   refreshHud(ctx?: any): void;
+  getHistoryRecallScope?(): HistoryRecallTurnScope;
+  getHistoryRecallCooldowns?(): HistoryRecallCooldown[];
+  setHistoryRecallCooldowns?(next: HistoryRecallCooldown[]): void;
 }
 
 function getAllLoreEntries(rt: RpToolRuntime): CompiledLoreEntry[] {
@@ -567,29 +578,36 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
     },
   });
 
-  // 4. rp_recall
+  // 4. rp_recall (Unified worldbook list/read/search + memory books/facts/foresights)
   pi.registerTool({
     name: "rp_recall",
     label: "RP 深度世界书检索",
     description:
-      "Search the compiled worldbook (including primary + co-cast cards and manual-only entries), bi-temporal facts, beliefs, and open foresights for a specific topic, entity, or historical detail.",
-    promptSnippet: "Deep-search world lore, historical facts, beliefs, and open foresights.",
+      "Query the compiled worldbook (action='search' default, action='list' to browse paginated entry titles, action='read' to read a specific entry by title/keyword), plus memory books, bi-temporal facts, and open foresights.",
+    promptSnippet: "Search, list, or read worldbook entries, memory books, facts, and open foresights.",
     defaultActive: false,
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Keywords, entity name, or question" },
-        token_budget: { type: "number", description: "Max tokens to return (default 900)" },
+        action: { type: "string", enum: ["search", "list", "read"], description: "Operation mode: search (default), list (browse titles), or read (exact entry full text)" },
+        query: { type: "string", description: "Keywords, entry title, or entity name (required for search/read)" },
+        offset: { type: "number", description: "Pagination offset for list or char offset for read (default 0)" },
+        limit: { type: "number", description: "Max titles for list (default 30, max 100)" },
+        token_budget: { type: "number", description: "Max tokens to return in search mode (default 900)" },
       },
-      required: ["query"],
     },
     renderCall(args, theme) {
+      const act = String(args.action ?? "search");
+      const label = act === "list" ? "浏览目录" : act === "read" ? `读取「${String(args.query ?? "")}」` : `“${String(args.query ?? "")}”`;
       return createLinesComponent(() => [
-        `${styleFg(theme, "accent", "📜 档案检索")} ${styleDim(theme, `“${String(args.query ?? "")}”`)}`,
+        `${styleFg(theme, "accent", "📜 档案检索")} ${styleDim(theme, label)}`,
       ]);
     },
     renderResult(result, _options, theme) {
-      const d = (result.details ?? {}) as { loreCount?: number; factCount?: number };
+      const d = (result.details ?? {}) as { loreCount?: number; factCount?: number; mode?: string; total?: number };
+      if (d.mode === "list") {
+        return createLinesComponent(() => [styleFg(theme, "muted", `📜 世界书目录（共 ${d.total ?? 0} 条）`)]);
+      }
       return createLinesComponent(() => [
         styleFg(theme, "muted", `📜 检索命中 ${d.loreCount ?? 0} 条设定 · ${d.factCount ?? 0} 条事实`),
       ]);
@@ -600,9 +618,93 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       if (!state.active || !card) {
         return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
       }
+      const action = params.action === "list" || params.action === "read" ? params.action : "search";
       const query = String(params.query ?? "").trim();
-      const budget = typeof params.token_budget === "number" ? Math.min(2400, Math.max(200, params.token_budget)) : 900;
       const allLore = getAllLoreEntries(rt);
+      const visibleLore = allLore.filter((e) => (state.loreOverrides[e.id] ?? e.enabled) && e.content.trim().length > 0);
+
+      // Mode A: Paginated title directory (`list`) ported from dsh-tavern worldbook-files.js
+      if (action === "list") {
+        const offset = Math.max(0, Math.floor(Number(params.offset) || 0));
+        const limit = Math.min(100, Math.max(1, Math.floor(Number(params.limit) || 30)));
+        const slice = visibleLore.slice(offset, offset + limit);
+        const lines = slice.map((e, i) => `${offset + i + 1}. [${e.constant ? "常驻" : "动态"}] ${e.title}${e.keys.length ? ` (${e.keys.slice(0, 4).join("/")})` : ""}`);
+        const nextOffset = offset + limit < visibleLore.length ? offset + limit : null;
+        return {
+          content: [
+            {
+              type: "text",
+              text:
+                `Worldbook Directory (${offset + 1}-${offset + slice.length} / ${visibleLore.length}):\n` +
+                lines.join("\n") +
+                (nextOffset !== null ? `\n(More entries available: pass offset=${nextOffset})` : ""),
+            },
+          ],
+          details: { mode: "list", total: visibleLore.length, offset, nextOffset },
+        };
+      }
+
+      // Mode B: Exact-title-first ranked full-text reader (`read`) ported from dsh-tavern worldbook-files.js
+      if (action === "read") {
+        if (!query) {
+          return { isError: true, content: [{ type: "text", text: "query is required for action='read'." }] };
+        }
+        const norm = (v: string) => v.normalize("NFKC").trim().toLowerCase();
+        const qNorm = norm(query);
+        let bestRank = Infinity;
+        let matches: CompiledLoreEntry[] = [];
+        for (const e of visibleLore) {
+          const titleNorm = norm(e.title);
+          const keysNorm = e.keys.map(norm);
+          const rank =
+            titleNorm === qNorm
+              ? 0
+              : keysNorm.some((k) => k === qNorm)
+                ? 1
+                : titleNorm.includes(qNorm) || keysNorm.some((k) => k.includes(qNorm))
+                  ? 2
+                  : Infinity;
+          if (!Number.isFinite(rank) || rank > bestRank) continue;
+          if (rank < bestRank) {
+            matches = [];
+            bestRank = rank;
+          }
+          matches.push(e);
+        }
+        if (matches.length === 0) {
+          matches = visibleLore.filter((e) => norm(e.content).includes(qNorm));
+        }
+        if (matches.length === 0) {
+          return { content: [{ type: "text", text: `No worldbook entry matched "${query}".` }], details: { mode: "read", loreCount: 0 } };
+        }
+        if (matches.length > 1) {
+          const cands = matches.slice(0, 10).map((e, i) => `${i + 1}. ${e.title}`).join("\n");
+          return {
+            content: [{ type: "text", text: `Multiple worldbook entries matched "${query}" (${matches.length} total). Call rp_recall(action="read", query="<exact title>") with one of:\n${cands}` }],
+            details: { mode: "read", loreCount: matches.length },
+          };
+        }
+        const entry = matches[0]!;
+        const offset = Math.max(0, Math.floor(Number(params.offset) || 0));
+        const chars = Array.from(entry.content);
+        const end = Math.min(offset + 8000, chars.length);
+        const text = chars.slice(offset, end).join("");
+        const nextOffset = end < chars.length ? end : null;
+        return {
+          content: [
+            {
+              type: "text",
+              text: `### ${entry.title}\n${text}${nextOffset !== null ? `\n\n[Truncated: call with offset=${nextOffset} to continue]` : ""}`,
+            },
+          ],
+          details: { mode: "read", loreCount: 1, title: entry.title, nextOffset },
+        };
+      }
+
+      if (!query) {
+        return { isError: true, content: [{ type: "text", text: "query is required for action='search'." }] };
+      }
+      const budget = typeof params.token_budget === "number" ? Math.min(2400, Math.max(200, params.token_budget)) : 900;
 
       const loreRes = recallLoreWithGraphPpr({
         entries: allLore,
@@ -670,6 +772,74 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           factCount: matchedFacts.length,
         },
       };
+    },
+  });
+
+  // 4b. rp_history_recall (Ported from dsh-tavern bm25.js + history-recall.js)
+  pi.registerTool({
+    name: "rp_history_recall",
+    label: "RP 历史原文召回",
+    description:
+      "Search or read committed story history verbatim (including older compacted or hidden floors) using CJK Bigram-BM25. Provide EITHER `query` (keywords for entities/promises/numbers) OR `turn` (1-indexed round number + optional `radius` 0..3). Max 6 calls per turn; full reads have a 10-turn cooldown.",
+    promptSnippet: "Recall exact past dialogue/details by BM25 keyword search or round number.",
+    defaultActive: false,
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "Keywords for characters, items, promises, or events to search (space-separated)." },
+        turn: { type: "number", description: "1-indexed story round number to read verbatim." },
+        radius: { type: "number", description: "Neighboring rounds before/after `turn` (0-3, default 1)." },
+        limit: { type: "number", description: "Max search matches to return (1-8, default 5)." },
+      },
+    },
+    renderCall(args, theme) {
+      const detail = typeof args.query === "string" && args.query.trim()
+        ? `搜索 “${args.query.trim()}”`
+        : `读取第 ${String(args.turn ?? "?")} 轮`;
+      return createLinesComponent(() => [
+        `${styleFg(theme, "accent", "🕰 历史召回")} ${styleDim(theme, detail)}`,
+      ]);
+    },
+    renderResult(result, _options, theme) {
+      const d = (result.details ?? {}) as { mode?: string; matchCount?: number; roundCount?: number };
+      const label = d.mode === "read" ? `读取 ${d.roundCount ?? 0} 轮原文` : `命中 ${d.matchCount ?? 0} 处历史片段`;
+      return createLinesComponent(() => [styleFg(theme, "muted", `🕰 ${label}`)]);
+    },
+    async execute(_id, params, _sig, _onUpdate, ctx) {
+      const state = rt.getState();
+      if (!state.active) {
+        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
+      }
+      const branch = ctx?.sessionManager?.getBranch?.() ?? [];
+      const scope = rt.getHistoryRecallScope?.() ?? createTurnRecallScope();
+      const cooldowns = rt.getHistoryRecallCooldowns?.() ?? [];
+      try {
+        const { result, nextCooldowns } = recallHistory({
+          branch,
+          query: typeof params.query === "string" ? params.query : undefined,
+          turn: typeof params.turn === "number" ? params.turn : undefined,
+          radius: typeof params.radius === "number" ? params.radius : undefined,
+          limit: typeof params.limit === "number" ? params.limit : undefined,
+          scope,
+          cooldowns,
+          cacheScopeId: state.cardSlug ?? "rp",
+        });
+        rt.setHistoryRecallCooldowns?.(nextCooldowns);
+        return {
+          content: [{ type: "text", text: renderHistoryRecall(result) }],
+          details: {
+            mode: result.mode,
+            found: result.found,
+            matchCount: result.matches.length,
+            roundCount: result.rounds.length,
+          },
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: (err as Error).message }],
+        };
+      }
     },
   });
 

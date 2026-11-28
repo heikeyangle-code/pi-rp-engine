@@ -2,21 +2,17 @@
  * Hybrid CJK + Latin token estimator & deterministic priority budget trimmer.
  */
 
+const CJK_CHAR_RE = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\u3000-\u303f\uff00-\uffef]/u;
+
 export function estimateTokens(text: string): number {
   if (!text) return 0;
   let cjk = 0;
   let other = 0;
-  for (let i = 0; i < text.length; i++) {
-    const code = text.charCodeAt(i);
-    if (
-      (code >= 0x4e00 && code <= 0x9fff) ||
-      (code >= 0x3400 && code <= 0x4dbf) ||
-      (code >= 0x3000 && code <= 0x303f) ||
-      (code >= 0xff00 && code <= 0xffef)
-    ) {
+  for (const ch of text) {
+    if (CJK_CHAR_RE.test(ch)) {
       cjk++;
     } else {
-      other++;
+      other += ch.length;
     }
   }
   return Math.ceil(cjk * 1.45 + other / 3.8);

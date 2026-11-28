@@ -95,6 +95,12 @@ export async function runSidecarLightSettlement(options: {
   const model = resolveSidecarModel(ctx, state.sidecarModel);
   if (!canCompleteWithRegistry(ctx, model)) return 0;
 
+  // Snapshot branch leaf & turn BEFORE the async LLM call (ported from dsh-tavern Background Cycle CAS)
+  // so late sidecar results NEVER contaminate a rewound/forked/exited branch!
+  const startLeafId = ctx.sessionManager?.getLeafId?.() ?? null;
+  const startTurn = state.turn;
+  const startCardSlug = state.cardSlug;
+
   const schemaFields: string[] = [
     `"location": string|null`,
     `"presentNpcs": string[]|null`,
@@ -203,6 +209,17 @@ export async function runSidecarLightSettlement(options: {
       clocks?: Array<{ clockId?: string; label?: string; delta?: number; max?: number }>;
     }>(rawText);
     if (!parsed) return 0;
+
+    // Stale-branch guard: if user exited RP, switched cards, rewound, or moved to another branch while sidecar ran, discard cleanly!
+    if (!state.active || state.turn !== startTurn || state.cardSlug !== startCardSlug) {
+      return 0;
+    }
+    if (startLeafId && typeof ctx.sessionManager?.getBranch === "function") {
+      const currentBranch = ctx.sessionManager.getBranch();
+      if (currentBranch.length > 0 && !currentBranch.some((e) => e.id === startLeafId)) {
+        return 0;
+      }
+    }
 
     let committed = 0;
     const commit = (tx: RpTxEntry) => {

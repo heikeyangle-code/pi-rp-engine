@@ -4,6 +4,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import rpEngineExtension from "../src/index.js";
+import { bm25Scores, buildBm25Index, tokenizeBigram } from "../src/memory/bm25.js";
+import { createTurnRecallScope, recallHistory, renderHistoryRecall } from "../src/memory/history-recall.js";
+import { estimateTokens } from "../src/context/token-budget.js";
+import { runSidecarLightSettlement } from "../src/engine/settlement.js";
+import { isReasoningOnlyOrEmptyStop } from "../src/index.js";
+
 import { completeWithRegistry, stripThinkingBlocks } from "../src/engine/llm-helper.js";
 import { compileCharacterCard } from "../src/parser/card-compiler.js";
 import { saveCompiledCard, getProjectRpDir } from "../src/storage/workspace-store.js";
@@ -448,7 +454,7 @@ test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, re
     assert.ok(h.shortcuts.has("alt+x"));
     assert.ok(h.shortcuts.has("alt+shift+x"));
     assert.equal(h.messageRenderers.size, 3);
-    assert.equal(h.tools.size, 6);
+    assert.equal(h.tools.size, 7);
     for (const tool of h.tools.values()) {
       assert.equal(tool.defaultActive, false);
       assert.equal(typeof tool.renderCall, "function");
@@ -603,6 +609,180 @@ test("actionRewriteLast guards against identical output & actionExportNovel incl
     assert.ok(exported.includes("船老大连眼皮都没抬"), "should include rp:rewrite custom_message");
     assert.ok(exported.includes("## 第 2 节"), "should include rp:era chapter divider");
     assert.ok(!exported.includes("吐了口烟"), "should exclude replaced/hidden original assistant floor");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("dsh-port-1: CJK Bigram-BM25 & rp_history_recall search, read, cooldown & 6-call turn budget", () => {
+  const tokens = tokenizeBigram("烟台码头黑水船老大");
+  assert.ok(tokens.includes("烟台") && tokens.includes("码头") && tokens.includes("船老"));
+
+  const corpus = buildBm25Index(["烟台码头起雾，船老大收了三十文船钱。", "德州城北门集市，柳春娘在熬药。"]);
+  const scores = bm25Scores(tokenizeBigram("船钱"), corpus);
+  assert.ok(scores[0]! > scores[1]!);
+
+  const branch: PiSessionEntry[] = [
+    { id: "g1", type: "custom_message", customType: "rp:greeting", content: "开场：烟台码头天还没亮，船老大要价三十文。", display: true },
+    { id: "u1", type: "message", message: { role: "user", content: "我递上三十文铜钱。" } },
+    { id: "a1", type: "message", message: { role: "assistant", content: "船老大掂了掂铜钱，放你进了底舱。" } },
+    { id: "u2", type: "message", message: { role: "user", content: "我问老汉这船去哪儿。" } },
+    { id: "a2", type: "message", message: { role: "assistant", content: "老汉低声说直奔营口，还提到一张破地图。" } },
+  ];
+
+  const scope = createTurnRecallScope();
+  // 1. Search mode
+  const s1 = recallHistory({ branch, query: "三十文 铜钱", scope, cooldowns: [] });
+  assert.equal(s1.result.found, true);
+  assert.equal(s1.result.mode, "search");
+  assert.ok(s1.result.matches.length >= 1);
+  assert.ok(renderHistoryRecall(s1.result).includes("以下是已经发生的历史"));
+
+  // Duplicate search in same turn is deduped cleanly
+  const sDup = recallHistory({ branch, query: "铜钱 三十文", scope, cooldowns: s1.nextCooldowns });
+  assert.ok(sDup.result.notice.includes("相同关键词本回合已检索"));
+
+  // 2. Read mode + 10-turn cooldown
+  const r1 = recallHistory({ branch, turn: 2, radius: 0, scope, cooldowns: s1.nextCooldowns });
+  assert.equal(r1.result.found, true);
+  assert.equal(r1.result.rounds.length, 1);
+  assert.equal(r1.result.rounds[0]!.turn, 2);
+  assert.ok(r1.nextCooldowns.some((c) => c.turn === 2));
+
+  // Re-reading round 2 within 10 turns hits cooldown
+  const rCool = recallHistory({ branch, turn: 2, radius: 0, scope: createTurnRecallScope(), cooldowns: r1.nextCooldowns });
+  assert.equal(rCool.result.rounds.length, 0);
+  assert.ok(rCool.result.notice.includes("10 轮冷却期"));
+
+  // 3. 6-call per-turn budget guard
+  const budgetScope = createTurnRecallScope();
+  for (let i = 0; i < 6; i++) {
+    recallHistory({ branch, query: `词${i}`, scope: budgetScope, cooldowns: [] });
+  }
+  const over = recallHistory({ branch, query: "超限", scope: budgetScope, cooldowns: [] });
+  assert.ok(over.result.notice.includes("预算已用尽"));
+});
+
+test("dsh-port-2: Zone 3 emits <lorebook_title_hints> for budget-dropped lore & <rp_recent_changes> for state deltas", () => {
+  const card = compileCharacterCard({ name: "黑水", description: "测试" }, "v2");
+  const state = createInitialRpState();
+  state.active = true;
+  state.turn = 3;
+  applyRpTx(state, { kind: "stat_patch", actorId: "黑水", key: "信任", op: "add", value: 10, reason: "分担干粮" });
+
+  const z3 = buildZone3TransientTail({
+    card,
+    state,
+    recalledLore: [],
+    budgetDroppedLore: [
+      { title: "营口码头黑市规矩", tokens: 320 },
+      { title: "关东马匪派系图谱", tokens: 410 },
+    ],
+    recentText: "我们商量去营口码头",
+  });
+
+  assert.ok(z3.includes("<rp_recent_changes>"), "should highlight last-turn state delta");
+  assert.ok(z3.includes("黑水.信任"), "should mention updated stat in delta");
+  assert.ok(z3.includes("<lorebook_title_hints>"), "should emit lightweight title hints for dropped lore");
+  assert.ok(z3.includes("营口码头黑市规矩") && z3.includes("关东马匪派系图谱"));
+});
+
+test("dsh-port-3: Unified rp_recall supports list/read/search & rp_history_recall executes via Pi tool", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rp-tools-port-"));
+  try {
+    const h = createMockPiHarness(tmpDir);
+    rpEngineExtension(h.pi);
+    const rawCard = {
+      name: "黑水",
+      description: "测试卡",
+      first_mes: "开场白：冰面开裂了。",
+      character_book: {
+        entries: [
+          { uid: 1, comment: "营口暗桩", keys: ["营口", "暗桩"], content: "营口城西米铺后院藏着接应暗桩。", enabled: true, constant: false },
+          { uid: 2, comment: "关东气候", keys: ["风雪"], content: "腊月北风能把人的耳朵冻掉。", enabled: true, constant: true },
+        ],
+      },
+    };
+    const card = compileCharacterCard(rawCard, "v2");
+    saveCompiledCard({ baseDir: path.join(tmpDir, ".pi", "rp"), card, rawJson: rawCard });
+    h.ctx.ui.select = async (_t: string, opts: string[]) => opts[0];
+    await h.commands.get("rp")!.handler(`load ${card.slug}`, h.ctx);
+
+    // 1. rp_recall action="list"
+    const listRes = await h.tools.get("rp_recall")!.execute("c1", { action: "list", offset: 0, limit: 10 }, undefined, undefined, h.ctx);
+    const listText = (listRes.content[0] as { text: string }).text;
+    assert.ok(listText.includes("营口暗桩") && listText.includes("关东气候"));
+
+    // 2. rp_recall action="read"
+    const readRes = await h.tools.get("rp_recall")!.execute("c2", { action: "read", query: "营口暗桩" }, undefined, undefined, h.ctx);
+    const readText = (readRes.content[0] as { text: string }).text;
+    assert.ok(readText.includes("米铺后院藏着接应暗桩"));
+
+    // 3. rp_history_recall tool
+    h.entries.push(
+      { id: "m1", type: "message", message: { role: "user", content: "我藏好了一把火镰。" } },
+      { id: "m2", type: "message", message: { role: "assistant", content: "黑水瞥见你袖口里的火镰，没作声。" } },
+    );
+    const histRes = await h.tools.get("rp_history_recall")!.execute("c3", { query: "火镰" }, undefined, undefined, h.ctx);
+    const histText = (histRes.content[0] as { text: string }).text;
+    assert.ok(histText.includes("火镰") && histText.includes("<history_recall>"));
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("dsh-port-4: Sidecar CAS stale-branch guard discards late settlement & CJK estimateTokens + reasoning-only stop", async () => {
+  // Full CJK coverage (Han + Kana + Hangul)
+  assert.ok(estimateTokens("日本語テスト한국어中文") >= 14);
+
+  // Reasoning-only / empty stop detection
+  assert.equal(
+    isReasoningOnlyOrEmptyStop({ role: "assistant", stopReason: "stop", content: [{ type: "thinking", thinking: "hmm" }] }),
+    true,
+  );
+  assert.equal(
+    isReasoningOnlyOrEmptyStop({ role: "assistant", stopReason: "toolUse", content: [{ type: "toolCall", name: "rp_roll_check" }] }),
+    false,
+  );
+  assert.equal(
+    isReasoningOnlyOrEmptyStop({ role: "assistant", stopReason: "stop", content: [{ type: "text", text: "风吹过城门。" }] }),
+    false,
+  );
+
+  // Sidecar stale-branch guard: branch leaf disappears before LLM resolves -> 0 committed!
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rp-sidecar-cas-"));
+  try {
+    const h = createMockPiHarness(tmpDir);
+    const state = createInitialRpState();
+    state.active = true;
+    state.cardSlug = "test";
+    state.settlementMode = "sidecar-light";
+    state.turn = 2;
+    h.entries.push({ id: "leaf_old", type: "message", message: { role: "assistant", content: "old" } });
+
+    h.ctx.model = { provider: "deepseek", id: "deepseek-flash" };
+    h.ctx.modelRegistry = {
+      streamSimple() {
+        return {
+          async result() {
+            // Simulate user rewinding/switching branch while sidecar was in-flight!
+            h.entries.length = 0;
+            h.entries.push({ id: "leaf_new", type: "message", message: { role: "assistant", content: "rewound" } });
+            return { content: [{ type: "text", text: '{"location":"新地点"}' }] };
+          },
+        };
+      },
+    };
+
+    const committed = await runSidecarLightSettlement({
+      pi: h.pi,
+      ctx: h.ctx,
+      state,
+      lastUserText: "去港口",
+      lastAssistantText: "你来到了港口。",
+    });
+    assert.equal(committed, 0, "stale sidecar result must be discarded when branch changed");
+    assert.equal(state.location, "", "state must remain untouched");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
