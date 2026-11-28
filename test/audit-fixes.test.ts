@@ -421,7 +421,7 @@ test("audit-8: Pi v1.7.0 session_shutdown & session_compact lifecycle hooks", as
 test("audit-9: v5 Prose-First default, Anti-Godmoding/Anti-Sycophancy/Spotlight & Runtime SlopTracker", async () => {
   const { detectRuntimeSlop } = await import("../src/engine/stagnation.js");
   const state = createInitialRpState();
-  assert.equal(state.settlementMode, "sidecar-light", "Default settlementMode must be Prose-First sidecar-light");
+  assert.equal(state.settlementMode, "tool-assisted", "Default settlementMode for single-model users must be tool-assisted (0 extra calls)");
   assert.equal(state.antiGodmoding, true, "Anti-Godmoding must default to enabled");
 
   state.active = true;

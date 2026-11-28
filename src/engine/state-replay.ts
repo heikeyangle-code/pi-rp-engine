@@ -73,7 +73,7 @@ export function createInitialRpState(): SessionRpState {
     presetId: null,
     rawPassthrough: false,
     hudMode: "minimal",
-    settlementMode: "sidecar-light",
+    settlementMode: "tool-assisted",
     pacingMode: "balanced",
     responseLength: "standard",
     narrativePov: "auto",
