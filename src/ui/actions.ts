@@ -97,6 +97,31 @@ function previewText(text: string, maxLen = 68): string {
   return oneLine.length > maxLen ? `${oneLine.slice(0, maxLen)}…` : oneLine;
 }
 
+/** Normalize both regular `message` entries and Pi's native `custom_message` entries from `getBranch()`. */
+function normalizeBranchMessage(e: {
+  type: string;
+  customType?: string;
+  message?: PiMessage;
+  content?: unknown;
+  display?: boolean;
+  details?: unknown;
+  timestamp?: number | string;
+}): PiMessage | null {
+  if (e.type === "message" && e.message) return e.message;
+  if (e.type === "custom_message" && e.content !== undefined) {
+    const ts = typeof e.timestamp === "number" ? e.timestamp : undefined;
+    return {
+      role: "custom",
+      customType: e.customType,
+      content: e.content as PiMessage["content"],
+      display: Boolean(e.display),
+      details: e.details,
+      timestamp: ts,
+    };
+  }
+  return null;
+}
+
 function extractMsgPlain(msg: PiMessage | undefined): string {
   if (!msg) return "";
   if (typeof msg.content === "string") return msg.content;
@@ -1172,9 +1197,18 @@ export async function actionToggleHide(
   }
 
   const branch = ctx.sessionManager.getBranch();
-  const msgEntries = branch.filter(
-    (e) => e.type === "message" && e.message && (e.message.role === "user" || e.message.role === "assistant"),
-  );
+  const msgEntries = branch
+    .map((e) => ({ entry: e, msg: normalizeBranchMessage(e) }))
+    .filter(
+      (x): x is { entry: (typeof branch)[number]; msg: PiMessage } =>
+        Boolean(
+          x.msg &&
+            (x.msg.role === "user" ||
+              x.msg.role === "assistant" ||
+              x.msg.customType === "rp:rewrite" ||
+              x.msg.customType === "rp:greeting"),
+        ),
+    );
 
   if (msgEntries.length === 0) {
     ctx.ui.notify("当前分支暂无可隐藏的对话楼层。", "info");
@@ -1185,8 +1219,8 @@ export async function actionToggleHide(
   if (arg) {
     const count = Math.max(1, Number(arg) || 1);
     const targets = msgEntries.slice(-count);
-    const ids = targets.map((e) => e.id);
-    const fps = targets.map((e) => computeMessageFingerprint(e.message!));
+    const ids = targets.map((x) => x.entry.id);
+    const fps = targets.map((x) => computeMessageFingerprint(x.msg));
     rt.commitTx({ kind: "hide_toggle", entryIds: ids, fingerprints: fps, hidden: hide });
     ctx.ui.notify(`已${hide ? "隐藏" : "恢复"}最近 ${ids.length} 条对话楼层（非破坏性，不删日志）。`, "info");
     return;
@@ -1194,17 +1228,18 @@ export async function actionToggleHide(
 
   // Interactive floor picker showing last 16 messages with status badges
   const recent = msgEntries.slice(-16).reverse();
-  const opts = recent.map((e, idx) => {
-    const fp = computeMessageFingerprint(e.message!);
-    const isHidden = state.hiddenEntryIds.has(e.id) || state.hiddenFingerprints.has(fp);
-    const roleTag = e.message!.role === "user" ? "玩家" : "叙事";
+  const opts = recent.map((x, idx) => {
+    const fp = computeMessageFingerprint(x.msg);
+    const isHidden = state.hiddenEntryIds.has(x.entry.id) || state.hiddenFingerprints.has(fp);
+    const roleTag = x.msg.role === "user" ? "玩家" : x.msg.customType === "rp:rewrite" ? "改写" : "叙事";
     const badge = isHidden ? "🙈已隐藏" : "👁可见";
-    return `${idx + 1}. [${badge}] [${roleTag}] ${previewText(extractMsgPlain(e.message), 50)}`;
+    return `${idx + 1}. [${badge}] [${roleTag}] ${previewText(extractMsgPlain(x.msg), 50)}`;
   });
 
+  const hasHidden = state.hiddenEntryIds.size > 0 || state.hiddenFingerprints.size > 0;
   const pick = await ctx.ui.select(
-    hide ? "🙈 选择要隐藏（不发给模型）的对话楼层" : "👁 选择要恢复显示的对话楼层",
-    [...opts, ...(hide ? [] : ["✨ 一键恢复全部已隐藏楼层"]), "✕ 返回"],
+    hide ? "🙈 隐藏或恢复对话楼层（点击切换可见/隐藏）" : "👁 选择要恢复显示的对话楼层",
+    [...opts, ...(hasHidden ? ["✨ 一键恢复全部已隐藏楼层"] : []), "✕ 返回"],
   );
   if (!pick || pick.startsWith("✕")) return;
 
@@ -1222,10 +1257,10 @@ export async function actionToggleHide(
   const idx = opts.indexOf(pick);
   const chosen = recent[idx];
   if (!chosen) return;
-  const fp = computeMessageFingerprint(chosen.message!);
-  const currentlyHidden = state.hiddenEntryIds.has(chosen.id) || state.hiddenFingerprints.has(fp);
+  const fp = computeMessageFingerprint(chosen.msg);
+  const currentlyHidden = state.hiddenEntryIds.has(chosen.entry.id) || state.hiddenFingerprints.has(fp);
   const nextHidden = !currentlyHidden;
-  rt.commitTx({ kind: "hide_toggle", entryIds: [chosen.id], fingerprints: [fp], hidden: nextHidden });
+  rt.commitTx({ kind: "hide_toggle", entryIds: [chosen.entry.id], fingerprints: [fp], hidden: nextHidden });
   ctx.ui.notify(`该楼层已设为：${nextHidden ? "隐藏（模型不可见）" : "恢复可见"}`, "info");
 }
 
@@ -1443,10 +1478,7 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
         maxTokens: 600,
         signal: ctx.signal,
       });
-      const m = /\{[\s\S]*\}/.exec(raw.replace(/<think>[\s\S]*?<\/think>/gi, ""));
-      if (m) {
-        sim = JSON.parse(m[0]!) as DowntimeSimResult;
-      }
+      sim = extractJsonObject<DowntimeSimResult>(raw);
     } catch {
       sim = null;
     }
@@ -1853,8 +1885,14 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
       (e.type === "custom_message" || e.type === "message") &&
       (e.customType === "rp:event" || e.customType === "rp:era" || e.message?.customType === "rp:event" || e.message?.customType === "rp:era")
     ) {
-      const details = ((e.message?.details ?? e.data) ?? {}) as { kind?: string };
-      if (details.kind === "continue" || details.kind === "montage" || details.kind === "reroll") {
+      const details = ((e.message?.details ?? (e as { details?: unknown }).details ?? e.data) ?? {}) as { kind?: string };
+      if (
+        details.kind === "continue" ||
+        details.kind === "montage" ||
+        details.kind === "downtime" ||
+        details.kind === "scene_shift" ||
+        details.kind === "reroll"
+      ) {
         triggerIdx = i;
         triggerKind = "custom";
         break;
@@ -1887,7 +1925,8 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
 
   const assistantEntry = branch[lastAssistantIdx]!;
   const triggerEntry = triggerIdx >= 0 ? branch[triggerIdx]! : undefined;
-  const triggerText = triggerEntry?.message ? extractMsgPlain(triggerEntry.message) : "";
+  const normalizedTrigger = triggerEntry ? normalizeBranchMessage(triggerEntry) : null;
+  const triggerText = normalizedTrigger ? extractMsgPlain(normalizedTrigger) : "";
   const rewindParentId = triggerEntry?.parentId ?? (triggerIdx > 0 ? branch[triggerIdx - 1]?.id : undefined);
 
   // Preferred path: true tree-branching Swipe via navigateTree so old swipe stays intact in Pi /tree!
@@ -2040,13 +2079,19 @@ function collectRecentDialogueLines(ctx: PiExtensionContext, state: SessionRpSta
   const branch = ctx.sessionManager.getBranch();
   const out: string[] = [];
   for (const e of branch) {
-    if (e.type !== "message" || !e.message) continue;
-    if (e.message.role !== "user" && e.message.role !== "assistant") continue;
-    const fp = computeMessageFingerprint(e.message);
+    const m = normalizeBranchMessage(e);
+    if (!m) continue;
+    const isNarrative =
+      m.role === "user" ||
+      m.role === "assistant" ||
+      m.customType === "rp:greeting" ||
+      m.customType === "rp:rewrite";
+    if (!isNarrative) continue;
+    const fp = computeMessageFingerprint(m);
     if (state.hiddenEntryIds.has(e.id) || state.hiddenFingerprints.has(fp)) continue;
-    const txt = extractMsgPlain(e.message).trim();
+    const txt = extractMsgPlain(m).trim();
     if (!txt) continue;
-    const speaker = e.message.role === "user" ? state.currentPersona.name : "叙事";
+    const speaker = m.role === "user" ? state.currentPersona.name : "叙事";
     out.push(`[${speaker}] ${txt.slice(0, 600)}`);
   }
   return out.slice(-limit);
@@ -2798,23 +2843,25 @@ export async function actionRewriteLast(rt: RpRuntimeHandle, ctx: PiExtensionCon
   }
 
   const branch = ctx.sessionManager.getBranch();
-  let lastAssistant: (typeof branch)[number] | undefined;
+  let lastTarget: { entry: (typeof branch)[number]; msg: PiMessage } | undefined;
   for (let i = branch.length - 1; i >= 0; i--) {
     const e = branch[i]!;
-    if (e.type === "message" && e.message?.role === "assistant") {
-      const fp = computeMessageFingerprint(e.message);
-      if (!state.hiddenEntryIds.has(e.id) && !state.hiddenFingerprints.has(fp)) {
-        lastAssistant = e;
-        break;
-      }
+    const m = normalizeBranchMessage(e);
+    if (!m) continue;
+    const isRewritable = m.role === "assistant" || m.customType === "rp:rewrite" || m.customType === "rp:greeting";
+    if (!isRewritable) continue;
+    const fp = computeMessageFingerprint(m);
+    if (!state.hiddenEntryIds.has(e.id) && !state.hiddenFingerprints.has(fp)) {
+      lastTarget = { entry: e, msg: m };
+      break;
     }
   }
-  if (!lastAssistant?.message) {
+  if (!lastTarget) {
     ctx.ui.notify("当前分支没有可改写的回复。", "info");
     return;
   }
 
-  const original = extractMsgPlain(lastAssistant.message).trim();
+  const original = extractMsgPlain(lastTarget.msg).trim();
   if (!original) {
     ctx.ui.notify("上一条回复内容为空。", "info");
     return;
@@ -2845,11 +2892,11 @@ export async function actionRewriteLast(rt: RpRuntimeHandle, ctx: PiExtensionCon
     rewritten = (
       await completeWithRegistry(ctx, ctx.model, {
         systemPrompt:
-          `You are a precision fiction editor revising the latest narrative reply for "${card.identity.name}". ` +
-          `Apply ONLY the user's requested edit while preserving unaffected paragraphs, tone, language, and continuity. ` +
-          `Output ONLY the revised prose (no explanations, no markdown wrappers).`,
-        userPrompt: `Original reply:\n${original}\n\nRequested edit:\n${instruction}`,
-        maxTokens: 1600,
+          `You are a skilled fiction editor actively revising a roleplay reply for "${card.identity.name}". ` +
+          `You MUST make concrete, clearly noticeable textual revisions that fully satisfy the user's edit request — NEVER return an unchanged copy of the original text. ` +
+          `Keep story continuity and the original language, and output ONLY the revised prose (no meta commentary, no markdown fences).`,
+        userPrompt: `Original reply:\n${original}\n\nMandatory edit instruction (apply visibly and thoroughly):\n${instruction}\n\nOutput the revised reply now:`,
+        maxTokens: 4096,
         signal: ctx.signal,
       })
     ).trim();
@@ -2863,14 +2910,20 @@ export async function actionRewriteLast(rt: RpRuntimeHandle, ctx: PiExtensionCon
     return;
   }
 
+  const norm = (t: string) => t.replace(/[\s\p{P}]+/gu, "");
+  if (norm(rewritten) === norm(original)) {
+    ctx.ui.notify("⚠️ 模型返回了与原文几乎一致的内容，未执行替换。请尝试输入更具体的改写要求。", "warning");
+    return;
+  }
+
   const ok = await ctx.ui.confirm(
-    "确认替换为改写后的版本？（原版将非破坏性隐藏，随时可恢复）",
+    `确认替换为改写版本？（原 ${original.length} 字 → 改写后 ${rewritten.length} 字，原楼层对模型隐藏）`,
     rewritten.slice(0, 600) + (rewritten.length > 600 ? "\n…（已截断预览）" : ""),
   );
   if (!ok) return;
 
-  const fp = computeMessageFingerprint(lastAssistant.message);
-  rt.commitTx({ kind: "hide_toggle", entryIds: [lastAssistant.id], fingerprints: [fp], hidden: true });
+  const fp = computeMessageFingerprint(lastTarget.msg);
+  rt.commitTx({ kind: "hide_toggle", entryIds: [lastTarget.entry.id], fingerprints: [fp], hidden: true });
   rt.pi.sendMessage(
     {
       customType: "rp:rewrite",
@@ -3137,26 +3190,25 @@ export async function actionExportNovel(rt: RpRuntimeHandle, ctx: PiExtensionCon
   let chapterIdx = 1;
   let msgCount = 0;
   for (const e of branch) {
-    if (e.type === "message" && e.message) {
-      const m = e.message;
-      if (m.customType === "rp:ooc" || m.customType === "rp:event") continue;
-      const fp = computeMessageFingerprint(m);
-      if (state.hiddenEntryIds.has(e.id) || state.hiddenFingerprints.has(fp)) continue;
-      const txt = extractMsgPlain(m).trim();
-      if (!txt || txt.startsWith("[OOC")) continue;
+    const m = normalizeBranchMessage(e);
+    if (!m) continue;
+    if (m.customType === "rp:ooc" || m.customType === "rp:event") continue;
+    const fp = computeMessageFingerprint(m);
+    if (state.hiddenEntryIds.has(e.id) || state.hiddenFingerprints.has(fp)) continue;
+    const txt = extractMsgPlain(m).trim();
+    if (!txt || txt.startsWith("[OOC")) continue;
 
-      if (m.customType === "rp:era") {
-        chapterIdx += 1;
-        sections.push(`## 第 ${chapterIdx} 节`, "", `> ${txt.split("\n")[0]}`, "");
-        continue;
-      }
-      if (m.role === "user") {
-        sections.push(`**${state.currentPersona.name}**：${txt}`, "");
-        msgCount += 1;
-      } else if (m.role === "assistant" || m.customType === "rp:greeting" || m.customType === "rp:rewrite") {
-        sections.push(txt, "");
-        msgCount += 1;
-      }
+    if (m.customType === "rp:era") {
+      chapterIdx += 1;
+      sections.push(`## 第 ${chapterIdx} 节`, "", `> ${txt.split("\n")[0]}`, "");
+      continue;
+    }
+    if (m.role === "user") {
+      sections.push(`**${state.currentPersona.name}**：${txt}`, "");
+      msgCount += 1;
+    } else if (m.role === "assistant" || m.customType === "rp:greeting" || m.customType === "rp:rewrite") {
+      sections.push(txt, "");
+      msgCount += 1;
     }
   }
 
@@ -3165,7 +3217,7 @@ export async function actionExportNovel(rt: RpRuntimeHandle, ctx: PiExtensionCon
     return;
   }
 
-  const exportDir = path.join(state.worldDir || getGlobalLibraryDir(), "exports");
+  const exportDir = path.join(ctx.cwd || state.worldDir || getGlobalLibraryDir(), "rp-exports");
   fs.mkdirSync(exportDir, { recursive: true });
   const stamp = new Date().toISOString().slice(0, 10);
   const customName = argsText.trim().replace(/[^a-zA-Z0-9\u4e00-\u9fa5_-]+/g, "_");

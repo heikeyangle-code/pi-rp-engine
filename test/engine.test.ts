@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import rpEngineExtension from "../src/index.js";
+import { completeWithRegistry, stripThinkingBlocks } from "../src/engine/llm-helper.js";
 import { compileCharacterCard } from "../src/parser/card-compiler.js";
 import { saveCompiledCard, getProjectRpDir } from "../src/storage/workspace-store.js";
 import { RP_ENTRY_TYPE, applyRpTx, computeMessageFingerprint, createInitialRpState, replayBranchState } from "../src/engine/state-replay.js";
@@ -441,7 +442,7 @@ test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, re
     rpEngineExtension(h.pi);
 
     // 16 shortcuts registered + 3 message renderers + 6 tools (all defaultActive: false)
-    assert.equal(h.shortcuts.size, 16);
+    assert.equal(h.shortcuts.size, 18);
     assert.ok(h.shortcuts.has("alt+r"));
     assert.ok(h.shortcuts.has("alt+e"));
     assert.ok(h.shortcuts.has("alt+x"));
@@ -503,6 +504,105 @@ test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, re
     });
     assert.equal(validateCfsmTransition(cfsmState, "诺亚", "trust", "devoted").ok, false);
     assert.equal(validateCfsmTransition(cfsmState, "诺亚", "trust", "ally").ok, true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("Thinking-model safety: completeWithRegistry enforces >=4096 maxTokens floor & stripThinkingBlocks drops unclosed <think>", async () => {
+  assert.equal(stripThinkingBlocks("<think>unclosed reasoning that ran out of tokens"), "");
+  assert.equal(stripThinkingBlocks("visible prose<think>trailing unclosed"), "visible prose");
+
+  let capturedMaxTokens = 0;
+  const fakeCtx = {
+    cwd: process.cwd(),
+    model: { provider: "deepseek", id: "deepseek-flash" },
+    modelRegistry: {
+      streamSimple(_model: unknown, _ctx: unknown, opts?: Record<string, unknown>) {
+        capturedMaxTokens = Number(opts?.maxTokens ?? 0);
+        return {
+          async result() {
+            return { content: [{ type: "text", text: "<think>step</think>干净正文" }] };
+          },
+        };
+      },
+    },
+    ui: { notify() {}, setStatus() {}, setWidget() {}, select: async () => undefined, confirm: async () => true, input: async () => undefined, editor: async () => undefined, setEditorText() {} },
+    sessionManager: { getBranch: () => [], getEntries: () => [], getLeafId: () => null },
+  };
+  const out = await completeWithRegistry(fakeCtx as never, fakeCtx.model, { userPrompt: "hi", maxTokens: 320 });
+  assert.equal(out, "干净正文");
+  assert.ok(capturedMaxTokens >= 4096, `expected >= 4096, got ${capturedMaxTokens}`);
+});
+
+test("actionRewriteLast guards against identical output & actionExportNovel includes custom_message to cwd/rp-exports", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rp-rewrite-export-"));
+  try {
+    const h = createMockPiHarness(tmpDir);
+    rpEngineExtension(h.pi);
+    const rawCard = { name: "林秋", description: "测试角色", first_mes: "开场白：码头起雾了。" };
+    const card = compileCharacterCard(rawCard, "v2");
+    saveCompiledCard({ baseDir: path.join(tmpDir, ".pi", "rp"), card, rawJson: rawCard });
+
+    const notifications: string[] = [];
+    h.ctx.ui.notify = (msg: string) => notifications.push(msg);
+    h.ctx.ui.confirm = async () => true;
+    h.ctx.ui.select = async (_title: string, opts: string[]) => opts[0];
+
+    // Bind card
+    await h.commands.get("rp")!.handler(`load ${card.slug}`, h.ctx);
+
+    // Seed branch with native Pi custom_message greeting + user + assistant + custom_message era
+    h.entries.push(
+      { id: "e_greet", type: "custom_message", customType: "rp:greeting", content: "开场白：码头起雾了。", display: true },
+      { id: "e_u1", type: "message", message: { role: "user", content: "我走上跳板。", timestamp: 100 } },
+      { id: "e_a1", type: "message", message: { role: "assistant", content: "船老大抬眼看你，吐了口烟。", timestamp: 200 } },
+      { id: "e_era", type: "custom_message", customType: "rp:era", content: "[时间推进：次日清晨]", display: true },
+    );
+
+    // 1. Identical output from model must be blocked (no fake replacement!)
+    let rewriteOutput = "船老大抬眼看你，吐了口烟。";
+    h.ctx.model = { provider: "deepseek", id: "deepseek-flash" };
+    h.ctx.modelRegistry = {
+      streamSimple() {
+        return {
+          async result() {
+            return { content: [{ type: "text", text: rewriteOutput }] };
+          },
+        };
+      },
+    };
+    const sentBefore = h.sentMessages.length;
+    await h.commands.get("rp")!.handler("rewrite 语气更冷硬", h.ctx);
+    assert.equal(h.sentMessages.length, sentBefore, "identical rewrite should not send rp:rewrite");
+    assert.ok(notifications.some((n) => n.includes("几乎一致")));
+
+    // 2. Genuine changed rewrite succeeds & creates rp:rewrite
+    rewriteOutput = "船老大连眼皮都没抬，只拿烟杆往船舷上一敲，冷声道：上船交钱。";
+    await h.commands.get("rp")!.handler("rewrite 语气更冷硬", h.ctx);
+    assert.equal(h.sentMessages.length, sentBefore + 1);
+    const rwMsg = h.sentMessages[h.sentMessages.length - 1]!;
+    assert.equal(rwMsg.msg.customType, "rp:rewrite");
+
+    // Push the rp:rewrite as custom_message into branch to verify export includes it & hides original
+    h.entries.push({
+      id: "e_rw1",
+      type: "custom_message",
+      customType: "rp:rewrite",
+      content: rewriteOutput,
+      display: true,
+    });
+
+    // 3. Export novel writes directly to cwd/rp-exports/ and includes custom_message greeting + era + rewrite
+    await h.commands.get("rp")!.handler("export my_novel", h.ctx);
+    const outFile = path.join(tmpDir, "rp-exports", "my_novel.md");
+    assert.ok(fs.existsSync(outFile), `expected export file at ${outFile}`);
+    const exported = fs.readFileSync(outFile, "utf-8");
+    assert.ok(exported.includes("开场白：码头起雾了。"), "should include rp:greeting custom_message");
+    assert.ok(exported.includes("我走上跳板。"), "should include user message");
+    assert.ok(exported.includes("船老大连眼皮都没抬"), "should include rp:rewrite custom_message");
+    assert.ok(exported.includes("## 第 2 节"), "should include rp:era chapter divider");
+    assert.ok(!exported.includes("吐了口烟"), "should exclude replaced/hidden original assistant floor");
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

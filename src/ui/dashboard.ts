@@ -64,6 +64,7 @@ export interface DashboardRuntime {
   spotlightNpc?(ctx: PiExtensionContext): Promise<void>;
   interludeScene?(ctx: PiExtensionContext): Promise<void>;
   exportNovel?(ctx: PiExtensionContext): Promise<void>;
+  toggleHide?(ctx: PiExtensionContext): Promise<void>;
 }
 
 function getAllLore(rt: DashboardRuntime): CompiledLoreEntry[] {
@@ -622,6 +623,14 @@ async function openMemoryBookChapters(rt: DashboardRuntime, ctx: PiExtensionCont
       await rt.summarizeOldFloors(ctx);
       continue;
     }
+    if (pick.startsWith("🙈")) {
+      await rt.toggleHide?.(ctx);
+      continue;
+    }
+    if (pick.startsWith("📖")) {
+      await rt.exportNovel?.(ctx);
+      continue;
+    }
 
     const chosen = books[opts.indexOf(pick) - 2];
     if (!chosen) continue;
@@ -680,6 +689,8 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
       `🔒 秘密与认知盲区 FANToM（秘密 ${secretCount} 条 · 生效盲区 ${blindSpots.length} 处）`,
       "📜 查看前情提要（0 Token 瞬时合成）",
       "📦 总结并隐藏较早的对话楼层 → 写入记忆书",
+      "🙈 隐藏或恢复对话楼层（支持一键恢复）",
+      "📖 导出纯净 Markdown 小说（至当前项目 rp-exports/）",
       "+ 记录一条重要剧情/秘密（支持仅指定角色知情）",
       "+ 记录一条未完约定 / 伏笔",
       ...activeFacts.slice(-14).reverse().map((f) => {
@@ -1273,9 +1284,14 @@ async function openOverviewAndAudit(rt: DashboardRuntime, ctx: PiExtensionContex
 
   const pick = await ctx.ui.select(sheetHeader(ctx, "🌍 会话总览与导入审计"), [
     ...lines,
+    "📖 导出纯净 Markdown 小说（至当前项目 rp-exports/）",
     `⌨️ 查看全部 ${RP_SHORTCUT_LIST.length} 项快捷键`,
     "← 返回主面板",
   ]);
+  if (pick?.startsWith("📖")) {
+    await rt.exportNovel?.(ctx);
+    return;
+  }
   if (pick?.startsWith("⌨️")) {
     await ctx.ui.select(
       sheetHeader(ctx, "RP 快捷键速查（Pi 原生 /hotkeys 可查看全部）"),

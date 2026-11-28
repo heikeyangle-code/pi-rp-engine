@@ -27,11 +27,10 @@ export function stripThinkingBlocks(raw: string): string {
     .replace(/<thinking\b[^>]*>[\s\S]*?<\/thinking\s*>/gi, "")
     .replace(/<reasoning\b[^>]*>[\s\S]*?<\/reasoning\s*>/gi, "");
 
-  // Handle unclosed leading `<think>` if a model ran out of tokens mid-thought
+  // Handle unclosed `<think>` if a model ran out of tokens mid-thought (never leak raw CoT!)
   const unclosedIdx = text.search(/<(?:think|thinking|reasoning)\b[^>]*>/i);
   if (unclosedIdx >= 0) {
-    const before = text.slice(0, unclosedIdx).trim();
-    if (before) text = before;
+    text = text.slice(0, unclosedIdx).trim();
   }
   return text.trim();
 }
@@ -200,7 +199,9 @@ export async function completeWithRegistry(
   };
 
   const options: Record<string, unknown> = {};
-  if (typeof req.maxTokens === "number") options.maxTokens = req.maxTokens;
+  // Reasoning/thinking models (e.g. deepseek-flash high) count CoT tokens inside `maxTokens`.
+  // Enforce a safe >= 4096 floor so thinking never starves visible output or truncates JSON!
+  if (typeof req.maxTokens === "number") options.maxTokens = Math.max(req.maxTokens, 4096);
   if (req.signal ?? ctx.signal) options.signal = req.signal ?? ctx.signal;
 
   let raw = "";

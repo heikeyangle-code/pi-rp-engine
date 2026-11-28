@@ -71,6 +71,8 @@ import {
   actionImpersonate,
   actionQuickReplies,
   actionReroll,
+  actionRewriteLast,
+  actionStyleControl,
   actionSetHud,
   actionSidePrompt,
   actionSkipMontage,
@@ -332,7 +334,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     description: "Bind a compiled character card slug immediately in this session",
   });
 
-  // Register 16 ergonomic, terminal-safe shortcuts
+  // Register 18 ergonomic, terminal-safe shortcuts
   registerRpShortcuts(pi, {
     isActive: () => state.active,
     openMenu: (ctx) => openRpMenu(runtime, ctx),
@@ -342,10 +344,12 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     impersonate: (ctx) => actionImpersonate(runtime, ctx, ""),
     sidePrompt: (ctx) => actionSidePrompt(runtime, ctx, ""),
     rerollLast: (ctx) => actionReroll(runtime, ctx, ""),
+    rewriteLast: (ctx) => actionRewriteLast(runtime, ctx, ""),
     continueStory: (ctx) => actionContinue(runtime, ctx),
     actionIdeas: (ctx) => actionIdeas(runtime, ctx),
     directorNote: (ctx) => actionDirectorNote(runtime, ctx, ""),
     cyclePacing: (ctx) => actionCyclePacing(runtime, ctx),
+    styleControl: (ctx) => actionStyleControl(runtime, ctx, ""),
     skipTime: (ctx) => actionSkipMontage(runtime, ctx, ""),
     saveBookmark: (ctx) => actionBookmarkSave(runtime, ctx, ""),
     gotoBookmark: (ctx) => actionBookmarkGoto(runtime, ctx, ""),

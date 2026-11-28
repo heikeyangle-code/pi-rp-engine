@@ -1,5 +1,5 @@
 /**
- * Ergonomic, terminal-safe RP shortcuts registered via Pi's official `pi.registerShortcut` (16 total).
+ * Ergonomic, terminal-safe RP shortcuts registered via Pi's official `pi.registerShortcut` (18 total).
  *
  * Prioritizes daily high-frequency RP workflows (Impersonate, Zero-Pollution Side Prompt,
  * Quick Replies, Context X-Ray, Reroll/Swipe, Continue, Director Note, Scene/Time Jump, Bookmarks).
@@ -21,10 +21,12 @@ export const RP_SHORTCUT_LIST: RpShortcutSpec[] = [
   { key: "alt+i", label: "帮我代写", description: "以玩家视角起草回复并填入输入框 (/rp imp)" },
   { key: "alt+q", label: "场外提问", description: "零污染 Side Prompt，不写入历史与时钟 (/rp ask)" },
   { key: "alt+w", label: "重摇回复", description: "重摇上一条回复（支持定向微调预设，旧分支保留在 /tree · /rp reroll）" },
+  { key: "alt+u", label: "局部改写", description: "定向改写上一条回复的局部段落或语气 (/rp rewrite)" },
   { key: "alt+k", label: "继续续写", description: "让角色无缝续写剧情 (/rp continue)" },
   { key: "alt+a", label: "行动建议", description: "生成 3 个当前情境下的行动选项 (/rp act)" },
   { key: "alt+n", label: "导演指令", description: "管理导演指令与文风/篇幅模板 (/rp note)" },
   { key: "alt+p", label: "切换节奏", description: "循环切换节奏：舒缓 → 均衡 → 紧张 (/rp pace)" },
+  { key: "alt+v", label: "篇幅/视角", description: "切换回复篇幅（精炼/标准/长篇）与叙事人称 (/rp style)" },
   { key: "alt+t", label: "切场景/跳时间", description: "跳过时间或切换至下一场景 (/rp skip)" },
   { key: "alt+b", label: "保存书签", description: "为当前剧情节点打书签 (/rp save)" },
   { key: "alt+j", label: "跳转书签", description: "回溯或分叉至已保存的剧情书签 (/rp goto)" },
@@ -41,10 +43,12 @@ export interface RpShortcutHandlers {
   impersonate(ctx: PiExtensionContext): Promise<void>;
   sidePrompt(ctx: PiExtensionContext): Promise<void>;
   rerollLast(ctx: PiExtensionContext): Promise<void>;
+  rewriteLast(ctx: PiExtensionContext): Promise<void>;
   continueStory(ctx: PiExtensionContext): Promise<void>;
   actionIdeas(ctx: PiExtensionContext): Promise<void>;
   directorNote(ctx: PiExtensionContext): Promise<void>;
   cyclePacing(ctx: PiExtensionContext): Promise<void>;
+  styleControl(ctx: PiExtensionContext): Promise<void>;
   skipTime(ctx: PiExtensionContext): Promise<void>;
   saveBookmark(ctx: PiExtensionContext): Promise<void>;
   gotoBookmark(ctx: PiExtensionContext): Promise<void>;
@@ -116,6 +120,11 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
     handler: requireActive((ctx) => handlers.rerollLast(ctx)),
   });
 
+  pi.registerShortcut("alt+u", {
+    description: "✂️ 局部改写",
+    handler: requireActive((ctx) => handlers.rewriteLast(ctx)),
+  });
+
   pi.registerShortcut("alt+k", {
     description: "▶ 续写剧情",
     handler: requireActive((ctx) => handlers.continueStory(ctx)),
@@ -134,6 +143,11 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
   pi.registerShortcut("alt+p", {
     description: "🎚 切换节奏",
     handler: requireActive((ctx) => handlers.cyclePacing(ctx)),
+  });
+
+  pi.registerShortcut("alt+v", {
+    description: "✒️ 篇幅/视角",
+    handler: requireActive((ctx) => handlers.styleControl(ctx)),
   });
 
   pi.registerShortcut("alt+t", {

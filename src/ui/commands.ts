@@ -92,7 +92,7 @@ const SUBCOMMANDS: Array<{ value: string; description: string }> = [
   { value: "hud", description: "切换 HUD 显示模式 (minimal / full / off · Alt+H)" },
   { value: "mode", description: "切换后台结算模式 (tool-assisted / sidecar-light / off)" },
   { value: "raw", description: "切换原味直通模式（跳过酒馆前端壳剥离）" },
-  { value: "keys", description: "查看全部 16 项 RP 快捷键速查表" },
+  { value: "keys", description: "查看全部 18 项 RP 快捷键速查表" },
   { value: "exit", description: "彻底退出当前会话 RP 模式，恢复编程助手 (Alt+Shift+X)" },
 ];
 
@@ -125,6 +125,7 @@ export function makeDashboardRuntime(rt: RpRuntimeHandle): DashboardRuntime {
     spotlightNpc: (ctx) => actionSpotlight(rt, ctx, ""),
     interludeScene: (ctx) => actionInterlude(rt, ctx, ""),
     exportNovel: (ctx) => actionExportNovel(rt, ctx, ""),
+    toggleHide: (ctx) => actionToggleHide(rt, ctx, "", true),
   };
 }
 
@@ -138,7 +139,7 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
       `🎭 加载已有角色卡（角色库共 ${cards.length} 张）`,
       "📥 浏览并导入角色卡 / 世界书 / 预设（自动识别 Downloads 与当前目录）",
       "🗂 资产库管理（清理角色卡 / 预设 / 马甲）",
-      "⌨️ 查看 16 项快捷键速查表",
+      "⌨️ 查看 18 项快捷键速查表",
       "✕ 关闭",
     ]);
     if (!pick || pick.startsWith("✕")) return;
@@ -155,11 +156,11 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     "📊 打开世界控制台（7 标签 TUI 浮窗 / 全功能面板 · Ctrl+Shift+R）",
     "⚡ 快捷回复与常用动作宏 (Alt+E)",
     "✍️ 帮我代写 (Alt+I)  /  💭 零污染场外提问 (Alt+Q)  /  💬 OOC",
-    "🔄 定向重摇 (Alt+W)  /  ▶ 续写 (Alt+K)  /  💡 行动建议 (Alt+A)",
-    "📚 记忆书 · 前情提要 · 归档旧楼 · 生成世界书",
-    "🔎 上下文 X-Ray 透视 (Alt+X)  /  ↩ 撤销状态变更 (/rp undo)",
-    "🎬 导演指令、内心独白与叙事节奏 (Alt+N / Alt+P)",
-    "⏳ 切场景 / 跳时间 (Alt+T)  /  🔖 书签 (Alt+B / Alt+J)",
+    "🔄 重摇 (Alt+W)  /  ✂️ 局部改写 (Alt+U)  /  ▶ 续写  /  💡 行动建议",
+    "📚 记忆书 · 前情提要 · 归档旧楼 · 生成世界书 · 📖 导出小说",
+    "🔎 上下文 X-Ray 透视 (Alt+X)  /  ↩ 撤销状态变更",
+    "🎬 导演台（指令 / 篇幅视角 Alt+V / 禁词表 / 节奏 / 内心戏）",
+    "⏳ 切场景推演 (Alt+T)  /  🔦 镜头聚焦  /  🎞 幕后插叙  /  🔖 书签",
     "🙈 隐藏或恢复对话楼层 (/rp hide)",
     "🧑 切换玩家马甲 / 👥 同场共演 / 🎭 切换角色或开场白",
     "🔍 一键 AI 智能建档 / 📥 导入新资产",
@@ -184,27 +185,31 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     else if (sub?.startsWith("💭")) await actionSidePrompt(rt, ctx, "");
     else if (sub?.startsWith("💬")) await actionOoc(rt, ctx, "");
   } else if (pick.startsWith("🔄")) {
-    const sub = await ctx.ui.select("剧情推进与重摇", [
+    const sub = await ctx.ui.select("剧情推进、重摇与改写", [
       "🔄 重摇上一条回复（支持定向微调预设 · Alt+W）",
+      "✂️ 局部定向改写上一条回复 (Alt+U)",
       "▶ 无缝续写 (Alt+K)",
       "💡 生成 3 个行动建议 (Alt+A)",
       "← 返回",
     ]);
     if (sub?.startsWith("🔄")) await actionReroll(rt, ctx, "");
+    else if (sub?.startsWith("✂️")) await actionRewriteLast(rt, ctx, "");
     else if (sub?.startsWith("▶")) await actionContinue(rt, ctx);
     else if (sub?.startsWith("💡")) await actionIdeas(rt, ctx);
   } else if (pick.startsWith("📚")) {
-    const sub = await ctx.ui.select("记忆书与世界书", [
+    const sub = await ctx.ui.select("记忆书、世界书与小说导出", [
       "📚 打开记忆书章节与事实管理面板",
-      "📜 前情提要（0 Token 瞬时合成 · /rp recap）",
-      "📦 归档较早的对话楼层 → 写入记忆书并隐藏 (/rp summarize)",
-      "✨ 从最近剧情生成新世界书条目 (/rp loregen)",
+      "📜 前情提要（0 Token 瞬时合成）",
+      "📦 归档较早的对话楼层 → 写入记忆书并隐藏",
+      "✨ 从最近剧情生成新世界书条目",
+      "📖 导出纯净 Markdown 小说（保存至当前项目 rp-exports/）",
       "← 返回",
     ]);
     if (sub?.startsWith("📚")) await openRpDashboard(makeDashboardRuntime(rt), ctx, 2);
     else if (sub?.startsWith("📜")) await actionRecap(rt, ctx);
     else if (sub?.startsWith("📦")) await actionSummarizeOldFloors(rt, ctx, "");
     else if (sub?.startsWith("✨")) await actionGenerateLoreEntry(rt, ctx, "");
+    else if (sub?.startsWith("📖")) await actionExportNovel(rt, ctx, "");
   } else if (pick.startsWith("🔎")) {
     const sub = await ctx.ui.select("透视与状态审计", [
       "🔎 输出本回合上下文 X-Ray 透视报告 (Alt+X)",
@@ -216,12 +221,16 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
   } else if (pick.startsWith("🎬")) {
     const sub = await ctx.ui.select("导演台", [
       "📝 管理导演指令 (Alt+N)",
+      `✒️ 回复篇幅与叙事视角（${state.responseLength} · ${state.narrativePov} · Alt+V）`,
+      `🚫 反 AI 套话禁词表（当前 ${state.bannedPhrases.length} 词）`,
       "🎚 切换叙事节奏 (relaxed/balanced/dramatic · Alt+P)",
       `💭 切换角色内心独白 (<thought>)：当前 ${state.innerMonologue ? "开" : "关"}`,
       "🃏 管理动态剧情卡 Storylets 与场景目标",
       "← 返回",
     ]);
     if (sub?.startsWith("📝")) await actionDirectorNote(rt, ctx, "");
+    else if (sub?.startsWith("✒️")) await actionStyleControl(rt, ctx, "");
+    else if (sub?.startsWith("🚫")) await actionBanPhrases(rt, ctx, "");
     else if (sub?.startsWith("🎚")) await actionSelectPacing(rt, ctx, "");
     else if (sub?.startsWith("💭")) {
       const next = !state.innerMonologue;
@@ -232,13 +241,17 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
       await openRpDashboard(makeDashboardRuntime(rt), ctx, 0);
     }
   } else if (pick.startsWith("⏳")) {
-    const sub = await ctx.ui.select("时间与书签", [
-      "⏳ 切场景 / 跳时间蒙太奇 (Alt+T)",
+    const sub = await ctx.ui.select("场景推演、镜头与书签", [
+      "⏳ 幕间世界推演 / 切场景 (Alt+T)",
+      "🔦 群像镜头切换：指定下一轮主导 NPC",
+      "🎞 零污染幕后插叙 / 小剧场（不影响主线）",
       "🔖 保存当前节点为书签 (Alt+B)",
       "⏪ 跳转 / 分叉至已有书签 (Alt+J)",
       "← 返回",
     ]);
     if (sub?.startsWith("⏳")) await actionSkipMontage(rt, ctx, "");
+    else if (sub?.startsWith("🔦")) await actionSpotlight(rt, ctx, "");
+    else if (sub?.startsWith("🎞")) await actionInterlude(rt, ctx, "");
     else if (sub?.startsWith("🔖")) await actionBookmarkSave(rt, ctx, "");
     else if (sub?.startsWith("⏪")) await actionBookmarkGoto(rt, ctx, "");
   } else if (pick.startsWith("🙈")) {
@@ -272,7 +285,7 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
       `🛡 原味直通模式（当前：${state.rawPassthrough ? "开" : "关"}）`,
       "🎲 快捷掷骰检定 (/rp roll)",
       "🗂 资产库管理（删除角色卡 / 预设 / 马甲）",
-      "⌨️ 查看全部 16 项快捷键",
+      "⌨️ 查看全部 18 项快捷键",
       "← 返回",
     ]);
     if (sub?.startsWith("🤖")) await actionSidecarModel(rt, ctx, "");
