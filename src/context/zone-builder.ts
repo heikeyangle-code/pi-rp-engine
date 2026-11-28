@@ -56,10 +56,14 @@ function fnv1aSeed(str: string): number {
   return h >>> 0;
 }
 
-function buildEngineProtocol(activeToolNames?: string[]): string {
+function buildEngineProtocol(
+  activeToolNames?: string[],
+  options?: { inlineDeltaEnabled?: boolean; archetype?: SessionRpState["archetype"] },
+): string {
   const active = activeToolNames ? new Set(activeToolNames) : null;
   const has = (name: string) => (active ? active.has(name) : true);
-  const hasWriteTools = has("rp_state_patch") || has("rp_fact_commit");
+  const hasWriteTools = Boolean(options?.inlineDeltaEnabled) || has("rp_state_patch") || has("rp_fact_commit");
+  const archetype = options?.archetype ?? "companion";
   const hasRoll = has("rp_roll_check");
   const hasRecall = has("rp_recall") || has("rp_history_recall");
 
@@ -106,8 +110,31 @@ function buildEngineProtocol(activeToolNames?: string[]): string {
     lines.push(`- Active tools (skip on pure casual chat, invoke promptly when triggered): ${toolHints.join("; ")}.`);
   }
   if (hasWriteTools) {
+    const coreKeys = [
+      "`loc: 地点 | NPC1, NPC2`",
+      "`time:`",
+      "`obj:`",
+      "`fact: 事实 [witness: ...]`",
+      "`belief: A->B: 信念 | 诱因`",
+      "`echo: 选择 -> 后果`",
+    ];
+    const extraKeys =
+      archetype === "rpg-sandbox" || archetype === "epic-saga" || archetype === "mystery"
+        ? [
+            "`clock: ID +1`",
+            "`flag: 键=true`",
+            "`route: 地A<->地B | 耗时`",
+            "`faction: 势力 standing=±N heat=+1`",
+            "`encounter: 名称 | stakes=...` / `encounter_end`",
+          ]
+        : [
+            "`promise: A->B: 承诺 | due: TN`",
+            "`phys: 角色 | outfit=... | pose=...`",
+            "`stat: 角色.键 +N`",
+            "`hook: 伏笔 | 提示`",
+          ];
     lines.push(
-      "- Prose-first zero-interruption sync: Write uninterrupted literary prose FIRST. Whenever location, present NPCs, time, stage, scene objective, stats, items, flags, clocks, facts, beliefs, foresights, physical state, or major choice consequences change, append a compact `[[RP_DELTA]]...[[/RP_DELTA]]` block at the very end (stripped from display; omit on pure banter turns). Keys: `loc: 地点 | NPC1, NPC2`, `time:`, `stage:`, `obj:`, `stat: 角色.键 +N`, `inv: player.物 ±N`, `flag: 键=true`, `clock: ID +1`, `storylet_done: ID`, `fact: 内容 [witness: ...]`, `fact_off: ID`, `belief: A->B: 信念 | 诱因`, `hook: 伏笔 | 提示`, `hook_done: ID`, `echo: 选择 -> 潜在后果 [weight: high]`, `promise: A->B: 承诺 | due: TN`, `route: 地A<->地B | 耗时`, `faction: 势力 standing=±N heat=+1`, `spread: factID -> NPC`, `encounter: 名称 | stakes=...` / `encounter_end`, `phys: 角色 | outfit=... | pose=... | held=...`.",
+      `- Prose-first sync: Write uninterrupted literary prose FIRST. Only when concrete state changes (omit on pure banter turns; update at most 2–4 changed fields per turn), append a compact \`[[RP_DELTA]]...[[/RP_DELTA]]\` block at the very end (stripped before display). Keys: ${[...coreKeys, ...extraKeys].join(", ")}.`,
     );
   }
   if (!hasWriteTools) {
@@ -220,8 +247,19 @@ export function buildZone1FrozenPrefix(options: {
   initialPersona: PersonaProfile;
   loreOverrides?: Record<string, boolean>;
   activeToolNames?: string[];
+  inlineDeltaEnabled?: boolean;
+  archetype?: SessionRpState["archetype"];
 }): string {
-  const { card, extraCastCards = [], preset, initialPersona, loreOverrides, activeToolNames } = options;
+  const {
+    card,
+    extraCastCards = [],
+    preset,
+    initialPersona,
+    loreOverrides,
+    activeToolNames,
+    inlineDeltaEnabled,
+    archetype,
+  } = options;
   const charName = card.identity.nickname || card.identity.name;
   const groupMembers = [charName, ...extraCastCards.map((c) => c.identity.nickname || c.identity.name)];
   // Stable per-session deterministic seed ensures {{random}} / {{roll}} in Zone 1 NEVER break KV-Cache!
@@ -253,7 +291,7 @@ export function buildZone1FrozenPrefix(options: {
   const sections: string[] = [];
 
   // 1. Dynamic engine protocol synced 1:1 with active tools (zero ghost tools, crystal-clear dice trigger rule)
-  sections.push(buildEngineProtocol(activeToolNames));
+  sections.push(buildEngineProtocol(activeToolNames, { inlineDeltaEnabled, archetype }));
 
   // 2. Preset Zone 1 prompts (before chatHistory)
   if (preset && preset.zone1Prompts.length > 0) {

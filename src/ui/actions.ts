@@ -3707,6 +3707,11 @@ interface PortableWorldSaveV1 {
     foresights: Array<SessionRpState["foresights"] extends Map<string, infer V> ? V : never>;
     memoryBooks: Array<SessionRpState["memoryBooks"] extends Map<string, infer V> ? V : never>;
     storylets: Array<SessionRpState["storylets"] extends Map<string, infer V> ? V : never>;
+    consequences?: Array<SessionRpState["consequences"] extends Map<string, infer V> ? V : never>;
+    locationGraph?: SessionRpState["locationGraph"];
+    commitments?: Array<SessionRpState["commitments"] extends Map<string, infer V> ? V : never>;
+    factions?: SessionRpState["factions"];
+    encounter?: SessionRpState["encounter"];
     physicalState: SessionRpState["physicalState"];
     spatialNotes: string;
     agendas: SessionRpState["npcAgendas"];
@@ -3784,6 +3789,11 @@ export async function actionExportWorldSave(
       foresights: Array.from(state.foresights.values()),
       memoryBooks: Array.from(state.memoryBooks.values()),
       storylets: Array.from(state.storylets.values()),
+      consequences: Array.from(state.consequences.values()),
+      locationGraph: state.locationGraph,
+      commitments: Array.from(state.commitments.values()),
+      factions: state.factions,
+      encounter: state.encounter,
       physicalState: state.physicalState,
       spatialNotes: state.spatialNotes,
       agendas: state.npcAgendas,
@@ -4090,6 +4100,31 @@ export async function actionImportWorldSave(
   }
   for (const storylet of storyletsArr) {
     if (storylet?.id && storylet.title) rt.commitTx({ kind: "storylet_upsert", storylet });
+  }
+  if (Array.isArray(snap.consequences)) {
+    for (const echo of snap.consequences) {
+      if (echo?.id && echo.choice) rt.commitTx({ kind: "consequence_upsert", echo });
+    }
+  }
+  if (snap.locationGraph && typeof snap.locationGraph === "object") {
+    for (const edge of Object.values(snap.locationGraph)) {
+      if (edge?.from && edge.to) rt.commitTx({ kind: "route_upsert", edge });
+    }
+  }
+  if (Array.isArray(snap.commitments)) {
+    for (const commitment of snap.commitments) {
+      if (commitment?.id && commitment.actor && commitment.promise) {
+        rt.commitTx({ kind: "commitment_upsert", commitment });
+      }
+    }
+  }
+  if (snap.factions && typeof snap.factions === "object") {
+    for (const faction of Object.values(snap.factions)) {
+      if (faction?.name) rt.commitTx({ kind: "faction_upsert", faction });
+    }
+  }
+  if (snap.encounter !== undefined) {
+    rt.commitTx({ kind: "encounter_set", encounter: snap.encounter ?? null });
   }
 
   // Physical state & spatial notes

@@ -557,6 +557,363 @@ async function openActorProfile(rt: DashboardRuntime, ctx: PiExtensionContext, a
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// v6.6 White-Box World Sim Inspectors (零斜杠命令依赖)
+// ---------------------------------------------------------------------------
+function deriveFactionStance(standing: number): string {
+  if (standing >= 50) return "盟友";
+  if (standing >= 15) return "友善";
+  if (standing <= -50) return "敌对";
+  if (standing <= -15) return "猜忌";
+  return "中立";
+}
+
+async function openEncounterManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const enc = s.encounter;
+    if (!enc) {
+      const act = await ctx.ui.select("⚔ 当前无进行中的冲突局势", [
+        "+ 手动开启冲突局势（谈判 / 追逃 / 对峙 / 战斗）",
+        "← 返回",
+      ]);
+      if (!act || act.startsWith("←")) return;
+      const title = (await ctx.ui.input("冲突名称（如：运河夜袭、公堂对峙）", ""))?.trim();
+      if (!title) continue;
+      const stakesRaw = await ctx.ui.input("筹码与输赢后果（可选）", "");
+      if (stakesRaw === undefined) continue;
+      const participantsRaw = await ctx.ui.input("参与方（逗号分隔，可选）", s.presentNpcs.join(", "));
+      if (participantsRaw === undefined) continue;
+      const combatants = participantsRaw
+        .split(/[,，]/)
+        .map((x) => x.trim())
+        .filter(Boolean)
+        .map((name) => ({ name }));
+      rt.commitTx({
+        kind: "encounter_set",
+        encounter: {
+          title,
+          stakes: stakesRaw.trim() || "局势紧绷",
+          combatants,
+          startedTurn: s.turn,
+          round: 1,
+        },
+      });
+      rt.refreshHud(ctx);
+      ctx.ui.notify(`⚔ 已开启冲突局势：${title}`, "info");
+      continue;
+    }
+
+    const combatantNames = enc.combatants.map((c) => c.name);
+    const pick = await ctx.ui.select(
+      `⚔ 冲突局势：${enc.title}（第 ${enc.round} 轮 · T${enc.startedTurn} 起）`,
+      [
+        `🎯 筹码：${enc.stakes || "未设定"}（点击修改）`,
+        `👥 参与方：${combatantNames.join("、") || "在场全员"}（点击修改）`,
+        "⏩ 推进一轮（Round +1）",
+        "✅ 结束当前冲突局势",
+        "← 返回",
+      ],
+    );
+    if (!pick || pick.startsWith("←")) return;
+    if (pick.startsWith("🎯")) {
+      const nextStakes = await ctx.ui.input("修改冲突筹码/风险", enc.stakes);
+      if (nextStakes !== undefined) {
+        rt.commitTx({ kind: "encounter_set", encounter: { ...enc, stakes: nextStakes.trim() } });
+      }
+    } else if (pick.startsWith("👥")) {
+      const nextP = await ctx.ui.input("修改参与方（逗号分隔）", combatantNames.join(", "));
+      if (nextP !== undefined) {
+        const combatants = nextP
+          .split(/[,，]/)
+          .map((x) => x.trim())
+          .filter(Boolean)
+          .map((name) => ({ name }));
+        rt.commitTx({ kind: "encounter_set", encounter: { ...enc, combatants } });
+      }
+    } else if (pick.startsWith("⏩")) {
+      rt.commitTx({ kind: "encounter_set", encounter: { ...enc, round: enc.round + 1 } });
+    } else if (pick.startsWith("✅")) {
+      const ok = await ctx.ui.confirm("结束冲突局势", `确认结束「${enc.title}」？`);
+      if (ok) {
+        rt.commitTx({ kind: "encounter_set", encounter: null });
+        rt.refreshHud(ctx);
+        ctx.ui.notify(`已结束冲突局势：${enc.title}`, "info");
+        return;
+      }
+    }
+  }
+}
+
+async function openLocationGraphManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const edges = Object.values(s.locationGraph);
+    const rows = edges.map(
+      (e, i) => `🗺 #${i + 1} ${e.from} ${e.oneWay ? "→" : "↔"} ${e.to}${e.travelNote ? `（${clipChars(e.travelNote, 20)}）` : ""}`,
+    );
+    const pick = await ctx.ui.select(`🗺 地点路网拓扑（共 ${edges.length} 条路径）`, [
+      "+ 手动添加地点连通路径",
+      ...rows,
+      "← 返回",
+    ]);
+    if (!pick || pick.startsWith("←")) return;
+    if (pick.startsWith("+")) {
+      const from = (await ctx.ui.input("起点地名", s.location || ""))?.trim();
+      if (!from) continue;
+      const to = (await ctx.ui.input("终点地名", ""))?.trim();
+      if (!to || to === from) continue;
+      const travelNoteRaw = await ctx.ui.input("通行耗时或路况备注（如：步行半刻、夜禁封闸，可选）", "");
+      if (travelNoteRaw === undefined) continue;
+      const [a, b] = [from, to].sort();
+      rt.commitTx({
+        kind: "route_upsert",
+        edge: {
+          id: `${a}::${b}`,
+          from,
+          to,
+          travelNote: travelNoteRaw.trim() || undefined,
+          discoveredTurn: s.turn,
+        },
+      });
+      ctx.ui.notify(`已添加路径：${from} ↔ ${to}`, "info");
+    } else {
+      const idx = rows.indexOf(pick);
+      const edge = idx >= 0 ? edges[idx] : undefined;
+      if (!edge) continue;
+      const act = await ctx.ui.select(`路径：${edge.from} ${edge.oneWay ? "→" : "↔"} ${edge.to}`, [
+        "✏️ 修改耗时与路况备注",
+        "🗑 删除此路径",
+        "← 返回",
+      ]);
+      if (act?.startsWith("✏️")) {
+        const n = await ctx.ui.input("通行耗时或路况备注", edge.travelNote ?? "");
+        if (n === undefined) continue;
+        rt.commitTx({
+          kind: "route_upsert",
+          edge: { ...edge, travelNote: n.trim() || undefined },
+        });
+      } else if (act?.startsWith("🗑")) {
+        const ok = await ctx.ui.confirm("删除路径", `确认删除「${edge.from} ↔ ${edge.to}」？`);
+        if (ok) rt.commitTx({ kind: "route_delete", routeId: edge.id });
+      }
+    }
+  }
+}
+
+async function openFactionsManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const list = Object.values(s.factions);
+    const rows = list.map(
+      (f, i) =>
+        `🏛 #${i + 1} ${f.name} [${f.stance}] · 声望 ${f.standing >= 0 ? `+${f.standing}` : f.standing} · 警戒 ${f.heat}/6`,
+    );
+    const pick = await ctx.ui.select(`🏛 势力声望与警戒度（共 ${list.length} 个势力）`, [
+      "+ 新增势力记录",
+      ...rows,
+      "← 返回",
+    ]);
+    if (!pick || pick.startsWith("←")) return;
+    if (pick.startsWith("+")) {
+      const name = (await ctx.ui.input("势力名称（如：漕帮、锦衣卫、城防营）", ""))?.trim();
+      if (!name) continue;
+      const stRaw = await ctx.ui.input("初始声望（-100 死敌 ~ +100 死忠）", "0");
+      if (stRaw === undefined) continue;
+      const heatRaw = await ctx.ui.input("初始警戒度 Heat（0 ~ 6）", "0");
+      if (heatRaw === undefined) continue;
+      const noteRaw = await ctx.ui.input("备注（可选）", "");
+      if (noteRaw === undefined) continue;
+      const standing = Number(stRaw.trim()) || 0;
+      rt.commitTx({
+        kind: "faction_upsert",
+        faction: {
+          name,
+          standing,
+          heat: Math.max(0, Math.min(6, Number(heatRaw.trim()) || 0)),
+          stance: deriveFactionStance(standing),
+          note: noteRaw.trim() || undefined,
+          updatedTurn: s.turn,
+        },
+      });
+      ctx.ui.notify(`已添加势力：${name}`, "info");
+    } else {
+      const idx = rows.indexOf(pick);
+      const fac = idx >= 0 ? list[idx] : undefined;
+      if (!fac) continue;
+      const act = await ctx.ui.select(
+        `🏛 ${fac.name}（${fac.stance} · 声望 ${fac.standing >= 0 ? `+${fac.standing}` : fac.standing} · 警戒 ${fac.heat}/6）`,
+        [
+          "📊 调整声望（-100 ~ +100）",
+          "🚨 警戒度 Heat +1",
+          "🕊 警戒度 Heat -1",
+          "✏️ 修改立场与备注",
+          "🗑 移除此势力",
+          "← 返回",
+        ],
+      );
+      if (!act || act.startsWith("←")) continue;
+      if (act.startsWith("📊")) {
+        const valRaw = await ctx.ui.input(`修改 ${fac.name} 声望（+10/-10 增减，或直接输数字设值）`, String(fac.standing));
+        if (valRaw === undefined || !valRaw.trim()) continue;
+        const v = valRaw.trim();
+        const nextStanding = /^[+-]\d+$/.test(v) ? fac.standing + Number(v) : Number(v);
+        if (Number.isFinite(nextStanding)) {
+          rt.commitTx({
+            kind: "faction_upsert",
+            faction: { ...fac, standing: nextStanding, stance: deriveFactionStance(nextStanding), updatedTurn: s.turn },
+          });
+        }
+      } else if (act.startsWith("🚨")) {
+        rt.commitTx({ kind: "faction_upsert", faction: { ...fac, heat: Math.min(6, fac.heat + 1), updatedTurn: s.turn } });
+      } else if (act.startsWith("🕊")) {
+        rt.commitTx({ kind: "faction_upsert", faction: { ...fac, heat: Math.max(0, fac.heat - 1), updatedTurn: s.turn } });
+      } else if (act.startsWith("✏️")) {
+        const stance = await ctx.ui.input("立场标签（如：暗中监视 / 合作 / 通缉）", fac.stance);
+        if (stance === undefined) continue;
+        const n = await ctx.ui.input("势力备注", fac.note ?? "");
+        if (n !== undefined) {
+          rt.commitTx({
+            kind: "faction_upsert",
+            faction: { ...fac, stance: stance.trim() || fac.stance, note: n.trim() || undefined, updatedTurn: s.turn },
+          });
+        }
+      } else if (act.startsWith("🗑")) {
+        const ok = await ctx.ui.confirm("移除势力", `确认移除「${fac.name}」？`);
+        if (ok) rt.commitTx({ kind: "faction_delete", name: fac.name });
+      }
+    }
+  }
+}
+
+async function openCommitmentsManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const list = Array.from(s.commitments.values()).reverse();
+    const badge = (st: "active" | "fulfilled" | "broken") =>
+      st === "fulfilled" ? "✅已履约" : st === "broken" ? "💔已违约" : "🤝生效中";
+    const rows = list.map(
+      (c, i) =>
+        `${badge(c.status)} #${i + 1} ${c.actor}→${c.target}：${clipChars(c.promise, 24)}${typeof c.dueTurn === "number" ? ` (T${c.dueTurn})` : ""}`,
+    );
+    const pick = await ctx.ui.select(`🤝 人物承诺与契约（共 ${list.length} 条）`, [
+      "+ 手动记一条承诺 / 约定",
+      ...rows,
+      "← 返回",
+    ]);
+    if (!pick || pick.startsWith("←")) return;
+    if (pick.startsWith("+")) {
+      const actor = (await ctx.ui.input("承诺人（谁许下的诺言）", s.presentNpcs[0] ?? s.currentPersona.name))?.trim();
+      if (!actor) continue;
+      const target = (await ctx.ui.input("对象（答应了谁）", s.currentPersona.name))?.trim();
+      if (!target) continue;
+      const promise = (await ctx.ui.input("承诺内容", ""))?.trim();
+      if (!promise) continue;
+      const dueRaw = await ctx.ui.input("到期回合号（可选，如 25，留空不限）", "");
+      if (dueRaw === undefined) continue;
+      const dueTurn = /^\d+$/.test(dueRaw.trim()) ? Number(dueRaw.trim()) : undefined;
+      rt.commitTx({
+        kind: "commitment_upsert",
+        commitment: {
+          id: `cmt_${Date.now().toString(36)}`,
+          actor,
+          target,
+          promise,
+          createdTurn: s.turn,
+          dueTurn,
+          status: "active",
+        },
+      });
+      ctx.ui.notify(`已记入承诺：${actor} → ${target}`, "info");
+    } else {
+      const idx = rows.indexOf(pick);
+      const cmt = idx >= 0 ? list[idx] : undefined;
+      if (!cmt) continue;
+      const act = await ctx.ui.select(`${cmt.actor} → ${cmt.target}：${clipChars(cmt.promise, 22)}`, [
+        "✅ 标记为已履约",
+        "💔 标记为已违约",
+        "🤝 恢复为生效中",
+        "🗑 删除此承诺",
+        "← 返回",
+      ]);
+      if (!act || act.startsWith("←")) continue;
+      if (act.startsWith("✅")) {
+        rt.commitTx({ kind: "commitment_upsert", commitment: { ...cmt, status: "fulfilled" } });
+      } else if (act.startsWith("💔")) {
+        rt.commitTx({ kind: "commitment_upsert", commitment: { ...cmt, status: "broken" } });
+      } else if (act.startsWith("🤝")) {
+        rt.commitTx({ kind: "commitment_upsert", commitment: { ...cmt, status: "active" } });
+      } else if (act.startsWith("🗑")) {
+        rt.commitTx({ kind: "commitment_delete", commitmentId: cmt.id });
+      }
+    }
+  }
+}
+
+async function openConsequencesManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const list = Array.from(s.consequences.values()).reverse();
+    const rows = list.map(
+      (e, i) =>
+        `${e.status === "resolved" ? "✅" : e.weight === "high" ? "🔥" : "🌀"} #${i + 1} [T${e.plantedTurn}] ${clipChars(e.choice, 16)} → ${clipChars(e.consequence, 18)}`,
+    );
+    const pick = await ctx.ui.select(`🌀 因果回响账本（共 ${list.length} 条）`, [
+      "+ 手动记录一条重大选择因果",
+      ...rows,
+      "← 返回",
+    ]);
+    if (!pick || pick.startsWith("←")) return;
+    if (pick.startsWith("+")) {
+      const choice = (await ctx.ui.input("玩家或角色做出的重大选择", ""))?.trim();
+      if (!choice) continue;
+      const consequence = (await ctx.ui.input("后续可能引发的因果回响", ""))?.trim();
+      if (!consequence) continue;
+      const wPick = await ctx.ui.select("重要程度", ["🔥 高（核心转折）", "🌀 中（常规后续）"]);
+      if (!wPick) continue;
+      rt.commitTx({
+        kind: "consequence_upsert",
+        echo: {
+          id: `echo_${Date.now().toString(36)}`,
+          plantedTurn: s.turn,
+          choice,
+          consequence,
+          entities: [],
+          weight: wPick.startsWith("🔥") ? "high" : "medium",
+          status: "pending",
+        },
+      });
+      ctx.ui.notify("已记入因果回响。", "info");
+    } else {
+      const idx = rows.indexOf(pick);
+      const echo = idx >= 0 ? list[idx] : undefined;
+      if (!echo) continue;
+      const act = await ctx.ui.select(`因果：${clipChars(echo.choice, 22)}`, [
+        "📖 查看完整内容",
+        echo.status === "resolved" ? "🌀 恢复为待触发" : "✅ 标记为已兑现",
+        "🗑 删除此条因果",
+        "← 返回",
+      ]);
+      if (!act || act.startsWith("←")) continue;
+      if (act.startsWith("📖")) {
+        await editLongText(
+          ctx,
+          `因果回响 · T${echo.plantedTurn}`,
+          `选择：${echo.choice}\n潜在后果：${echo.consequence}\n权重：${echo.weight} · 状态：${echo.status === "resolved" ? "已兑现" : "待触发"}`,
+        );
+      } else if (act.startsWith("🌀") || act.startsWith("✅")) {
+        rt.commitTx({
+          kind: "consequence_upsert",
+          echo: { ...echo, status: echo.status === "resolved" ? "pending" : "resolved" },
+        });
+      } else if (act.startsWith("🗑")) {
+        rt.commitTx({ kind: "consequence_delete", echoId: echo.id });
+      }
+    }
+  }
+}
+
 export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<"back" | "close"> {
   while (true) {
     const s = rt.getState();
@@ -573,11 +930,16 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
         })()
       : null;
 
+    const routeCount = Object.keys(s.locationGraph).length;
+    const factionCount = Object.keys(s.factions).length;
     const pick = await ctx.ui.select("📍 场景与世界", [
+      ...(s.encounter ? [`⚔ 当前冲突局势（${s.encounter.title} · 第${s.encounter.round}拍）`] : []),
       `📍 地点与在场人物（${s.location || "未设定"}${s.presentNpcs.length ? ` · ${s.presentNpcs.join("、")}` : ""}）`,
       `🕒 时间标签（${s.worldTimeLabel || "未设定"}）`,
       `🏁 剧情阶段（${s.era || "未启用"}）`,
       `🎯 场景目标（${s.sceneObjective || "未设定"}）`,
+      `🗺 地点路网拓扑（${routeCount} 条连通路径）`,
+      `🏛 势力声望与警戒（${factionCount} 个势力）`,
       `🃏 动态剧情卡（${s.storylets.size} 张 · 已触发 ${activeSt}）`,
       `🚩 事件标记（${Object.entries(s.flags).filter(([, v]) => Boolean(v)).map(([k]) => k).slice(0, 4).join("、") || "暂无"}）`,
       ...(s.modules.clocks || clocks.length > 0
@@ -593,7 +955,13 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
     ]);
     if (!pick || pick.startsWith("←")) return "back";
 
-    if (pick.startsWith("📍")) {
+    if (pick.startsWith("⚔")) {
+      await openEncounterManager(rt, ctx);
+    } else if (pick.startsWith("🗺")) {
+      await openLocationGraphManager(rt, ctx);
+    } else if (pick.startsWith("🏛")) {
+      await openFactionsManager(rt, ctx);
+    } else if (pick.startsWith("📍")) {
       const loc = await ctx.ui.input("当前地点", s.location || "");
       if (loc === undefined) continue;
       const npcsStr = await ctx.ui.input("在场人物（逗号分隔，留空表示无人）", s.presentNpcs.join(", "));
@@ -982,6 +1350,7 @@ export async function openCharactersSection(rt: DashboardRuntime, ctx: PiExtensi
     const pick = await ctx.ui.select("👥 人物与关系", [
       ...actorRows,
       ...(worldStatsCount > 0 ? [`🌍 世界全局数值（${worldStatsCount} 项，非人物）`] : []),
+      `🤝 人物承诺与契约（生效 ${Array.from(s.commitments.values()).filter((c) => c.status === "active").length} / 共 ${s.commitments.size} 条）`,
       `🕸 人物关系网（NPC↔NPC ${Object.keys(s.pairBonds).length} 条 · 后台日程 ${Object.keys(s.npcAgendas).length} 个）`,
       `🧑 切换玩家马甲（当前：${s.currentPersona.name}）`,
       `🎭 同场共演角色卡管理（当前：${s.activeCharacters.length} 张卡）`,
@@ -992,6 +1361,8 @@ export async function openCharactersSection(rt: DashboardRuntime, ctx: PiExtensi
 
     if (pick.startsWith("🌍")) {
       await openActorProfile(rt, ctx, "world");
+    } else if (pick.startsWith("🤝")) {
+      await openCommitmentsManager(rt, ctx);
     } else if (pick.startsWith("🕸")) {
       await openLivingWorldManager(rt, ctx);
     } else if (pick.startsWith("🧑")) {
@@ -1122,6 +1493,7 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     const options: string[] = [
       `🗂 世界书管理（${getAllLore(rt).length} 条）`,
       `📚 记忆书归档章节（${s.memoryBooks.size} 章）`,
+      `🌀 因果回响（待触发 ${Array.from(s.consequences.values()).filter((e) => e.status === "pending").length} · 共 ${s.consequences.size} 条）`,
       `🔒 秘密与认知盲区（秘密 ${secretCount} · 盲区 ${blindSpots.length}）`,
       `◇ 人物信念与潜台词（${s.beliefs.length} 条${s.beliefs.length > 0 ? ` · ${s.beliefs[s.beliefs.length - 1]!.actorId}→${s.beliefs[s.beliefs.length - 1]!.belief.slice(0, 14)}` : ""}）`,
       "📜 查看前情提要",
@@ -1143,6 +1515,10 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
 
     if (pick.startsWith("📚")) {
       await openMemoryBookChapters(rt, ctx);
+      continue;
+    }
+    if (pick.startsWith("🌀")) {
+      await openConsequencesManager(rt, ctx);
       continue;
     }
     if (pick.startsWith("🔒")) {
@@ -1899,6 +2275,7 @@ async function openLedgerOverview(rt: DashboardRuntime, ctx: PiExtensionContext)
       : null;
 
     const opts: string[] = [
+      ...(s.encounter ? [`⚔ 当前冲突局势：${s.encounter.title}（${clipChars(s.encounter.stakes || "进行中", 20)}）`] : []),
       ...(rollLine ? [rollLine] : []),
       ...(condList.length > 0
         ? [
@@ -1928,7 +2305,9 @@ async function openLedgerOverview(rt: DashboardRuntime, ctx: PiExtensionContext)
 
     const pick = await ctx.ui.select("📋 本局动态一览", opts);
     if (!pick || pick.startsWith("←")) return;
-    if (pick.startsWith("🎲")) {
+    if (pick.startsWith("⚔")) {
+      await openEncounterManager(rt, ctx);
+    } else if (pick.startsWith("🎲")) {
       await rt.quickRoll(ctx);
     } else if (pick.startsWith("⚡")) {
       await openConditionsManager(rt, ctx);

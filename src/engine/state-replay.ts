@@ -790,12 +790,38 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       break;
     }
 
+    case "consequence_delete": {
+      const prev = state.consequences.get(tx.echoId);
+      state.consequences.delete(tx.echoId);
+      if (!isUndoTx(tx) && prev) {
+        pushAudit(state, {
+          summary: `删除因果回响: ${prev.choice.slice(0, 22)}`,
+          source: "user",
+          undoTx: { kind: "consequence_upsert", echo: prev, reason: "undo" } as RpTxEntry,
+        });
+      }
+      break;
+    }
+
     case "route_upsert": {
       const fromClean = normalizePlaceName(tx.edge.from);
       const toClean = normalizePlaceName(tx.edge.to);
       if (!fromClean || !toClean || fromClean.toLowerCase() === toClean.toLowerCase()) break;
       const rid = tx.edge.id || makeRouteId(fromClean, toClean);
       state.locationGraph[rid] = { ...tx.edge, id: rid, from: fromClean, to: toClean };
+      break;
+    }
+
+    case "route_delete": {
+      const prev = state.locationGraph[tx.routeId];
+      delete state.locationGraph[tx.routeId];
+      if (!isUndoTx(tx) && prev) {
+        pushAudit(state, {
+          summary: `删除路径: ${prev.from} ↔ ${prev.to}`,
+          source: "user",
+          undoTx: { kind: "route_upsert", edge: prev, reason: "undo" } as RpTxEntry,
+        });
+      }
       break;
     }
 
@@ -808,6 +834,19 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
           summary: `约定(${tx.commitment.status === "fulfilled" ? "已履约" : tx.commitment.status === "broken" ? "已违约" : "生效"}): ${tx.commitment.actor}→${tx.commitment.promise.slice(0, 18)}`,
           source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
           undoTx: prev ? ({ kind: "commitment_upsert", commitment: prev, reason: "undo" } as RpTxEntry) : undefined,
+        });
+      }
+      break;
+    }
+
+    case "commitment_delete": {
+      const prev = state.commitments.get(tx.commitmentId);
+      state.commitments.delete(tx.commitmentId);
+      if (!isUndoTx(tx) && prev) {
+        pushAudit(state, {
+          summary: `删除约定: ${prev.actor}→${prev.promise.slice(0, 18)}`,
+          source: "user",
+          undoTx: { kind: "commitment_upsert", commitment: prev, reason: "undo" } as RpTxEntry,
         });
       }
       break;
@@ -837,6 +876,19 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
           summary: `势力 ${key}: 声望 ${standing >= 0 ? `+${standing}` : standing} · 警戒 ${heat}/6`,
           source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
           undoTx: prev ? ({ kind: "faction_upsert", faction: prev, reason: "undo" } as RpTxEntry) : undefined,
+        });
+      }
+      break;
+    }
+
+    case "faction_delete": {
+      const prev = state.factions[tx.name];
+      delete state.factions[tx.name];
+      if (!isUndoTx(tx) && prev) {
+        pushAudit(state, {
+          summary: `移除势力: ${prev.name}`,
+          source: "user",
+          undoTx: { kind: "faction_upsert", faction: prev, reason: "undo" } as RpTxEntry,
         });
       }
       break;

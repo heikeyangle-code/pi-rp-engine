@@ -808,3 +808,68 @@ test("v6.5-pure-text-world-sim: Spatial Graph, NPC Commitments, Rumor Propagatio
   assert.ok(z3.includes("[FACTION PRESSURE]"));
   assert.ok(z3.includes("<rp_encounter>"));
 });
+
+test("v6.6-sdk-convergence: slim archetype RP_DELTA protocol, zero double-write tools & CRUD delete+undo txs", async () => {
+  const { TOOL_ASSISTED_CORE_TOOLS } = await import("../src/index.js");
+  const { buildZone1FrozenPrefix } = await import("../src/context/zone-builder.js");
+  const { createInitialRpState } = await import("../src/engine/state-replay.js");
+  assert.ok(!TOOL_ASSISTED_CORE_TOOLS.includes("rp_state_patch" as never));
+  assert.ok(!TOOL_ASSISTED_CORE_TOOLS.includes("rp_fact_commit" as never));
+
+  const card = compileCharacterCard(
+    { spec: "chara_card_v2", data: { name: "柳春娘", description: "运河游医", scenario: "北门集市", first_mes: "请坐。" } },
+    "v2",
+  );
+  const z1World = buildZone1FrozenPrefix({
+    card,
+    initialPersona: { id: "p1", name: "主角", description: "" },
+    activeToolNames: [...TOOL_ASSISTED_CORE_TOOLS],
+    inlineDeltaEnabled: true,
+    archetype: "rpg-sandbox",
+  });
+  assert.ok(z1World.includes("[[RP_DELTA]]"));
+  assert.ok(z1World.includes("route:"));
+  assert.ok(z1World.includes("faction:"));
+  assert.ok(!z1World.includes("phys:"));
+
+  const z1Comp = buildZone1FrozenPrefix({
+    card,
+    initialPersona: { id: "p1", name: "主角", description: "" },
+    activeToolNames: [...TOOL_ASSISTED_CORE_TOOLS],
+    inlineDeltaEnabled: true,
+    archetype: "companion",
+  });
+  assert.ok(z1Comp.includes("promise:"));
+  assert.ok(z1Comp.includes("phys:"));
+  assert.ok(!z1Comp.includes("encounter:"));
+
+  // CRUD delete + reversible undo for consequences, routes, commitments, factions
+  const st = createInitialRpState();
+  st.active = true;
+  st.turn = 10;
+  applyRpTx(st, {
+    kind: "consequence_upsert",
+    echo: { id: "e1", choice: "放走密探", consequence: "官府搜城", entities: [], weight: "high", plantedTurn: 10, status: "pending" },
+  });
+  applyRpTx(st, { kind: "consequence_delete", echoId: "e1" });
+  assert.equal(st.consequences.size, 0);
+  const undoEcho = st.auditLog.at(-1)?.undoTx;
+  assert.ok(undoEcho);
+  applyRpTx(st, undoEcho!);
+  assert.equal(st.consequences.size, 1);
+
+  applyRpTx(st, { kind: "route_upsert", edge: { id: "北门::码头", from: "北门", to: "码头", travelNote: "半刻", discoveredTurn: 10 } });
+  applyRpTx(st, { kind: "route_delete", routeId: "北门::码头" });
+  assert.equal(Object.keys(st.locationGraph).length, 0);
+
+  applyRpTx(st, {
+    kind: "commitment_upsert",
+    commitment: { id: "c1", actor: "春娘", target: "主角", promise: "子时渡河", createdTurn: 10, status: "active" },
+  });
+  applyRpTx(st, { kind: "commitment_delete", commitmentId: "c1" });
+  assert.equal(st.commitments.size, 0);
+
+  applyRpTx(st, { kind: "faction_upsert", faction: { name: "漕帮", standing: -20, heat: 3, stance: "猜忌", updatedTurn: 10 } });
+  applyRpTx(st, { kind: "faction_delete", name: "漕帮" });
+  assert.equal(Object.keys(st.factions).length, 0);
+});

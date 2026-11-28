@@ -915,9 +915,13 @@ export type RpTxEntry =
   | { kind: "storylet_delete"; storyletId: string }
   | { kind: "foresight_upsert"; hook: ForesightHook }
   | { kind: "consequence_upsert"; echo: ConsequenceEcho }
+  | { kind: "consequence_delete"; echoId: string }
   | { kind: "route_upsert"; edge: LocationEdge }
+  | { kind: "route_delete"; routeId: string }
   | { kind: "commitment_upsert"; commitment: NpcCommitment }
+  | { kind: "commitment_delete"; commitmentId: string }
   | { kind: "faction_upsert"; faction: FactionStanding }
+  | { kind: "faction_delete"; name: string }
   | { kind: "fact_spread"; factId: string; newWitnesses: string[]; via?: string }
   | { kind: "encounter_set"; encounter: ActiveEncounter | null }
   | {

@@ -133,8 +133,6 @@ export function isReasoningOnlyOrEmptyStop(msg: PiMessage | undefined): boolean 
 export const SIDECAR_READ_TOOLS = ["rp_roll_check", "rp_recall", "rp_history_recall"] as const;
 export const TOOL_ASSISTED_CORE_TOOLS = [
   "rp_roll_check",
-  "rp_state_patch",
-  "rp_fact_commit",
   "rp_recall",
   "rp_history_recall",
 ] as const;
@@ -203,6 +201,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     consumedOneShots: string[];
   } | null = null;
   let pendingCompactionBookEntry: MemoryBookEntry | null = null;
+  let pendingInlineDeltaBlock: string | null = null;
 
   const rpToolSet = new Set<string>(RP_TOOL_NAMES);
 
@@ -222,6 +221,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
 
   function resetTransientTurnBuffers(): void {
     isOocTurn = false;
+    pendingInlineDeltaBlock = null;
     lastTurnWasOoc = false;
     lastUserText = "";
     lastAssistantText = "";
@@ -604,6 +604,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       initialPersona,
       activeToolNames,
       loreOverrides: state.loreOverrides,
+      inlineDeltaEnabled: state.settlementMode === "tool-assisted",
+      archetype: state.archetype || activeCard.worldProfile?.archetype || "companion",
     };
     const zone1 = buildZone1FrozenPrefix(zone1Options);
 
@@ -910,6 +912,38 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     return mutated ? next : undefined;
   });
 
+  // Universal SDK/RPC/TUI stripping of trailing [[RP_DELTA]]...[[/RP_DELTA]] before message persistence & UI display
+  pi.on("message_end", (event) => {
+    if (!state.active || isOocTurn) return;
+    const msg = event?.message as PiMessage | undefined;
+    if (!msg || msg.role !== "assistant") return;
+    const fullText = extractMessageText(msg);
+    if (!fullText || !fullText.includes("[[RP_DELTA]]")) return;
+    const { cleanProse, rawBlock } = extractInlineDelta(fullText);
+    if (!rawBlock) return;
+    pendingInlineDeltaBlock = rawBlock;
+    if (typeof msg.content === "string") {
+      return { message: { ...msg, content: cleanProse } };
+    }
+    if (Array.isArray(msg.content)) {
+      let changed = false;
+      const nextBlocks = msg.content.map((b) => {
+        if (b && typeof b === "object" && b.type === "text" && typeof b.text === "string") {
+          const stripped = stripInlineDelta(b.text);
+          if (stripped !== b.text) {
+            changed = true;
+            return { ...b, text: stripped };
+          }
+        }
+        return b;
+      });
+      if (changed) {
+        return { message: { ...msg, content: nextBlocks } };
+      }
+    }
+    return undefined;
+  });
+
   // Deterministic turn_end settlement (< 2ms, skips intermediate tool-call assistant steps!)
   pi.on("turn_end", (event, ctx) => {
     if (!state.active || !activeCard) return;
@@ -1020,10 +1054,18 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     const prevEraBeforeDelta = state.era;
 
     // Single-model zero-RTT inline delta sync (`[[RP_DELTA]]...[[/RP_DELTA]]`)
-    if (!thisTurnOoc && lastAssistantText) {
-      const { cleanProse, rawBlock } = extractInlineDelta(lastAssistantText);
+    const capturedDeltaBlock = pendingInlineDeltaBlock;
+    pendingInlineDeltaBlock = null;
+    if (!thisTurnOoc && (capturedDeltaBlock || lastAssistantText)) {
+      let rawBlock = capturedDeltaBlock;
+      if (!rawBlock && lastAssistantText) {
+        const extracted = extractInlineDelta(lastAssistantText);
+        if (extracted.rawBlock) {
+          lastAssistantText = extracted.cleanProse;
+          rawBlock = extracted.rawBlock;
+        }
+      }
       if (rawBlock) {
-        lastAssistantText = cleanProse;
         const parsedDelta = parseAndValidateInlineDelta(rawBlock, state);
         for (const dtx of parsedDelta.txs) {
           commitTx(dtx);
