@@ -150,6 +150,9 @@ export function makeDashboardRuntime(rt: RpRuntimeHandle): DashboardRuntime {
       setSettlementMode: (c) => actionSetSettlementMode(rt, c, ""),
     exportWorldSave: (ctx) => actionExportWorldSave(rt, ctx, ""),
     importWorldSave: (ctx) => actionImportWorldSave(rt, ctx, ""),
+    setHud: (ctx) => actionSetHud(rt, ctx, ""),
+    pickPreset: (ctx) => actionPreset(rt, ctx, ""),
+    toggleRawPassthrough: (ctx) => actionToggleRawPassthrough(rt, ctx, ""),
   };
 }
 
@@ -176,105 +179,60 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     const card = rt.getCard();
     const title = `🎭 ${[card?.identity.name ?? state.cardSlug ?? "RP", state.location || state.era, `T${state.turn}`].filter(Boolean).join(" · ")}`;
     const pick = await ctx.ui.select(title, [
-      "📊 打开世界面板（全功能总控）",
-      "⚡ 快捷回复 · 代写 · 行动建议",
-      "🔄 重摇 · 局部改写 · 无缝续写",
-      "💭 场外提问 · 对话内 OOC",
-      "⏳ 推演切场 · 镜头 · 插叙 · 书签",
-      "🎭 换卡 · 开场白 · 导入 · 建档",
-      "⚙ 快捷开关（HUD / 预设 / 结算）",
-      "✕ 关闭",
+      "📊 打开世界面板（全部功能）",
+      "💡 生成 3 个行动建议",
+      "⏳ 推演切场 / 跳时间",
+      "🎲 快捷掷骰检定",
+      "🔖 剧情书签（保存 / 回溯分叉）",
+      "🎭 换卡 · 开场白 · 导入",
+      "🚪 退出本会话角色扮演",
     ]);
-    if (!pick || pick.startsWith("✕")) return;
+    if (!pick) return;
 
     if (pick.startsWith("📊")) {
       await openRpDashboard(makeDashboardRuntime(rt), ctx);
       return;
     }
-    if (pick.startsWith("⚡")) {
-      const sub = await ctx.ui.select("快捷回复与行动辅助", [
-        "⚡ 快捷回复与动作宏",
-        "✍️ 帮我代写主角回复",
-        "💡 生成 3 个行动建议",
-        "← 返回",
-      ]);
-      if (!sub || sub.startsWith("←")) continue;
-      if (sub.startsWith("⚡")) await actionQuickReplies(rt, ctx, "");
-      else if (sub.startsWith("✍️")) await actionImpersonate(rt, ctx, "");
-      else if (sub.startsWith("💡")) await actionIdeas(rt, ctx);
-      return;
-    }
-    if (pick.startsWith("🔄")) {
-      const sub = await ctx.ui.select("重摇、改写与续写", [
-        "🔄 重摇上一条回复",
-        "✂️ 局部定向改写",
-        "▶ 让角色无缝续写",
-        "← 返回",
-      ]);
-      if (!sub || sub.startsWith("←")) continue;
-      if (sub.startsWith("🔄")) await actionReroll(rt, ctx, "");
-      else if (sub.startsWith("✂️")) await actionRewriteLast(rt, ctx, "");
-      else if (sub.startsWith("▶")) await actionContinue(rt, ctx);
-      return;
-    }
-    if (pick.startsWith("💭")) {
-      const sub = await ctx.ui.select("场外提问与 OOC", [
-        "💭 零污染场外提问（不进历史）",
-        "💬 对话内 OOC（用完自动隐身）",
-        "← 返回",
-      ]);
-      if (!sub || sub.startsWith("←")) continue;
-      if (sub.startsWith("💭")) await actionSidePrompt(rt, ctx, "");
-      else if (sub.startsWith("💬")) await actionOoc(rt, ctx, "");
+    if (pick.startsWith("💡")) {
+      await actionIdeas(rt, ctx);
       return;
     }
     if (pick.startsWith("⏳")) {
-      const sub = await ctx.ui.select("场景推演、镜头与书签", [
-        "⏳ 幕间推演 / 切场景",
-        "🔦 镜头聚焦主导 NPC",
-        "🎞 幕后插叙 / 小剧场",
+      await actionSkipMontage(rt, ctx, "");
+      return;
+    }
+    if (pick.startsWith("🎲")) {
+      await actionManualRoll(rt, ctx, "");
+      return;
+    }
+    if (pick.startsWith("🔖")) {
+      const sub = await ctx.ui.select("剧情书签", [
         "🔖 保存当前节点书签",
-        "⏪ 跳转或分叉至书签",
-        "← 返回",
+        "⏪ 回溯或分叉至已有书签",
+        "← 返回上一级",
       ]);
       if (!sub || sub.startsWith("←")) continue;
-      if (sub.startsWith("⏳")) await actionSkipMontage(rt, ctx, "");
-      else if (sub.startsWith("🔦")) await actionSpotlight(rt, ctx, "");
-      else if (sub.startsWith("🎞")) await actionInterlude(rt, ctx, "");
-      else if (sub.startsWith("🔖")) await actionBookmarkSave(rt, ctx, "");
+      if (sub.startsWith("🔖")) await actionBookmarkSave(rt, ctx, "");
       else if (sub.startsWith("⏪")) await actionBookmarkGoto(rt, ctx, "");
       return;
     }
     if (pick.startsWith("🎭")) {
-      const sub = await ctx.ui.select("角色卡、开场白与导入", [
-        "✨ 一键 AI 深度建档",
-        "💬 重发 / 切换开场白",
+      const sub = await ctx.ui.select("角色卡与开场白", [
+        "💬 切换 / 重发开场白",
         "🎭 切换其他主角色卡",
         "📥 导入新卡 / 世界书 / 预设",
-        "← 返回",
+        "✨ 一键 AI 深度建档",
+        "← 返回上一级",
       ]);
       if (!sub || sub.startsWith("←")) continue;
-      if (sub.startsWith("✨")) await actionAnalyzeCard(rt, ctx);
-      else if (sub.startsWith("💬")) await actionGreeting(rt, ctx);
+      if (sub.startsWith("💬")) await actionGreeting(rt, ctx);
       else if (sub.startsWith("🎭")) await actionLoadCard(rt, ctx, "");
       else if (sub.startsWith("📥")) await actionImportFile(rt, ctx, "");
+      else if (sub.startsWith("✨")) await actionAnalyzeCard(rt, ctx);
       return;
     }
-    if (pick.startsWith("⚙")) {
-      const hudZh = state.hudMode === "off" ? "关" : state.hudMode === "full" ? "完整" : "精简";
-      const settleZh = state.settlementMode === "sidecar-light" ? "后台小模型" : state.settlementMode === "off" ? "纯文学关闭" : "主模型随行";
-      const sub = await ctx.ui.select("快捷开关", [
-        `🖥 切换状态显示（${hudZh}）`,
-        `🎛 切换预设（${state.presetId ?? "无"}）`,
-        `⚙️ 记账模式（${settleZh}）`,
-        `🛡 原味直通（${state.rawPassthrough ? "开" : "关"}）`,
-        "← 返回",
-      ]);
-      if (!sub || sub.startsWith("←")) continue;
-      if (sub.startsWith("🖥")) await actionSetHud(rt, ctx, "");
-      else if (sub.startsWith("🎛")) await actionPreset(rt, ctx, "");
-      else if (sub.startsWith("⚙️")) await actionSetSettlementMode(rt, ctx, "");
-      else if (sub.startsWith("🛡")) await actionToggleRawPassthrough(rt, ctx, "");
+    if (pick.startsWith("🚪")) {
+      await actionExitRp(rt, ctx, true);
       return;
     }
     return;

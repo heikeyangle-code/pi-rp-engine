@@ -165,7 +165,7 @@ function buildHudRawLines(
   if (condList.length > 0) {
     const condText = condList
       .slice(0, 4)
-      .map((c) => `${c.actorId}:${c.label}${c.remainingTurns !== null ? `(${c.remainingTurns}轮)` : ""}`)
+      .map((c) => `${c.actorId === "player" ? state.currentPersona.name : c.actorId}:${c.label}${c.remainingTurns !== null ? `(${c.remainingTurns}轮)` : ""}`)
       .join(" · ");
     lines.push(`│ ⚡ 状态  ${condText}${condList.length > 4 ? ` (+${condList.length - 4})` : ""}`);
   }
@@ -199,7 +199,8 @@ function buildHudRawLines(
       .slice(0, 3)
       .map(([axis, rec]) => `${axis}:${rec.state}`);
     if (pairs.length > 0) {
-      cfsmSnippets.push(`${actor}〔${pairs.join(" · ")}〕`);
+      const displayActor = actor === "player" ? state.currentPersona.name : actor;
+      cfsmSnippets.push(`${displayActor}〔${pairs.join(" · ")}〕`);
     }
   }
   if (cfsmSnippets.length > 0) {
@@ -213,7 +214,8 @@ function buildHudRawLines(
       .slice(0, 4)
       .map(([k, v]) => formatBoundedStat(state, actor, k, v));
     if (pairs.length > 0) {
-      statSnippets.push(`${actor}〔${pairs.join(" · ")}〕`);
+      const displayActor = actor === "player" ? state.currentPersona.name : actor;
+      statSnippets.push(`${displayActor}〔${pairs.join(" · ")}〕`);
     }
   }
   if (statSnippets.length > 0) {

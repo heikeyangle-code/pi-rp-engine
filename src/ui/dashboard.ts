@@ -72,6 +72,9 @@ export interface DashboardRuntime {
   setSettlementMode?(ctx: PiExtensionContext): Promise<void>;
   exportWorldSave?(ctx: PiExtensionContext): Promise<void>;
   importWorldSave?(ctx: PiExtensionContext): Promise<void>;
+  setHud?(ctx: PiExtensionContext): Promise<void>;
+  pickPreset?(ctx: PiExtensionContext): Promise<void>;
+  toggleRawPassthrough?(ctx: PiExtensionContext): Promise<void>;
 }
 
 const PACING_ZH: Record<PacingMode, string> = {
@@ -573,9 +576,10 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
     const pick = await ctx.ui.select("📍 场景与世界", [
       `📍 地点与在场人物（${s.location || "未设定"}${s.presentNpcs.length ? ` · ${s.presentNpcs.join("、")}` : ""}）`,
       `🕒 时间标签（${s.worldTimeLabel || "未设定"}）`,
+      `🏁 剧情阶段（${s.era || "未启用"}）`,
       `🎯 场景目标（${s.sceneObjective || "未设定"}）`,
       `🃏 动态剧情卡（${s.storylets.size} 张 · 已触发 ${activeSt}）`,
-      `🚩 世界状态 Flags（${Object.entries(s.flags).filter(([, v]) => Boolean(v)).map(([k]) => k).slice(0, 4).join("、") || "暂无"}）`,
+      `🚩 事件标记（${Object.entries(s.flags).filter(([, v]) => Boolean(v)).map(([k]) => k).slice(0, 4).join("、") || "暂无"}）`,
       ...(s.modules.clocks || clocks.length > 0
         ? [
             `⏱ 进度时钟（${clocks.length > 0 ? clocks.slice(0, 2).map((c) => `${c.label} ${c.value}/${c.max}`).join(" · ") : "暂无，点此新建"}）`,
@@ -607,6 +611,20 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
         rt.commitTx({ kind: "clock_tick", beatDelta: 0, worldTimeLabel: nextTime.trim() });
         rt.refreshHud(ctx);
         ctx.ui.notify(`时间已更新：${nextTime.trim() || "(已隐藏)"}`, "info");
+      }
+    } else if (pick.startsWith("🏁")) {
+      const nextStage = await ctx.ui.input("当前剧情阶段 / 章节（留空隐藏）", s.era);
+      if (nextStage !== undefined && nextStage.trim() !== s.era) {
+        rt.commitTx({
+          kind: "era_advance",
+          fromEra: s.era,
+          toEra: nextStage.trim(),
+          milestoneUnlocked: [],
+          montageSummary: "panel_edit",
+          turn: s.turn,
+        });
+        rt.refreshHud(ctx);
+        ctx.ui.notify(`剧情阶段已更新：${nextStage.trim() || "已隐藏"}`, "info");
       }
     } else if (pick.startsWith("🎯")) {
       const obj = await ctx.ui.input("当前场景目标（如：说服店长交出密室钥匙；留空清除）", s.sceneObjective);
@@ -1096,11 +1114,11 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     const secretCount = activeFacts.filter((f) => f.witnessIds !== "public").length;
     const { blindSpots } = partitionEpistemicFacts(activeFacts, s.presentNpcs);
     const recentFacts = activeFacts.slice(-14).reverse();
-    const factRows = recentFacts.map((f) => {
+    const factRows = recentFacts.map((f, i) => {
       const vis = f.witnessIds === "public" ? "" : ` [仅:${f.witnessIds.join(",")}]`;
-      return `▪ [T${f.validFromTurn}]${vis} ${f.statement.slice(0, 44)}`;
+      return `▪ #${i + 1} [T${f.validFromTurn}]${vis} ${f.statement.slice(0, 38)}`;
     });
-    const hookRows = openHooks.map((h) => `◇ 伏笔：${h.summary.slice(0, 44)}`);
+    const hookRows = openHooks.map((h, i) => `◇ 伏笔 #${i + 1}：${h.summary.slice(0, 38)}`);
     const options: string[] = [
       `🗂 世界书管理（${getAllLore(rt).length} 条）`,
       `📚 记忆书归档章节（${s.memoryBooks.size} 章）`,
@@ -1536,7 +1554,7 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
       rt.refreshHud(ctx);
       ctx.ui.notify("导演指令已生效。", "info");
     } else if (pick.startsWith("⚙")) {
-      await openRpgToolsSection(rt, ctx);
+      if ((await openRpgToolsSection(rt, ctx)) === "close") return "close";
     } else if (pick.startsWith("🧹")) {
       rt.commitTx({ kind: "note_clear" });
       rt.refreshHud(ctx);
@@ -1557,25 +1575,25 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
 // ---------------------------------------------------------------------------
 // 6. 上下文 X-Ray 透视 & 状态变更审计撤销
 // ---------------------------------------------------------------------------
-async function openXRayAndAuditSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+async function openXRayAndAuditSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<"back" | "close"> {
   while (true) {
     const s = rt.getState();
     const xray = rt.getLastXRay();
     const undoable = s.auditLog.filter((r) => Boolean(r.undoTx)).length;
     const summaryLine = xray
-      ? `总计 ~${xray.zone1Tokens + xray.zone2Tokens + xray.zone3Tokens}t · 召回 ${xray.recalled.length} 条`
-      : "尚未捕获快照（发送一轮对话后生成）";
+      ? `总计 ~${xray.zone1Tokens + xray.zone2Tokens + xray.zone3Tokens} · 召回 ${xray.recalled.length} 条`
+      : "尚未捕获快照";
 
-    const pick = await ctx.ui.select("🔎 上下文透视与变更撤销", [
+    const pick = await ctx.ui.select("🔎 上下文透视与撤销", [
       `🔎 输出上下文透视卡片（${summaryLine}）`,
-      `↩ 查看状态变更记录并撤销（可撤销 ${undoable} 条）`,
+      `↩ 查看状态变更并撤销（可撤销 ${undoable} 条）`,
       "← 返回上一级",
     ]);
-    if (!pick || pick.startsWith("←")) return;
+    if (!pick || pick.startsWith("←")) return "back";
 
     if (pick.startsWith("🔎")) {
       await rt.openXRay(ctx);
-      return;
+      return "close";
     }
     if (pick.startsWith("↩")) {
       await rt.undoLast(ctx, false);
@@ -1584,80 +1602,61 @@ async function openXRayAndAuditSection(rt: DashboardRuntime, ctx: PiExtensionCon
 }
 
 // ---------------------------------------------------------------------------
-// 7. 跑团机制、引擎高级设置与资产库
+// 7. 系统设置、透视与资产库（已移除与 2/3 区重复的时钟/标记/背包/阶段入口）
 // ---------------------------------------------------------------------------
-async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<"back" | "close"> {
   while (true) {
     const s = rt.getState();
-    const invCount = Object.values(s.inventory).reduce((acc, rec) => acc + Object.keys(rec).length, 0);
-    const clockCount = Object.keys(s.clocks).length;
-    const flagCount = Object.keys(s.flags).length;
+    const hudZh = s.hudMode === "off" ? "关" : s.hudMode === "full" ? "完整" : "精简";
+    const settleZh = s.settlementMode === "sidecar-light" ? "后台小模型" : s.settlementMode === "off" ? "纯文学关闭" : "主模型随行";
 
-    const pick = await ctx.ui.select("⚙ 高级设置与资产库", [
-      "🔎 上下文透视与审计撤销",
-      "🌍 会话总览与导入审计",
-      `🎒 背包物品（${invCount} 项）`,
-      `⏳ 进度时钟（${clockCount} 个）`,
-      "🎲 快捷掷骰检定",
-      `🏁 剧情阶段 / 章节（${s.era || "未启用"}）`,
-      `⚡ 持续状态 Buff/Debuff（${Object.keys(s.conditions).length} 项）`,
-      `⚙ 世界状态 Flags（${flagCount}）与模块开关`,
-      `🎛 引擎运行模式（${s.settlementMode === "tool-assisted" ? "全能默认" : s.settlementMode === "sidecar-light" ? "纯文学后台" : "纯聊天"}）`,
-      `🤖 后台结算模型（${s.sidecarModel || "跟随主模型"}）`,
-      `🧠 语义向量召回（${loadUiPrefs().embeddingConfig?.enabled ? "● 开" : "○ 关"}）`,
-      `📏 动态世界书预算（${s.loreTokenBudget} tokens）`,
-      `🎛 应用预设采样参数：${s.applyPresetSampling ? "● 开" : "○ 关"}`,
-      "🗂 资产库管理（角色卡 / 预设 / 马甲）",
+    const pick = await ctx.ui.select("⚙ 系统设置与资产库", [
+      `🖥 状态栏显示（${hudZh}）`,
+      `🎛 酒馆预设（${s.presetId ?? "未启用"}）`,
+      `⚙️ 记账模式（${settleZh}）`,
+      `🤖 后台小模型（${s.sidecarModel || "未配置"}）`,
+      `🛡 原味直通（${s.rawPassthrough ? "● 开" : "○ 关"}）`,
+      `📏 世界书字数预算（${s.loreTokenBudget}）`,
+      `🎛 应用预设采样（${s.applyPresetSampling ? "● 开" : "○ 关"}）`,
+      `🧠 向量语义召回（${loadUiPrefs().embeddingConfig?.enabled ? "● 开" : "○ 关"}）`,
+      `⚡ 持续状态管理（${Object.keys(s.conditions).length} 项）`,
+      "🔎 上下文透视与撤销",
+      "🌍 会话总览与导入报告",
+      "🗂 资产库管理（卡 / 预设 / 马甲）",
       "← 返回上一级",
     ]);
-    if (!pick || pick.startsWith("←")) return;
+    if (!pick || pick.startsWith("←")) return "back";
 
-    if (pick.startsWith("🔎")) {
-      await openXRayAndAuditSection(rt, ctx);
-    } else if (pick.startsWith("🌍")) {
-      await openOverviewAndAudit(rt, ctx);
-    } else if (pick.startsWith("🎒")) {
-      await openInventoryManager(rt, ctx);
-    } else if (pick.startsWith("⏳")) {
-      await openClocksManager(rt, ctx);
-    } else if (pick.startsWith("🎲")) {
-      await rt.quickRoll(ctx);
-    } else if (pick.startsWith("🏁")) {
-      const nextStage = await ctx.ui.input("当前阶段 / 章节（留空则隐藏不显示）", s.era);
-      if (nextStage !== undefined && nextStage.trim() !== s.era) {
-        rt.commitTx({
-          kind: "era_advance",
-          fromEra: s.era,
-          toEra: nextStage.trim(),
-          milestoneUnlocked: [],
-          montageSummary: "panel_edit",
-          turn: s.turn,
-        });
-        rt.refreshHud(ctx);
-        ctx.ui.notify(`阶段已更新：${nextStage.trim() || "(已隐藏)"}`, "info");
-      }
-    } else if (pick.startsWith("⚡")) {
-      await openConditionsManager(rt, ctx);
-    } else if (pick.startsWith("⚙")) {
-      await openFlagsAndModulesManager(rt, ctx);
-    } else if (pick.startsWith("🎛 引擎运行模式")) {
+    if (pick.startsWith("🖥")) {
+      await rt.setHud?.(ctx);
+    } else if (pick.startsWith("🎛 酒馆预设")) {
+      await rt.pickPreset?.(ctx);
+    } else if (pick.startsWith("⚙️")) {
       await rt.setSettlementMode?.(ctx);
     } else if (pick.startsWith("🤖")) {
       await rt.pickSidecarModel(ctx);
-    } else if (pick.startsWith("🧠")) {
-      await openEmbeddingConfigManager(ctx);
+    } else if (pick.startsWith("🛡")) {
+      await rt.toggleRawPassthrough?.(ctx);
     } else if (pick.startsWith("📏")) {
-      const budgetRaw = await ctx.ui.input("动态世界书 Token 预算（建议 800 ~ 4000）", String(s.loreTokenBudget));
+      const budgetRaw = await ctx.ui.input("动态世界书预算（建议 800 ~ 4000）", String(s.loreTokenBudget));
       if (budgetRaw === undefined) continue;
       const val = Number(budgetRaw.trim());
       if (Number.isFinite(val) && val >= 200) {
         rt.commitTx({ kind: "config_patch", loreTokenBudget: Math.min(8000, Math.round(val)) });
-        ctx.ui.notify(`动态世界书预算已调整为 ${Math.min(8000, Math.round(val))} tokens`, "info");
+        ctx.ui.notify(`动态世界书预算已调整为 ${Math.min(8000, Math.round(val))}`, "info");
       }
-    } else if (pick.startsWith("🎛")) {
+    } else if (pick.startsWith("🎛 应用预设采样")) {
       const next = !s.applyPresetSampling;
       rt.commitTx({ kind: "config_patch", applyPresetSampling: next });
-      ctx.ui.notify(`应用酒馆预设采样参数（temperature/top_p/max_tokens）：${next ? "已开启" : "已关闭"}`, "info");
+      ctx.ui.notify(`应用酒馆预设采样参数：${next ? "已开启" : "已关闭"}`, "info");
+    } else if (pick.startsWith("🧠")) {
+      await openEmbeddingConfigManager(ctx);
+    } else if (pick.startsWith("⚡")) {
+      await openConditionsManager(rt, ctx);
+    } else if (pick.startsWith("🔎")) {
+      if ((await openXRayAndAuditSection(rt, ctx)) === "close") return "close";
+    } else if (pick.startsWith("🌍")) {
+      await openOverviewAndAudit(rt, ctx);
     } else if (pick.startsWith("🗂")) {
       await rt.manageLibrary(ctx);
     }

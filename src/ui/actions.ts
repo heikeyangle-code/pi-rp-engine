@@ -1038,14 +1038,14 @@ export async function actionDirectorNote(rt: RpRuntimeHandle, ctx: PiExtensionCo
   }
 
   // Interactive humanized manager
-  const quickTemplates = [
-    "去 AI 味：禁止排比句、总结式升华与“空气仿佛凝固/眼底闪过一丝”等陈词滥调，用克制白描和具体动作推动场景",
-    "严禁越权：绝不替玩家说话、动作或揣测玩家内心决定，把选择权完整留给玩家",
-    "保持人物棱角：角色遵循自身立场、利害与防备心，不无端讨好或瞬间软化，对白留有潜台词",
-    "群像自然运转：在场配角各自有短期意图与小动作，不全部围着主角转，允许打断与信息差",
-    "细节镜头：放慢当前一拍，通过声音、气味、光线与微表情展现情绪，避免直接点破心理",
-    "打破平淡：引入一个合乎逻辑的外部变数、意外访客或隐蔽线索，在结尾留出明确行动钩子",
-    "紧凑提速：正文控制在 250–400 字内，对白干脆利落，加快交互节奏",
+  const quickTemplateItems = [
+    { label: "去 AI 味 · 克制白描", text: "去 AI 味：禁止排比句、总结式升华与“空气仿佛凝固/眼底闪过一丝”等陈词滥调，用克制白描和具体动作推动场景" },
+    { label: "严禁越权 · 留白给玩家", text: "严禁越权：绝不替玩家说话、动作或揣测玩家内心决定，把选择权完整留给玩家" },
+    { label: "保持棱角 · 拒绝无端讨好", text: "保持人物棱角：角色遵循自身立场、利害与防备心，不无端讨好或瞬间软化，对白留有潜台词" },
+    { label: "群像运转 · 配角自有主张", text: "群像自然运转：在场配角各自有短期意图与小动作，不全部围着主角转，允许打断与信息差" },
+    { label: "细节慢镜 · 感官氛围刻画", text: "细节镜头：放慢当前一拍，通过声音、气味、光线与微表情展现情绪，避免直接点破心理" },
+    { label: "打破平淡 · 引入外部变数", text: "打破平淡：引入一个合乎逻辑的外部变数、意外访客或隐蔽线索，在结尾留出明确行动钩子" },
+    { label: "紧凑提速 · 短篇快节奏", text: "紧凑提速：正文控制在 250–400 字内，对白干脆利落，加快交互节奏" },
   ];
 
   const opts = [
@@ -1080,9 +1080,9 @@ export async function actionDirectorNote(rt: RpRuntimeHandle, ctx: PiExtensionCo
 
   let noteText = "";
   if (pick.startsWith("✨")) {
-    const tpl = await ctx.ui.select("选择导演模板", [...quickTemplates, "← 返回"]);
+    const tpl = await ctx.ui.select("选择导演模板", [...quickTemplateItems.map((x) => x.label), "← 返回"]);
     if (!tpl || tpl.startsWith("←")) return;
-    noteText = tpl;
+    noteText = quickTemplateItems.find((x) => x.label === tpl)?.text ?? tpl;
   } else {
     const entered = await ctx.ui.input("输入导演指令", "");
     if (!entered?.trim()) return;
@@ -1958,20 +1958,21 @@ export async function actionSelectPacing(rt: RpRuntimeHandle, ctx: PiExtensionCo
   }
   const arg = argsText.trim().toLowerCase();
   let mode: PacingMode | undefined;
+  const pacingZh: Record<PacingMode, string> = { relaxed: "舒缓", balanced: "均衡", dramatic: "紧张" };
   if (arg === "relaxed" || arg === "balanced" || arg === "dramatic") {
     mode = arg;
   } else {
-    const pick = await ctx.ui.select(`🎚 选择叙事节奏（当前：${state.pacingMode}）`, [
-      "relaxed — 舒缓细腻，注重环境氛围与心理互动",
-      "balanced — 均衡自然（默认）",
-      "dramatic — 紧张强冲突，积极推进时钟与悬念",
+    const pick = await ctx.ui.select(`🎚 选择叙事节奏（当前：${pacingZh[state.pacingMode]}）`, [
+      "舒缓 — 细腻氛围与日常互动",
+      "均衡 — 自然推进（默认）",
+      "紧张 — 强冲突与悬念推进",
     ]);
     if (!pick) return;
-    mode = pick.split(" ")[0] as PacingMode;
+    mode = pick.startsWith("舒缓") ? "relaxed" : pick.startsWith("紧张") ? "dramatic" : "balanced";
   }
   rt.commitTx({ kind: "config_patch", pacingMode: mode });
   rt.refreshHud(ctx);
-  ctx.ui.notify(`叙事节奏已切换为：${mode}`, "info");
+  ctx.ui.notify(`叙事节奏已切换为：${pacingZh[mode]}`, "info");
 }
 
 export async function actionSetHud(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {

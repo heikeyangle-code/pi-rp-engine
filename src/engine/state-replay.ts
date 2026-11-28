@@ -674,7 +674,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         state.lastMeaningfulProgressTurn = state.turn;
         pushAudit(state, {
           summary: `印象 ${tx.actorId}→${tx.target}: ${tx.belief.slice(0, 26)}`,
-          source: "sidecar",
+          source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
           undoTx: { kind: "belief_remove", id },
         });
       }
@@ -735,7 +735,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         if (!isUndoTx(tx)) {
           pushAudit(state, {
             summary: `剧情卡完成: ${nextStorylet.title}`,
-            source: "sidecar",
+            source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
             undoTx: prevStorylet
               ? ({ kind: "storylet_upsert", storylet: prevStorylet, reason: "undo" } as RpTxEntry)
               : undefined,
@@ -841,7 +841,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         state.lastMeaningfulProgressTurn = state.turn;
         pushAudit(state, {
           summary: `日程 ${actor}: ${tx.agenda.currentActivity.slice(0, 32)}`,
-          source: "sidecar",
+          source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
           undoTx: prev
             ? ({ kind: "agenda_upsert", agenda: prev, reason: "undo" } as RpTxEntry)
             : { kind: "agenda_delete", actorId: actor },
@@ -893,7 +893,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         }
         pushAudit(state, {
           summary: `关系 ${actorA}↔${actorB}: ${tx.bond.stance} (${tension})${bondEffects.length ? ` → ${bondEffects.join(" ")}` : ""}`,
-          source: "sidecar",
+          source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
           undoTx: prev
             ? ({ kind: "pair_bond_upsert", bond: prev, reason: "undo" } as RpTxEntry)
             : { kind: "pair_bond_delete", id },

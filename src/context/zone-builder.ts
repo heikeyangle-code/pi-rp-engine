@@ -665,7 +665,7 @@ export function buildZone3TransientTail(options: {
     }
     pushSection(
       `<rp_physical_scene>\nRespect physical continuity, line-of-sight, and audio occlusion (no teleportation or telepathic eavesdropping):\n${physLines.join("\n")}\n</rp_physical_scene>`,
-      2,
+      1,
     );
   }
 
@@ -736,7 +736,7 @@ export function buildZone3TransientTail(options: {
     });
     pushSection(
       `<rp_voice_anchors>\nMaintain distinct character speech cadence and non-negotiable backbone (never flatten into generic AI tone or unearned compliance):\n${vaLines.join("\n")}\n</rp_voice_anchors>`,
-      2,
+      1,
     );
   }
 
@@ -858,8 +858,6 @@ export function buildZone3TransientTail(options: {
     ...(spotlightCue ? [`- ${spotlightCue}`] : []),
     ...(pointInTimeOverride ? [`- ${pointInTimeOverride}`] : []),
     ...(shortInputCue ? [`- ${shortInputCue}`] : []),
-    ...(state.sceneObjective ? [`- Scene Objective: ${state.sceneObjective}`] : []),
-    ...activeStorylets.map((s) => `- [Triggered Storylet · ${s.title}] ${s.triggerPrompt}`),
     ...(pacingCue ? [`- ${pacingCue}`] : []),
     ...(lengthCue ? [`- ${lengthCue}`] : []),
     ...(povCue ? [`- ${povCue}`] : []),

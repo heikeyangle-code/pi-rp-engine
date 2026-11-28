@@ -19,7 +19,7 @@ import { rollDiceCheck } from "../engine/dice.js";
 import { computeCalendarAnchor, detectLifespanProfile } from "../engine/temporal.js";
 import { computeCheckedStatValue, resolveCanonicalStatKey, validateCfsmTransition, validateInventoryPatch } from "../engine/cfsm.js";
 import { recallLoreWithGraphPpr, tokenizeHybrid } from "../memory/graph-ppr.js";
-import { getActiveFacts } from "../memory/bitemporal.js";
+import { getActiveFacts, getHistoricalFacts } from "../memory/bitemporal.js";
 import {
   type HistoryRecallCooldown,
   type HistoryRecallTurnScope,
@@ -517,7 +517,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
-        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
+        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }], details: undefined };
       }
 
       // Phase 1: Validate all operations against a staging copy before committing any `rp:tx`
@@ -946,6 +946,16 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             required: ["actorA", "actorB", "stance"],
           },
         },
+        delete_agendas: {
+          type: "array",
+          items: { type: "string" },
+          description: "Actor names whose resolved/obsolete off-screen agendas should be removed",
+        },
+        delete_bonds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Pair bond IDs to remove when obsolete",
+        },
       },
     },
     renderCall(rawArgs, theme) {
@@ -975,11 +985,11 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         ),
       );
     },
-    async execute(_id, rawParams) {
+    async execute(_id, rawParams, _sig, _onUpdate, ctx) {
       const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
-        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
+        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }], details: undefined };
       }
 
       const log: string[] = [];
@@ -1107,6 +1117,30 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         }
       }
 
+      if (Array.isArray(params.delete_agendas)) {
+        for (const a of params.delete_agendas) {
+          const actorId = String(a ?? "").trim();
+          if (actorId) {
+            rt.commitTx({ kind: "agenda_delete", actorId });
+            log.push(`agenda.del(${actorId})`);
+          }
+        }
+      }
+
+      if (Array.isArray(params.delete_bonds)) {
+        for (const bid of params.delete_bonds) {
+          const id = String(bid ?? "").trim();
+          if (id) {
+            rt.commitTx({ kind: "pair_bond_delete", id });
+            log.push(`bond.del(${id})`);
+          }
+        }
+      }
+
+      if (log.length > 0 && ctx) {
+        rt.refreshHud(ctx);
+      }
+
       return {
         content: [{ type: "text", text: log.length ? `Committed: ${log.join(", ")}` : "Nothing committed." }],
         details: { log, previews },
@@ -1122,7 +1156,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       "Search/list/read worldbook entries (action='search'|'list'|'read'), plus memory books, facts, and open foresights.",
     promptSnippet: "Search, list, or read worldbook, memory books & facts.",
     defaultActive: false,
-    annotations: { readOnlyHint: true },
+    annotations: { readOnlyHint: true, openWorldHint: false },
     parameters: {
       type: "object",
       properties: {
@@ -1155,7 +1189,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const state = rt.getState();
       const card = rt.getCard();
       if (!state.active || !card) {
-        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
+        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }], details: undefined };
       }
       const action = params.action === "list" || params.action === "read" ? params.action : "search";
       const query = String(params.query ?? "").trim();
@@ -1189,7 +1223,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       // Mode B: Exact-title-first ranked full-text reader (`read`) ported from dsh-tavern worldbook-files.js
       if (action === "read") {
         if (!query) {
-          return { isError: true, content: [{ type: "text", text: "query is required for action='read'." }] };
+          return { isError: true, content: [{ type: "text", text: "query is required for action='read'." }], details: undefined };
         }
         const norm = (v: string) => v.normalize("NFKC").trim().toLowerCase();
         const qNorm = norm(query);
@@ -1244,7 +1278,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       }
 
       if (!query) {
-        return { isError: true, content: [{ type: "text", text: "query is required for action='search'." }] };
+        return { isError: true, content: [{ type: "text", text: "query is required for action='search'." }], details: undefined };
       }
       const budget = typeof params.token_budget === "number" ? Math.min(2400, Math.max(200, params.token_budget)) : 900;
 
@@ -1322,6 +1356,21 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       }
       if (matchedFacts.length > 0) {
         parts.push(`## Matching Facts\n${matchedFacts.map((f) => `- [${f.id} | T${f.validFromTurn}] ${f.statement}`).join("\n")}`);
+      } else {
+        const histFacts = getHistoricalFacts(state)
+          .filter(
+            (f) =>
+              f.statement.toLowerCase().includes(qLower) ||
+              f.entities.some((e) => e.toLowerCase().includes(qLower)),
+          )
+          .slice(0, 4);
+        if (histFacts.length > 0) {
+          parts.push(
+            `## Historical (Superseded) Facts\n${histFacts
+              .map((f) => `- [${f.id} | T${f.validFromTurn}->T${f.validUntilTurn ?? "?"}] ${f.statement}`)
+              .join("\n")}`,
+          );
+        }
       }
       if (matchedHooks.length > 0) {
         parts.push(`## Matching Foresights\n${matchedHooks.map((h) => `- [${h.id}] ${h.summary} (${h.triggerHint})`).join("\n")}`);
@@ -1346,7 +1395,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       "Search/read past story turns verbatim via BM25. Pass `query` (keywords) OR `turn` (1-indexed) + optional `radius` (0-3). Max 6/turn.",
     promptSnippet: "Recall verbatim past turns by keyword or round #.",
     defaultActive: false,
-    annotations: { readOnlyHint: true },
+    annotations: { readOnlyHint: true, openWorldHint: false },
     parameters: {
       type: "object",
       properties: {
@@ -1374,7 +1423,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
-        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
+        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }], details: undefined };
       }
       const branch = ctx?.sessionManager?.getBranch?.() ?? [];
       const scope = rt.getHistoryRecallScope?.() ?? createTurnRecallScope();
@@ -1426,10 +1475,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           },
         };
       } catch (err) {
-        return {
-          isError: true,
-          content: [{ type: "text", text: (err as Error).message }],
-        };
+        return { isError: true, content: [{ type: "text", text: (err as Error).message }], details: undefined };
       }
     },
   });
@@ -1471,7 +1517,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
-        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
+        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }], details: undefined };
       }
       const fromEra = state.era;
       const prevWorldTimeLabel = state.worldTimeLabel;
@@ -1533,7 +1579,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       "Retrieve an NPC's strictly isolated epistemic view (ONLY facts they witnessed + their own CFSM state and DREAM beliefs) so you can decide their hidden-information reaction without leaking secrets.",
     promptSnippet: "Inspect an NPC's strictly isolated knowledge (FANToM epistemic boundary) before acting.",
     defaultActive: false,
-    annotations: { readOnlyHint: true },
+    annotations: { readOnlyHint: true, openWorldHint: false },
     parameters: {
       type: "object",
       properties: {
@@ -1558,7 +1604,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
-        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
+        return { isError: true, content: [{ type: "text", text: "RP mode is not active." }], details: undefined };
       }
       const actor = String(params.actor ?? "").trim();
       const situation = String(params.situation ?? "").trim();
