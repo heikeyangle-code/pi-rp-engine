@@ -37,7 +37,7 @@
 1. 下载并安装配套 Android 客户端：**[Pi for Android (`heikeyangle-code/pi-android`)](https://github.com/heikeyangle-code/pi-android)**（免 Root、免 Termux，本机直接运行）。
 2. 打开 App，把本仓库链接发给 AI，让它自动安装并启用：
    > 请帮我安装并启用这个角色扮演扩展：`https://github.com/heikeyangle-code/tavern-next`
-3. 装好后输入 `/rp` 或 `/rp import`，内置文件浏览器会自动扫描手机下载目录里的 `.png`、`.charx`、`.json`，选卡即可开玩。所有面板均采用手机原生可搜索底部弹窗与一键点选交互，不弹迷你虚拟终端，支持一键撤销状态误操作。
+3. 装好后输入 `/rp` 或 `/rp import`，内置文件浏览器会自动扫描手机下载目录里的 `.png`、`.charx`、`.json`，选卡即可开玩。所有面板均采用手机原生可搜索底部弹窗与一键点选交互，单手触控顺手，并支持一键撤销状态误操作。
 
 ### 方式二：电脑端使用
 
@@ -74,7 +74,7 @@ git clone https://github.com/heikeyangle-code/tavern-next.git ~/.pi/agent/extens
 - **变量计算、状态更新与叙事上下文彻底隔离（不会因为模型算错数而错乱）**
   - **运算归代码，不让模型当算盘**：数值加减与上下界裁剪、背包数量校验（禁止扣成负数）、进度时钟推进、真随机掷骰、条件门禁校验全部由 TypeScript 代码确定性执行。
   - **动态状态发完即丢，永不写进聊天历史**：每轮 `<rp_state_frame>` 与召回记忆仅通过 `context` 钩子临时附在当次请求尾部（Zone 3），绝不落盘进历史记录。聊到第 100 轮时，主对话历史里依然只有干净纯文字剧情，没有堆积的过期状态代码。
-  - **后台结算与辅助功能走独立隔离上下文**：开启 `sidecar-light` 时，事实、信念与状态提炼在回复结束后另起独立轻量模型请求（且自动从主叙事模型撤下状态写入工具，减少工具调用干扰）；`/rp analyze`、`/rp ask`、`/rp imp`、`/rp act` 全部走独立隔离请求，不污染主剧情上下文。
+  - **后台结算与辅助功能走独立隔离上下文**：开启 `sidecar-light` 时，事实、信念与状态提炼在回复结束后另起独立轻量模型请求（且主叙事模型不背状态写入工具，专注写正文）；`/rp analyze`、`/rp ask`、`/rp imp`、`/rp act` 全部走独立隔离请求，不污染主剧情上下文。
   - **会话与剧情认知双隔离**：角色库纯静态存放，绝不污染普通编程会话（`/rp exit` 一键清零）；未解锁世界书物理拦截，私密事件按知情者列表标注认知盲区。
 
 <br>
@@ -119,7 +119,7 @@ git clone https://github.com/heikeyangle-code/tavern-next.git ~/.pi/agent/extens
 ### 1. 三区 KV-Cache 上下文装配与 X-Ray 透视（`src/context/zone-builder.ts`）
 - **Zone 1（冻结前缀，`before_agent_start`）**：按 SillyTavern 位置规范组装引擎极简协议、预设前段、`system_prompt`、常驻世界书、静态 `outlet`、角色设定、**100% 原样 `mes_example`** 与初始玩家人设；所有宏采用确定性种子求值，跨回合通过 SHA-256 哈希校验保证字节级一致。
 - **Zone 2（Append-Only 历史流）**：绝不篡改历史消息对象；隐藏楼层同时记录 `entryId` 与消息指纹做非破坏性过滤。
-- **Zone 3（瞬态尾部帧，`context`）**：仅挂接在当次请求末尾，不落盘。包含确定性键序 `<rp_state_frame>`、召回世界书、实体匹配的双时态事实、列表优先认知盲区（`- [HIDDEN FROM: NPC] ...`）、RoleMemo DualMem 信念、开放伏笔、激活 Storylets、真实叙事健康度防停滞提示（`stagnation.ts` 基于复读率与世界推进检测，而非机械按轮数触发）、导演指令、`depth_prompt` 与 `post_history_instructions`。
+- **Zone 3（瞬态尾部帧，`context`）**：仅挂接在当次请求末尾，不落盘。包含确定性键序 `<rp_state_frame>`、召回世界书、实体匹配的双时态事实、列表优先认知盲区（`- [HIDDEN FROM: NPC] ...`）、RoleMemo DualMem 信念、开放伏笔、激活 Storylets、真实叙事健康度防停滞提示（`stagnation.ts` 基于复读率与世界推进状态动态检测）、导演指令、`depth_prompt` 与 `post_history_instructions`。
 
 ### 2. 无损 7 维抽取与 L0 / L1 / L2 闭环管道（`src/parser/`、`src/engine/settlement.ts`）
 - **L0 本地无损打捞（`mvu-salvage.ts`、`world-profile.ts`）**：支持禁用态 `[InitVar]` 嵌套 YAML、官方 MVU `_.set`/`_.add`/`_.assign`、JSONPatch、HTML 表格与纯文本有界数值，多角色隔离且保留负值边界。
@@ -127,7 +127,7 @@ git clone https://github.com/heikeyangle-code/tavern-next.git ~/.pi/agent/extens
 - **L2 异步边车闭环（`settlement.ts`、`llm-helper.ts`）**：支持在 `/rp sidecar` 指定独立的廉价极速模型，挂载于 `agent_settled`/`agent_end`（零首字延迟），输出双时态失效（`invalidatedFactIds`）、RoleMemo 主观洞见与情绪基调、场景/时钟/数值更新；兼容推理模型思考标签剥离与平衡括号 JSON 提取。
 
 ### 3. 统一 HippoRAG 2 图谱召回与双时态记忆（`src/memory/`）
-- **统一 2 跳 PPR（`graph-ppr.ts`）**：将世界书条目、双时态事实与记忆书章节桥接在同一本地实体共现图上执行 2 轮幂迭代 Personalized PageRank（本地毫秒级），消除长对话到 100 轮时的早期记忆盲区。
+- **统一 2 跳 PPR（`graph-ppr.ts`）**：将世界书条目、双时态事实与记忆书章节桥接在同一本地实体共现图上执行 2 轮幂迭代 Personalized PageRank（本地毫秒级），保证长篇多轮对话中早期关键设定依然可被准确召回。
 - **语义幕间压缩（`compaction.ts`）**：`session_before_compact` 支持异步语义 MemScene 归并并具备安全回退机制，严格遵循官方 `CompactionResult` 契约。
 
 ### 4. 确定性事件溯源、可逆审计与零污染生命周期（`src/engine/state-replay.ts`、`src/index.ts`）
