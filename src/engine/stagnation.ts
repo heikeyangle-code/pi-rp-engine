@@ -83,7 +83,8 @@ const EN_BOUNDARY_WORDS = new Set([
  * of the last 4 assistant turns, returning concise avoidance cues only for phrases
  * actually repeating in THIS session.
  */
-export function detectRuntimeSlop(recentAssistantTexts: string[]): RuntimeSlopResult {
+export function detectRuntimeSlop(recentAssistantTexts: string[], ignoreTerms: string[] = []): RuntimeSlopResult {
+  const ignoreSet = new Set(ignoreTerms.map((t) => t.trim().toLowerCase()).filter((t) => t.length >= 2));
   const turns = recentAssistantTexts
     .slice(-4)
     .map((t) => t.replace(/<thought\b[^>]*>[\s\S]*?<\/thought>/gi, "").trim())
@@ -109,6 +110,14 @@ export function detectRuntimeSlop(recentAssistantTexts: string[]): RuntimeSlopRe
           if (CJK_BOUNDARY_PARTICLES.has(gram[0]!) || CJK_BOUNDARY_PARTICLES.has(gram[len - 1]!)) {
             continue;
           }
+          let isProperNoun = false;
+          for (const term of ignoreSet) {
+            if (term.includes(gram) || gram.includes(term)) {
+              isProperNoun = true;
+              break;
+            }
+          }
+          if (isProperNoun) continue;
           // Skip if more than half the characters are ultra-common particles
           let particleCount = 0;
           for (const ch of gram) {
@@ -193,6 +202,7 @@ export function detectRuntimeSlop(recentAssistantTexts: string[]): RuntimeSlopRe
 export function evaluateNarrativeHealth(
   state: SessionRpState,
   messages: PiMessage[],
+  ignoreTerms: string[] = [],
 ): NarrativeHealthReport {
   const recentAssistant = messages
     .filter((m) => m.role === "assistant" && m.customType !== "rp:ooc" && m.customType !== "rp:event")
@@ -227,7 +237,13 @@ export function evaluateNarrativeHealth(
       : null;
 
   // 3. Dynamic Runtime SlopTracker (tracks actual repeating phrases in THIS session)
-  const runtimeSlop = detectRuntimeSlop(recentAssistant);
+  const combinedIgnore = [
+    ...ignoreTerms,
+    ...state.presentNpcs,
+    ...(state.location ? [state.location] : []),
+    ...(state.currentPersona?.name ? [state.currentPersona.name] : []),
+  ];
+  const runtimeSlop = detectRuntimeSlop(recentAssistant, combinedIgnore);
   state.slopCounts = { ...runtimeSlop.counts };
 
   const status: NarrativeHealthReport["status"] = antiRepetitionCue

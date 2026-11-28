@@ -191,7 +191,7 @@ function formatLoreEntries(
       const body = evaluateMacros(e.content, macroCtx).trim();
       if (!body) return "";
       if (wiFormat && wiFormat.includes("{0}")) {
-        return wiFormat.replace(/\{0\}/g, `[${e.title}]\n${body}`);
+        return wiFormat.replace(/\{0\}/g, () => `[${e.title}]\n${body}`);
       }
       return `### ${e.title}\n${body}`;
     })
@@ -491,8 +491,8 @@ export function buildZone3TransientTail(options: {
     );
   }
   for (const clk of Object.values(state.clocks)) {
-    if (clk.completed) {
-      dramaBeats.push(`[CLOCK FULL] "${clk.label}" (${clk.value}/${clk.max}) has reached fruition — depict its consequence!`);
+    if (clk.completed && (clk.completedTurn === undefined || state.turn - clk.completedTurn <= 1)) {
+      dramaBeats.push(`[CLOCK FULL id="${clk.clockId}"] "${clk.label}" (${clk.value}/${clk.max}) has reached fruition — depict its consequence!`);
     }
   }
   for (const ag of Object.values(state.npcAgendas)) {
@@ -513,6 +513,7 @@ export function buildZone3TransientTail(options: {
     dramaBeats.push(`[DICE ${critLabel}] ${state.lastRoll.expression}=${state.lastRoll.total}${state.lastRoll.reason ? ` (${state.lastRoll.reason})` : ""} — make this dramatic swing unmistakable!`);
   }
   for (const pb of Object.values(state.pairBonds)) {
+    if (pb.lastCrisisTurn !== undefined && state.turn - pb.lastCrisisTurn > 1) continue;
     if (pb.tension <= -60) {
       dramaBeats.push(`[RELATIONSHIP RIFT] ${pb.actorA} ↔ ${pb.actorB} (${pb.stance}, tension ${pb.tension}) is at breaking point.`);
     } else if (pb.tension >= 60) {
@@ -545,7 +546,7 @@ export function buildZone3TransientTail(options: {
         const body = evaluateMacros(e.content, macroCtx).trim();
         if (!body) return "";
         if (wiFmt && wiFmt.includes("{0}")) {
-          return wiFmt.replace(/\{0\}/g, `[${e.title}] ${body}`);
+          return wiFmt.replace(/\{0\}/g, () => `[${e.title}] ${body}`);
         }
         return `[${e.title}] ${body}`;
       })
@@ -563,16 +564,17 @@ export function buildZone3TransientTail(options: {
 
   const activeFacts = selectFactsForZone3(state, recentText, 8, 6);
   if (activeFacts.length > 0) {
-    const { known, blindSpots } = partitionEpistemicFacts(activeFacts, state.presentNpcs);
+    const epistemicActors = state.presentNpcs.length > 0 ? state.presentNpcs : (charName ? [charName] : []);
+    const { known, blindSpots } = partitionEpistemicFacts(activeFacts, epistemicActors);
     if (known.length > 0) {
       recalledSections.push(
-        `## Established Facts\n${known.map((f) => `- [T${f.validFromTurn}] ${f.statement}`).join("\n")}`,
+        `## Established Facts\n${known.map((f) => `- [${f.id} | T${f.validFromTurn}] ${f.statement}`).join("\n")}`,
       );
     }
     if (blindSpots.length > 0) {
       recalledSections.push(
         `## Epistemic Access Boundaries (List-First Isolation: characters listed below CANNOT know, hear, or act on these facts)\n${blindSpots
-          .map((b) => `- [HIDDEN FROM: ${b.ignorantNpcs.join(", ")}] ${b.fact.statement}`)
+          .map((b) => `- [${b.fact.id}] [HIDDEN FROM: ${b.ignorantNpcs.join(", ")}] ${b.fact.statement}`)
           .join("\n")}`,
       );
     }
@@ -607,7 +609,7 @@ export function buildZone3TransientTail(options: {
   const activeForesights = selectActiveForesights(state, recentText, 3);
   if (activeForesights.length > 0) {
     recalledSections.push(
-      `## Open Foresights\n${activeForesights.map((h) => `- ${h.summary}${h.triggerHint ? ` (hint: ${h.triggerHint})` : ""}`).join("\n")}`,
+      `## Open Foresights\n${activeForesights.map((h) => `- [${h.id}] ${h.summary}${h.triggerHint ? ` (hint: ${h.triggerHint})` : ""}`).join("\n")}`,
     );
   }
 
@@ -836,11 +838,13 @@ export function buildZone3TransientTail(options: {
       }
     }
     const n = state.presentNpcs.length;
+    const userMsgLower = (lastUserMessage ?? "").toLowerCase();
     const ranked = state.presentNpcs.map((npc, idx) => {
       const talk = talkMap.get(npc.toLowerCase()) ?? 0.5;
       const slot = (idx + state.turn) % n;
       const rotBoost = slot === 0 ? 0.45 : slot === 1 ? 0.2 : 0;
-      return { npc, score: talk + rotBoost, idx };
+      const mentionedBoost = userMsgLower && userMsgLower.includes(npc.toLowerCase()) ? 2.0 : 0;
+      return { npc, score: talk + rotBoost + mentionedBoost, idx };
     });
     ranked.sort((a, b) => b.score - a.score || a.idx - b.idx);
     const focalCount = n >= 3 ? 2 : 1;
@@ -948,15 +952,11 @@ export function attachZone3ToMessages(
   const targetIdx = out.length - 1;
   const target = out[targetIdx]!;
 
-  // When trailing message is a toolResult, attach only the compact <rp_state_frame> snapshot
-  // instead of duplicating full <rp_director_note> / <rp_voice_anchors> inside tool output.
-  let payloadToAttach = zone3Text;
-  if (target.role === "toolResult") {
-    const frameMatch = zone3Text.match(/<rp_state_frame>[\s\S]*?<\/rp_state_frame>/);
-    if (frameMatch) {
-      payloadToAttach = frameMatch[0];
-    }
-  }
+  // Because `context` attaches Zone 3 only transiently (never mutating stored user messages),
+  // a trailing `toolResult` has NO Zone 3 on the earlier user turn. Attach the full transient
+  // Zone 3 strictly to `out[last]` so KV-Cache on prior messages stays 100% intact AND the model
+  // retains recalled lore, facts/blind spots, voice anchors, and director rules when writing prose!
+  const payloadToAttach = zone3Text;
 
   if (typeof target.content === "string") {
     out[targetIdx] = {

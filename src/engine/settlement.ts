@@ -116,10 +116,12 @@ export async function runSidecarLightSettlement(options: {
   pi: PiExtensionAPI;
   ctx: PiExtensionContext;
   state: SessionRpState;
+  getState?: () => SessionRpState;
+  isStale?: () => boolean;
   lastUserText: string;
   lastAssistantText: string;
 }): Promise<number> {
-  const { pi, ctx, state, lastUserText, lastAssistantText } = options;
+  const { pi, ctx, state, getState, isStale, lastUserText, lastAssistantText } = options;
   if (!state.active || state.settlementMode !== "sidecar-light") return 0;
   if (!lastAssistantText.trim()) return 0;
 
@@ -175,7 +177,7 @@ export async function runSidecarLightSettlement(options: {
   if (state.modules.stats) {
     schemaFields.push(`"stats": [{"actorId":"...","key":"...","op":"set"|"add","value":number|string|boolean,"reason":"..."}]`);
   }
-  if (state.modules.inventory && (!isLightArchetype || Object.keys(state.inventory).length > 0 || state.modules.inventory)) {
+  if (state.modules.inventory && (!isLightArchetype || Object.keys(state.inventory).length > 0)) {
     schemaFields.push(`"inventory": [{"actorId":"...","item":"...","delta":integer,"note":"..."}]`);
   }
   if (state.modules.clocks) {
@@ -291,7 +293,11 @@ export async function runSidecarLightSettlement(options: {
 
     // Stale-branch guard (strict CAS): if user exited RP, switched cards, rewound, moved to another branch,
     // or advanced the leaf while sidecar ran, discard cleanly!
-    if (!state.active || state.turn !== startTurn || state.cardSlug !== startCardSlug) {
+    if (isStale?.()) {
+      return 0;
+    }
+    const liveState = getState ? getState() : state;
+    if (!liveState.active || liveState.turn !== startTurn || liveState.cardSlug !== startCardSlug) {
       return 0;
     }
     if (startLeafId) {

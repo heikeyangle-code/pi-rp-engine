@@ -72,7 +72,7 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
 
   const requireActive = (fn: (ctx: PiExtensionContext) => Promise<void>) => (ctx: PiExtensionContext) => {
     if (!handlers.isActive()) {
-      ctx.ui.notify("当前会话未开启 RP 模式，请先输入 /rp 打开启动器。", "info");
+      ctx.ui.notify("当前会话未开启角色扮演模式，请先点「主菜单」加载角色卡。", "info");
       return;
     }
     return runShortcut(fn, ctx);

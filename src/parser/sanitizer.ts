@@ -12,6 +12,7 @@
 
 import type { CompiledRegexRule } from "../types.js";
 import { evaluateMacros, type MacroContext } from "./macros.js";
+import { isSafeRegexPattern } from "./lore-compiler.js";
 
 export interface StrippedRecord {
   field: string;
@@ -214,6 +215,10 @@ export function applyDisplayRegexRules(
           userName: escapeRegExp(macroCtx.userName),
         });
       }
+    }
+
+    if (pattern !== rule.pattern && !isSafeRegexPattern(pattern)) {
+      continue;
     }
 
     try {

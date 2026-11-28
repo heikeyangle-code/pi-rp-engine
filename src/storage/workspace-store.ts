@@ -101,15 +101,23 @@ export function saveCompiledCard(options: {
 }
 
 export function loadCompiledCard(baseDir: string, slug: string): CompiledCard | null {
-  const safeSlug = assertSafeSegment(slug, "card slug");
-  const target = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.compiled.json");
-  return readJsonSafe<CompiledCard>(target);
+  try {
+    const safeSlug = assertSafeSegment(slug, "card slug");
+    const target = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.compiled.json");
+    return readJsonSafe<CompiledCard>(target);
+  } catch {
+    return null;
+  }
 }
 
 export function loadRawCardJson(baseDir: string, slug: string): Record<string, unknown> | null {
-  const safeSlug = assertSafeSegment(slug, "card slug");
-  const target = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.raw.json");
-  return readJsonSafe<Record<string, unknown>>(target);
+  try {
+    const safeSlug = assertSafeSegment(slug, "card slug");
+    const target = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.raw.json");
+    return readJsonSafe<Record<string, unknown>>(target);
+  } catch {
+    return null;
+  }
 }
 
 export function listCardSlugs(baseDir: string): string[] {
@@ -236,7 +244,12 @@ export function saveCompiledPreset(baseDir: string, preset: CompiledPreset): str
 }
 
 export function loadCompiledPreset(cwd: string, presetId: string): CompiledPreset | null {
-  const safeId = assertSafeSegment(presetId, "preset id");
+  let safeId: string;
+  try {
+    safeId = assertSafeSegment(presetId, "preset id");
+  } catch {
+    return null;
+  }
   const projPath = resolveInsideRoot(path.join(getProjectRpDir(cwd), "presets"), `${safeId}.json`);
   const proj = readJsonSafe<CompiledPreset>(projPath);
   if (proj) return proj;

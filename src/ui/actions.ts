@@ -227,7 +227,7 @@ async function pickGreeting(ctx: PiExtensionContext, card: CompiledCard, quickDe
   return idx >= 0 ? idx : undefined;
 }
 
-async function pickOrCreatePersona(ctx: PiExtensionContext, current: PersonaProfile): Promise<PersonaProfile> {
+async function pickOrCreatePersona(ctx: PiExtensionContext, current: PersonaProfile): Promise<PersonaProfile | undefined> {
   const saved = loadPersonas(ctx.cwd);
   const prefs = loadUiPrefs();
   const preferred =
@@ -242,15 +242,20 @@ async function pickOrCreatePersona(ctx: PiExtensionContext, current: PersonaProf
     "+ 新建玩家人设（保存到全局库，跨卡通用）",
   ];
 
-  const choice = await ctx.ui.select("🧑 选择本次会话的玩家人设 (Persona)", options);
-  if (!choice || choice.startsWith("▶")) {
+  const choice = await ctx.ui.select("🧑 选择本次会话的玩家马甲", options);
+  if (!choice) {
+    return undefined;
+  }
+  if (choice.startsWith("▶")) {
     return preferred;
   }
   if (choice.startsWith("+")) {
-    const name = (await ctx.ui.input("玩家角色名称", "旅人"))?.trim();
-    if (!name) return preferred;
+    const nameRaw = await ctx.ui.input("玩家角色名称", "旅人");
+    if (nameRaw === undefined) return undefined;
+    const name = nameRaw.trim();
+    if (!name) return undefined;
     const descRaw = await ctx.ui.input("简短设定/外貌/身份（可留空）", "");
-    if (descRaw === undefined) return preferred;
+    if (descRaw === undefined) return undefined;
     const desc = descRaw.trim();
     const profile: PersonaProfile = {
       id: name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_").slice(0, 32) || `p_${Date.now()}`,
@@ -746,6 +751,7 @@ export async function actionImportFile(rt: RpRuntimeHandle, ctx: PiExtensionCont
   const greetingIndex = await pickGreeting(ctx, card);
   if (greetingIndex === undefined) return;
   const persona = await pickOrCreatePersona(ctx, rt.getState().currentPersona);
+  if (!persona) return;
   await bindCardToCurrentSession(rt, ctx, {
     card,
     source,
@@ -835,6 +841,7 @@ export async function actionLoadCard(rt: RpRuntimeHandle, ctx: PiExtensionContex
   const greetingIndex = await pickGreeting(ctx, card);
   if (greetingIndex === undefined) return;
   const persona = await pickOrCreatePersona(ctx, rt.getState().currentPersona);
+  if (!persona) return;
   let presetId: string | undefined;
   if (presets.length > 0) {
     const pPick = await ctx.ui.select("🎛 是否加载酒馆预设（可选）", ["不使用预设（推荐）", ...presets]);
@@ -1121,9 +1128,10 @@ export async function actionPersona(rt: RpRuntimeHandle, ctx: PiExtensionContext
   }
 
   const next = await pickOrCreatePersona(ctx, state.currentPersona);
+  if (!next) return;
   rt.commitTx({ kind: "persona_set", persona: next });
   rt.refreshHud(ctx);
-  ctx.ui.notify(`已切换玩家人设：${next.name}`, "info");
+  ctx.ui.notify(`已切换玩家马甲：${next.name}`, "info");
 }
 
 export async function actionGreeting(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
@@ -1285,21 +1293,33 @@ export async function actionBookmarkGoto(rt: RpRuntimeHandle, ctx: PiExtensionCo
   if (!modePick || modePick.startsWith("✕")) return;
 
   if (modePick.startsWith("🌿") && typeof ctx.fork === "function") {
-    const res = await ctx.fork(target.targetId);
-    if (!res?.cancelled) {
-      rt.reloadRuntime(ctx);
-      rt.refreshHud(ctx);
-      ctx.ui.notify(`已从书签「${target.label}」创建新剧情分支。`, "info");
+    try {
+      const forkFn = ctx.fork as (
+        targetId: string,
+        opts?: { position?: "before" | "at"; withSession?: (newCtx: PiExtensionContext) => Promise<void> | void },
+      ) => Promise<{ cancelled?: boolean } | void>;
+      await forkFn(target.targetId, {
+        position: "at",
+        withSession: (newCtx) => {
+          newCtx.ui?.notify?.(`已从书签「${target.label}」创建新剧情分支。`, "info");
+        },
+      });
+    } catch (err) {
+      ctx.ui.notify(`创建分支失败：${err instanceof Error ? err.message : String(err)}`, "warning");
     }
     return;
   }
 
   if (typeof ctx.navigateTree === "function") {
-    const res = await ctx.navigateTree(target.targetId);
-    if (!res?.cancelled) {
-      rt.reloadRuntime(ctx);
-      rt.refreshHud(ctx);
-      ctx.ui.notify(`已回溯至书签「${target.label}」，所有数值与事实账本已同步还原。`, "info");
+    try {
+      const res = await ctx.navigateTree(target.targetId);
+      if (!res?.cancelled) {
+        rt.reloadRuntime(ctx);
+        rt.refreshHud(ctx);
+        ctx.ui.notify(`已回溯至书签「${target.label}」，所有数值与事实账本已同步还原。`, "info");
+      }
+    } catch (err) {
+      ctx.ui.notify(`无法回溯至书签：${err instanceof Error ? err.message : String(err)}`, "warning");
     }
   } else {
     ctx.ui.setEditorText?.(`/rp goto ${target.label}`);
@@ -1358,6 +1378,7 @@ export async function actionToggleHide(
     const ids = targets.map((x) => x.entry.id);
     const fps = targets.map((x) => computeMessageFingerprint(x.msg));
     rt.commitTx({ kind: "hide_toggle", entryIds: ids, fingerprints: fps, hidden: hide });
+    rt.refreshHud(ctx);
     ctx.ui.notify(`已${hide ? "隐藏" : "恢复"}最近 ${ids.length} 条对话楼层（非破坏性，不删日志）。`, "info");
     return;
   }
@@ -1390,6 +1411,7 @@ export async function actionToggleHide(
       fingerprints: Array.from(state.hiddenFingerprints),
       hidden: false,
     });
+    rt.refreshHud(ctx);
     ctx.ui.notify("已恢复全部隐藏楼层。", "info");
     return;
   }
@@ -1401,6 +1423,7 @@ export async function actionToggleHide(
   const currentlyHidden = state.hiddenEntryIds.has(chosen.entry.id) || state.hiddenFingerprints.has(fp);
   const nextHidden = !currentlyHidden;
   rt.commitTx({ kind: "hide_toggle", entryIds: [chosen.entry.id], fingerprints: [fp], hidden: nextHidden });
+  rt.refreshHud(ctx);
   ctx.ui.notify(`该楼层已设为：${nextHidden ? "隐藏（模型不可见）" : "恢复可见"}`, "info");
 }
 
@@ -1574,7 +1597,9 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
       spanKind = "scene_only";
       const loc = (await ctx.ui.input("输入要切往的新地点", state.location || ""))?.trim();
       if (!loc) return;
-      const npcsRaw = (await ctx.ui.input("新地点在场人物（逗号分隔，可留空）", "")) ?? "";
+      const npcsInput = await ctx.ui.input("新地点在场人物（逗号分隔，可留空）", "");
+      if (npcsInput === undefined) return;
+      const npcsRaw = npcsInput;
       const npcs = npcsRaw.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
       rt.commitTx({ kind: "location_set", location: loc, presentNpcs: npcs });
       rt.refreshHud(ctx);
@@ -1609,8 +1634,9 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
     if (!desc) return;
 
     if (spanKind === "days" || spanKind === "long") {
-      playerPlan =
-        (await ctx.ui.input("这段时间主角主要做什么？（可选，如：养伤/打听消息/赶路，留空自动推演）", ""))?.trim() ?? "";
+      const planInput = await ctx.ui.input("这段时间主角主要做什么？（可留空自动推演）", "");
+      if (planInput === undefined) return;
+      playerPlan = planInput.trim();
     }
   }
 
@@ -2227,7 +2253,13 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
 
   // Preferred path: true tree-branching Swipe via navigateTree so old swipe stays intact in Pi /tree!
   if (typeof ctx.navigateTree === "function" && triggerEntry && rewindParentId) {
-    const nav = await ctx.navigateTree(rewindParentId);
+    let nav: { cancelled?: boolean } | void;
+    try {
+      nav = await ctx.navigateTree(rewindParentId);
+    } catch (err) {
+      ctx.ui.notify(`重摇回溯失败：${err instanceof Error ? err.message : String(err)}`, "warning");
+      return;
+    }
     if (nav?.cancelled) return;
     rt.reloadRuntime(ctx);
     if (steerHint) {

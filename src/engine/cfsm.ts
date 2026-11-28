@@ -100,7 +100,8 @@ export function computeCheckedStatValue(
   min?: number,
   max?: number,
 ): ValidationResult {
-  const existingBounds = state.statBounds[actorId]?.[key];
+  const boundsActorKey = findCaseInsensitiveKey(state.statBounds, actorId) ?? actorId;
+  const existingBounds = state.statBounds[boundsActorKey]?.[key];
   const effMin = min ?? existingBounds?.min;
   const effMax = max ?? existingBounds?.max;
 
@@ -108,7 +109,8 @@ export function computeCheckedStatValue(
     if (typeof value !== "number" || !Number.isFinite(value)) {
       return { ok: false, error: `stat_patch op="add" requires a finite number for ${actorId}.${key}` };
     }
-    const prev = state.stats[actorId]?.[key];
+    const statsActorKey = findCaseInsensitiveKey(state.stats, actorId) ?? actorId;
+    const prev = state.stats[statsActorKey]?.[key];
     const base = typeof prev === "number" ? prev : 0;
     let next = base + value;
     if (effMin !== undefined) next = Math.max(effMin, next);
@@ -141,7 +143,8 @@ export function validateInventoryPatch(
   if (!Number.isInteger(delta) || delta === 0) {
     return { ok: false, error: `Inventory delta must be a non-zero integer, got ${delta}` };
   }
-  const current = state.inventory[actorId]?.[item] ?? 0;
+  const invActorKey = findCaseInsensitiveKey(state.inventory, actorId) ?? actorId;
+  const current = state.inventory[invActorKey]?.[item] ?? 0;
   const next = current + delta;
   if (next < 0) {
     return {
@@ -150,4 +153,38 @@ export function validateInventoryPatch(
     };
   }
   return { ok: true, clampedValue: next };
+}
+
+const STAT_KEY_SYNONYMS: Array<string[]> = [
+  ["好感", "好感度", "亲密度", "亲密", "关系度", "affection", "affinity", "favor", "likability"],
+  ["信任", "信任度", "信赖", "信赖度", "trust"],
+  ["理智", "理智值", "san", "sanity"],
+  ["体力", "精力", "耐力", "stamina", "energy", "sp"],
+  ["生命", "生命值", "血量", "气血", "hp", "health"],
+  ["心情", "情绪", "mood"],
+  ["压力", "压力值", "stress"],
+  ["警戒", "警戒度", "怀疑", "怀疑度", "suspicion", "alert"],
+  ["声望", "名望", "reputation", "fame"],
+  ["金币", "金钱", "银两", "货币", "存款", "gold", "money", "credits"],
+];
+
+/**
+ * Deduplicate synonym stat keys (e.g., `好感` vs `好感度`) across BOTH tool-assisted and sidecar modes.
+ */
+export function resolveCanonicalStatKey(state: SessionRpState, actorId: string, rawKey: string): string {
+  const clean = rawKey.trim();
+  if (!clean) return clean;
+  const statsActorKey = findCaseInsensitiveKey(state.stats, actorId) ?? actorId;
+  const existingKeys = Object.keys(state.stats[statsActorKey] ?? {});
+  if (existingKeys.length === 0) return clean;
+  const lower = clean.toLowerCase();
+  const exact = existingKeys.find((k) => k.toLowerCase() === lower);
+  if (exact) return exact;
+  for (const group of STAT_KEY_SYNONYMS) {
+    if (group.includes(lower)) {
+      const match = existingKeys.find((k) => group.includes(k.toLowerCase()));
+      if (match) return match;
+    }
+  }
+  return clean;
 }

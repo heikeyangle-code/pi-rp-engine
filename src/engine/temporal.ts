@@ -56,13 +56,20 @@ export function parseFlexNumber(raw: string): number | null {
   }
 
   // Handle digit-by-digit Chinese numerals (e.g. "二零二六" -> 2026, "一九四五" -> 1945)
+  // Guard against Chinese approximate pairs like "两三" (2-3) or "三五" (3-5) being parsed as 23 / 35!
   const chars = Array.from(s);
   if (chars.length >= 2 && chars.every((ch) => CN_DIGITS[ch] !== undefined)) {
-    let val = 0;
-    for (const ch of chars) {
-      val = val * 10 + CN_DIGITS[ch]!;
+    if (chars.length >= 4 || chars.includes("零") || chars.includes("〇")) {
+      let val = 0;
+      for (const ch of chars) {
+        val = val * 10 + CN_DIGITS[ch]!;
+      }
+      return val;
     }
-    return val;
+    // Approximate pair (e.g. "两三" -> 3, "三五" -> 4): take rounded midpoint
+    const a = CN_DIGITS[chars[0]!] ?? 0;
+    const b = CN_DIGITS[chars[chars.length - 1]!] ?? a;
+    return Math.round((a + b) / 2);
   }
 
   let total = 0;
@@ -174,12 +181,14 @@ export function parseTimeSpan(desc: string): ParsedTimeSpan {
     if (n && n > 0) years += n * 100;
   }
 
-  const yearMatch = new RegExp(`(${NUM_TOKEN})\\s*(?:余?年|载|載|岁|歲|years?|yrs?)(\\s*半)?`, "i").exec(text);
+  const yearMatch = new RegExp(`(${NUM_TOKEN})\\s*(?:余?年|载|載|years?|yrs?)(\\s*半)?`, "i").exec(text);
   if (yearMatch) {
     const prefix = text.slice(0, yearMatch.index);
+    const suffix = text.slice(yearMatch.index + yearMatch[0].length);
     const isAbsoluteYear = ABSOLUTE_YEAR_PREFIX_RE.test(prefix);
-    if (!isAbsoluteYear) {
-      const n = parseFlexNumber(yearMatch[1] ?? "");
+    const n = parseFlexNumber(yearMatch[1] ?? "");
+    const isBareCalendarYear = Boolean(n && n >= 1000 && !/^(?:\s*(?:后|後|之后|之後|以后|以後|later|ahead))/i.test(suffix));
+    if (!isAbsoluteYear && !isBareCalendarYear) {
       if (n && n > 0) {
         years += n + (yearMatch[2] ? 0.5 : 0);
       }

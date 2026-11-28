@@ -17,7 +17,7 @@ import type {
 import { RP_ENTRY_TYPE, applyRpTx } from "../engine/state-replay.js";
 import { rollDiceCheck } from "../engine/dice.js";
 import { computeCalendarAnchor, detectLifespanProfile } from "../engine/temporal.js";
-import { computeCheckedStatValue, validateCfsmTransition, validateInventoryPatch } from "../engine/cfsm.js";
+import { computeCheckedStatValue, resolveCanonicalStatKey, validateCfsmTransition, validateInventoryPatch } from "../engine/cfsm.js";
 import { recallLoreWithGraphPpr, tokenizeHybrid } from "../memory/graph-ppr.js";
 import { getActiveFacts } from "../memory/bitemporal.js";
 import {
@@ -60,7 +60,10 @@ type ExtendedPiToolDefinition = PiToolDefinition & {
 };
 
 function registerExtendedTool(pi: PiExtensionAPI, tool: ExtendedPiToolDefinition): void {
-  pi.registerTool(tool);
+  pi.registerTool({
+    prepareArguments: (args) => unwrapNestedArgs(args),
+    ...tool,
+  });
 }
 
 /**
@@ -152,6 +155,11 @@ function cloneStagingState(state: SessionRpState): SessionRpState {
     flags: { ...state.flags },
     conditions: { ...state.conditions },
     storylets: new Map(state.storylets),
+    milestones: new Set(state.milestones),
+    foresights: new Map(state.foresights),
+    npcAgendas: { ...state.npcAgendas },
+    pairBonds: { ...state.pairBonds },
+    beliefs: [...state.beliefs],
     stats,
     statBounds,
     inventory,
@@ -182,6 +190,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       "Deterministic dice/skill check ('1d20', '1d20+3', '2d20kh1', '2d6', '1d100'). Call BEFORE narrating risky/uncertain/contested actions; optionally pass stat_key to auto-add character stat bonus.",
     promptSnippet: "Roll dice for risky/uncertain skill, stealth, persuasion, or combat checks.",
     defaultActive: false,
+    executionMode: "sequential",
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     parameters: {
       type: "object",
       properties: {
@@ -321,15 +331,20 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
     name: "rp_state_patch",
     label: "RP 状态账本更新",
     description:
-      "Atomically update world state (location, NPCs, stats, inventory, flags, clocks, CFSM, physical/spatial notes).",
-    promptSnippet: "Patch world stats, inventory, location, flags, clocks, CFSM.",
+      "Atomically update world state (location, NPCs, scene objective, time label, stats, inventory, flags, clocks, CFSM, physical/spatial notes).",
+    promptSnippet: "Patch world stats, inventory, location, objective, time, flags, clocks, CFSM.",
     defaultActive: false,
     executionMode: "sequential",
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     parameters: {
       type: "object",
       properties: {
         location: { type: "string", description: "Scene location" },
         present_npcs: { type: "array", items: { type: "string" }, description: "Present NPC names" },
+        scene_objective: { type: "string", description: "Current scene objective (empty string to clear)" },
+        world_time_label: { type: "string", description: "Updated in-world time label (e.g. '次日清晨', '夜半')" },
+        day_delta: { type: "integer", description: "Optional non-negative day increment when advancing calendar days" },
+        delete_clocks: { type: "array", items: { type: "string" }, description: "Clock IDs to remove after resolution" },
         stats: {
           type: "array",
           items: {
@@ -526,10 +541,37 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         );
       }
 
+      if (typeof params.scene_objective === "string") {
+        stageTx({ kind: "scene_objective_set", objective: params.scene_objective.trim() }, `objective=${params.scene_objective.trim() || "(cleared)"}`);
+      }
+
+      if (typeof params.world_time_label === "string" || (typeof params.day_delta === "number" && params.day_delta > 0)) {
+        const dayDelta = typeof params.day_delta === "number" && Number.isFinite(params.day_delta) ? Math.max(0, Math.round(params.day_delta)) : 0;
+        stageTx(
+          {
+            kind: "clock_tick",
+            beatDelta: 0,
+            dayDelta,
+            worldTimeLabel: typeof params.world_time_label === "string" && params.world_time_label.trim() ? params.world_time_label.trim() : undefined,
+          },
+          `time=${typeof params.world_time_label === "string" ? params.world_time_label.trim() : `+${dayDelta}d`}`,
+        );
+      }
+
+      if (Array.isArray(params.delete_clocks)) {
+        for (const cid of params.delete_clocks) {
+          const cleanId = String(cid ?? "").trim();
+          if (cleanId) {
+            stageTx({ kind: "clock_delete", clockId: cleanId }, `clock.del(${cleanId})`);
+          }
+        }
+      }
+
       if (Array.isArray(params.stats)) {
         for (const s of params.stats as Array<Record<string, unknown>>) {
           const actorId = String(s.actor ?? "player");
-          const key = String(s.key ?? "");
+          const rawKey = String(s.key ?? "");
+          const key = resolveCanonicalStatKey(staging, actorId, rawKey);
           const op = s.op === "add" ? "add" : "set";
           const val = s.value as number | string | boolean;
           const min = typeof s.min === "number" ? s.min : undefined;
@@ -813,6 +855,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
     promptSnippet: "Commit/invalidate facts, beliefs, foresights, or agendas.",
     defaultActive: false,
     executionMode: "sequential",
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     parameters: {
       type: "object",
       properties: {
@@ -1252,11 +1295,15 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         const semHits = await rankBySemanticSimilarity(recallEmbCfg, query, loreDocs, 0.30);
         if (semHits && semHits.length > 0) {
           const existingIds = new Set(loreRes.selected.map((e) => e.id));
+          let usedTokens = loreRes.selected.reduce((sum, e) => sum + Math.ceil(e.content.length / 3), 0);
           for (const hit of semHits.slice(0, 3)) {
             const entry = visibleLore[hit.index];
             if (entry && !existingIds.has(entry.id)) {
+              const est = Math.ceil(entry.content.length / 3);
+              if (usedTokens + est > budget && loreRes.selected.length > 0) continue;
               loreRes.selected.push(entry);
               existingIds.add(entry.id);
+              usedTokens += est;
             }
           }
         }
@@ -1274,10 +1321,10 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         );
       }
       if (matchedFacts.length > 0) {
-        parts.push(`## Matching Facts\n${matchedFacts.map((f) => `- [T${f.validFromTurn}] ${f.statement}`).join("\n")}`);
+        parts.push(`## Matching Facts\n${matchedFacts.map((f) => `- [${f.id} | T${f.validFromTurn}] ${f.statement}`).join("\n")}`);
       }
       if (matchedHooks.length > 0) {
-        parts.push(`## Matching Foresights\n${matchedHooks.map((h) => `- ${h.summary} (${h.triggerHint})`).join("\n")}`);
+        parts.push(`## Matching Foresights\n${matchedHooks.map((h) => `- [${h.id}] ${h.summary} (${h.triggerHint})`).join("\n")}`);
       }
 
       return {

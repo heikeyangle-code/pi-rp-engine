@@ -20,7 +20,7 @@ const NON_CHARACTER_SUFFIX_RE =
   /(?:模拟器|模组|剧本|世界|空间|指南|物语|风云|传说|纪元|编年史|计划|系统|合集|大全|市|省|县|镇|村|城|国|帝国|王国|公国|共和国|联邦|王朝|朝廷|政府|议会|法院|学院|大学|学校|医院|公司|集团|企业|协会|公会|商会|教团|教会|宗门|门派|帮派|部队|军团|警局|部门|厅|馆|店|铺|楼|阁|殿|宫|院|室|房|屋|街|巷|路|桥|港|站|山|岭|峰|谷|林|森|河|江|湖|海|岛|洞|窟|塔|堡|营|地|区|域|界|境|栏|表|单|录|志|图|谱|书|册|卷|章|节|幕)$/i;
 
 const CARD_TITLE_OR_METAPHOR_RE =
-  /(?:模拟器|模组|剧本|世界观|主神空间|指南|rpg|trpg|simulator|scenario|chronicle|game\s*master|gm|narrator|仿佛|宛如|犹如|就像|如同|般的|一般|一样|之影|之刃|之手|齿轮|阴影|风暴|深渊|命运|宿命)/i;
+  /(?:模拟器|模组|剧本|世界观|主神空间|指南|rpg|trpg|simulator|scenario|chronicle|game\s*master|\bgm\b|\bnarrator\b|仿佛|宛如|犹如|就像|如同|般的|一般|一样|之影|之刃|之手|齿轮|阴影|风暴|深渊|命运|宿命)/i;
 
 /** Descriptive Chinese noun-phrases / metaphors like "黑夜中的幽灵" or "沉睡的巨兽" are not character names. */
 const DESCRIPTIVE_PHRASE_RE = /(?:[一-鿿]{2,}的[一-鿿]{1,}|[一-鿿]{2,}之[一-鿿]{2,})/;

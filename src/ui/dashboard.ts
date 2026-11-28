@@ -77,7 +77,7 @@ export interface DashboardRuntime {
 const PACING_ZH: Record<PacingMode, string> = {
   relaxed: "舒缓",
   balanced: "均衡",
-  dramatic: "紧凑",
+  dramatic: "紧张",
 };
 
 const STORYLET_STATUS_ZH: Record<StoryletEntry["status"], string> = {
@@ -554,7 +554,7 @@ async function openActorProfile(rt: DashboardRuntime, ctx: PiExtensionContext, a
   }
 }
 
-export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<"back" | "close"> {
   while (true) {
     const s = rt.getState();
     const activeSt = evaluateActiveStorylets(s).length;
@@ -587,7 +587,7 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
       "🎞 幕后插叙 / 小剧场",
       "← 返回主面板",
     ]);
-    if (!pick || pick.startsWith("←")) return;
+    if (!pick || pick.startsWith("←")) return "back";
 
     if (pick.startsWith("📍")) {
       const loc = await ctx.ui.input("当前地点", s.location || "");
@@ -623,12 +623,13 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
       await openClocksManager(rt, ctx);
     } else if (pick.startsWith("⚠") || pick.startsWith("🟢")) {
       await rt.openXRay(ctx);
+      return "close";
     } else if (pick.startsWith("⏳")) {
       await rt.skipScene(ctx);
-      return;
+      return "close";
     } else if (pick.startsWith("🔦")) {
       await rt.spotlightNpc?.(ctx);
-      return;
+      return "close";
     } else if (pick.startsWith("🎞")) {
       await rt.interludeScene?.(ctx);
       continue;
@@ -1086,7 +1087,7 @@ async function openMemoryBookChapters(rt: DashboardRuntime, ctx: PiExtensionCont
   }
 }
 
-export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<"back" | "close"> {
   while (true) {
     const s = rt.getState();
     const activeFacts = getActiveFacts(s);
@@ -1120,7 +1121,7 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
       `📖 记忆、伏笔与世界书（事实 ${activeFacts.length} · 伏笔 ${openHooks.length}）`,
       options,
     );
-    if (!pick || pick.startsWith("←")) return;
+    if (!pick || pick.startsWith("←")) return "back";
 
     if (pick.startsWith("📚")) {
       await openMemoryBookChapters(rt, ctx);
@@ -1140,7 +1141,7 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     }
     if (pick.startsWith("📜")) {
       await rt.recapStory(ctx);
-      return;
+      return "close";
     }
     if (pick.startsWith("📦")) {
       await rt.summarizeOldFloors(ctx);
@@ -1458,7 +1459,7 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
 // ---------------------------------------------------------------------------
 // 5. 导演台 (Author's Note, Pacing, Inner Monologue, Quick Replies)
 // ---------------------------------------------------------------------------
-export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<"back" | "close"> {
   while (true) {
     const s = rt.getState();
     const antiGodmoding = Boolean((s as SessionRpState & { antiGodmoding?: boolean }).antiGodmoding);
@@ -1482,7 +1483,7 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
       "← 返回主面板",
     ];
     const pick = await ctx.ui.select("🎬 导演台与设置", options);
-    if (!pick || pick.startsWith("←")) return;
+    if (!pick || pick.startsWith("←")) return "back";
 
     if (pick.startsWith("✒️")) {
       await rt.styleControl?.(ctx);
@@ -1492,29 +1493,25 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
       continue;
     } else if (pick.startsWith("✂️")) {
       await rt.rewriteLast?.(ctx);
-      return;
+      return "close";
     } else if (pick.startsWith("🎚")) {
       const p = await ctx.ui.select("选择叙事节奏", [
-        "relaxed — 舒缓细腻，注重氛围与日常互动",
-        "balanced — 均衡自然（默认）",
-        "dramatic — 紧凑强冲突，积极推进悬念与冲突",
+        "舒缓 — 细腻氛围与日常互动",
+        "均衡 — 自然推进（默认）",
+        "紧张 — 强冲突与悬念推进",
       ]);
       if (p) {
-        const mode = p.split(" ")[0] as PacingMode;
+        const mode: PacingMode = p.startsWith("舒缓") ? "relaxed" : p.startsWith("紧张") ? "dramatic" : "balanced";
         rt.commitTx({ kind: "config_patch", pacingMode: mode });
         rt.refreshHud(ctx);
-        ctx.ui.notify(`叙事节奏已切换为：${mode}`, "info");
+        ctx.ui.notify(`叙事节奏已切换为：${PACING_ZH[mode]}`, "info");
       }
     } else if (pick.startsWith("💭")) {
       const next = !s.innerMonologue;
       rt.commitTx({ kind: "config_patch", innerMonologue: next });
       rt.refreshHud(ctx);
-      ctx.ui.notify(`角色内心独白已${next ? "开启（将以精致引文块呈现潜台词）" : "关闭"}`, "info");
-    } else if (pick.startsWith("⚙️ 记账模式")) {
-      await rt.setSettlementMode?.(ctx);
-      continue;
-    }
-    if (pick.startsWith("🛡")) {
+      ctx.ui.notify(`角色内心独白已${next ? "开启" : "关闭"}`, "info");
+    } else if (pick.startsWith("🛡")) {
       await rt.toggleAntiGodmoding?.(ctx);
     } else if (pick.startsWith("💾")) {
       await rt.exportWorldSave?.(ctx);
@@ -1522,7 +1519,7 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
       await rt.importWorldSave?.(ctx);
     } else if (pick.startsWith("⚡")) {
       await rt.openQuickReplies(ctx);
-      return;
+      return "close";
     } else if (pick.startsWith("✨")) {
       await rt.analyzeCard(ctx);
     } else if (pick.startsWith("+")) {
@@ -1846,8 +1843,12 @@ async function openConditionsManager(rt: DashboardRuntime, ctx: PiExtensionConte
       if (!actor) continue;
       const label = (await ctx.ui.input("状态名称（如：流血、中毒、隐身、警觉）", ""))?.trim();
       if (!label) continue;
-      const effect = (await ctx.ui.input("状态效果说明（可留空）", ""))?.trim() || undefined;
-      const turnsRaw = (await ctx.ui.input("持续回合数（留空=持续到解除）", ""))?.trim();
+      const effectInput = await ctx.ui.input("状态效果说明（可留空）", "");
+      if (effectInput === undefined) continue;
+      const effect = effectInput.trim() || undefined;
+      const turnsInput = await ctx.ui.input("持续回合数（留空=持续到解除）", "");
+      if (turnsInput === undefined) continue;
+      const turnsRaw = turnsInput.trim();
       const rem = turnsRaw && /^\d+$/.test(turnsRaw) && Number(turnsRaw) > 0 ? Number(turnsRaw) : null;
       const id = `${actor.toLowerCase()}::${label.toLowerCase()}`;
       rt.commitTx({
@@ -1996,10 +1997,10 @@ export async function openRpDashboard(
     if (pendingTab > 0) {
       const jump = pendingTab;
       pendingTab = 0;
-      if (jump === 1) await openSceneSection(rt, ctx);
+      if (jump === 1) { if ((await openSceneSection(rt, ctx)) === "close") return; }
       else if (jump === 2) await openCharactersSection(rt, ctx);
-      else if (jump === 3) await openMemoryBookSection(rt, ctx);
-      else if (jump === 4) await openNotesAndPacing(rt, ctx);
+      else if (jump === 3) { if ((await openMemoryBookSection(rt, ctx)) === "close") return; }
+      else if (jump === 4) { if ((await openNotesAndPacing(rt, ctx)) === "close") return; }
       continue;
     }
     const card = rt.getCard();
@@ -2027,10 +2028,10 @@ export async function openRpDashboard(
       continue;
     }
     if (choice.startsWith("1.")) await openLedgerOverview(rt, ctx);
-    else if (choice.startsWith("2.")) await openSceneSection(rt, ctx);
+    else if (choice.startsWith("2.")) { if ((await openSceneSection(rt, ctx)) === "close") return; }
     else if (choice.startsWith("3.")) await openCharactersSection(rt, ctx);
-    else if (choice.startsWith("4.")) await openMemoryBookSection(rt, ctx);
-    else if (choice.startsWith("5.")) await openNotesAndPacing(rt, ctx);
+    else if (choice.startsWith("4.")) { if ((await openMemoryBookSection(rt, ctx)) === "close") return; }
+    else if (choice.startsWith("5.")) { if ((await openNotesAndPacing(rt, ctx)) === "close") return; }
     else if (choice.startsWith("6.")) {
       await rt.exitRp(ctx, true);
       return;

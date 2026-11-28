@@ -303,14 +303,18 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
           .map((n) => (n.remainingTurns === null ? n : { ...n, remainingTurns: n.remainingTurns - 1 }))
           .filter((n) => n.remainingTurns === null || n.remainingTurns > 0);
         for (const ag of Object.values(state.npcAgendas)) {
-          if (typeof ag.etaTurns === "number" && ag.etaTurns > 0) {
-            ag.etaTurns = Math.max(0, ag.etaTurns - 1);
-            if (ag.etaTurns === 0) {
-              state.lastMeaningfulProgressTurn = state.turn;
-              pushAudit(state, {
-                summary: `🕸 幕后日程达成: ${ag.actorId}「${ag.goal.slice(0, 22)}」`,
-                source: "system",
-              });
+          if (typeof ag.etaTurns === "number") {
+            if (ag.etaTurns > 0) {
+              ag.etaTurns = Math.max(0, ag.etaTurns - 1);
+              if (ag.etaTurns === 0) {
+                state.lastMeaningfulProgressTurn = state.turn;
+                pushAudit(state, {
+                  summary: `🕸 幕后日程达成: ${ag.actorId}「${ag.goal.slice(0, 22)}」`,
+                  source: "system",
+                });
+              }
+            } else if (ag.etaTurns === 0) {
+              ag.etaTurns = -1;
             }
           }
         }
@@ -345,12 +349,12 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       }
       state.location = tx.location;
       state.presentNpcs = sanitizeNpcList(tx.presentNpcs, getHygieneCtx(state));
-      if (!isUndoTx(tx) && (prevLoc !== tx.location || prevNpcs.join("|") !== tx.presentNpcs.join("|"))) {
+      if (!isUndoTx(tx) && (prevLoc !== tx.location || prevNpcs.join("|") !== state.presentNpcs.join("|"))) {
         const isInitialHydration = state.turn === 0 && !prevLoc && prevNpcs.length === 0;
         if (!isInitialHydration) {
           state.lastMeaningfulProgressTurn = state.turn;
           pushAudit(state, {
-            summary: `地点: ${tx.location || "(空)"}${tx.presentNpcs.length ? ` [${tx.presentNpcs.join("、")}]` : ""}`,
+            summary: `地点: ${tx.location || "(空)"}${state.presentNpcs.length ? ` [${state.presentNpcs.join("、")}]` : ""}`,
             source: "tool",
             undoTx: { kind: "location_set", location: prevLoc, presentNpcs: prevNpcs, reason: "undo" } as RpTxEntry,
           });
@@ -519,12 +523,16 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       const nowCompleted = tx.completed ?? val >= max;
       const onComplete = tx.onComplete ?? prev?.onComplete;
       const label = tx.label || prev?.label || tx.clockId;
+      const completedTurn = nowCompleted
+        ? (wasCompleted ? (prev?.completedTurn ?? state.turn) : state.turn)
+        : undefined;
       state.clocks[tx.clockId] = {
         clockId: tx.clockId,
         label,
         value: val,
         max,
         completed: nowCompleted,
+        ...(completedTurn !== undefined ? { completedTurn } : {}),
         ...(onComplete ? { onComplete } : {}),
       };
       if (!isUndoTx(tx) && appliedDelta !== 0 && !(state.turn === 0 && !prev)) {
@@ -632,8 +640,21 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     }
 
     case "belief_update": {
-      const id = tx.id ?? `belief_${tx.turn}_${state.beliefs.length}`;
-      const existingIdx = state.beliefs.findIndex((b) => b.id && b.id === id);
+      const existingById = tx.id ? state.beliefs.findIndex((b) => b.id && b.id === tx.id) : -1;
+      const existingByPair =
+        existingById < 0 && !tx.id
+          ? state.beliefs.findIndex(
+              (b) =>
+                b.actorId.toLowerCase() === tx.actorId.toLowerCase() &&
+                b.target.toLowerCase() === tx.target.toLowerCase(),
+            )
+          : -1;
+      const existingIdx = existingById >= 0 ? existingById : existingByPair;
+      const id =
+        tx.id ??
+        (existingIdx >= 0 && state.beliefs[existingIdx]?.id
+          ? state.beliefs[existingIdx]!.id!
+          : `belief_${tx.turn}_${state.beliefs.length}`);
       const record = {
         id,
         actorId: tx.actorId,
@@ -829,6 +850,10 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       break;
     }
 
+    case "clock_delete":
+      delete state.clocks[tx.clockId];
+      break;
+
     case "agenda_delete":
       delete state.npcAgendas[tx.actorId];
       break;
@@ -839,7 +864,19 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       const { id, actorA, actorB } = canon;
       const prev = state.pairBonds[id] ? { ...state.pairBonds[id]! } : undefined;
       const tension = Math.max(-100, Math.min(100, Math.round(tx.bond.tension)));
-      state.pairBonds[id] = { ...tx.bond, id, actorA, actorB, tension };
+      const wasExtreme = prev ? Math.abs(prev.tension) >= 60 : false;
+      const isExtreme = Math.abs(tension) >= 60;
+      const lastCrisisTurn = isExtreme
+        ? (wasExtreme ? (prev?.lastCrisisTurn ?? state.turn) : state.turn)
+        : undefined;
+      state.pairBonds[id] = {
+        ...tx.bond,
+        id,
+        actorA,
+        actorB,
+        tension,
+        ...(lastCrisisTurn !== undefined ? { lastCrisisTurn } : {}),
+      };
       if (!isUndoTx(tx)) {
         state.lastMeaningfulProgressTurn = state.turn;
         const bondEffects: string[] = [];

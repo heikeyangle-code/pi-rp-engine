@@ -27,6 +27,7 @@ function stripCompactionNoise(raw: string): string {
   return raw
     .replace(/<(?:think|thinking|thought|reasoning)\b[^>]*>[\s\S]*?<\/(?:think|thinking|thought|reasoning)\s*>/gi, "")
     .replace(/<rp_state_frame>[\s\S]*?<\/rp_state_frame>/gi, "")
+    .replace(/<rp_drama_beat>[\s\S]*?<\/rp_drama_beat>/gi, "")
     .replace(/<rp_recalled_context>[\s\S]*?<\/rp_recalled_context>/gi, "")
     .replace(/<rp_director_note>[\s\S]*?<\/rp_director_note>/gi, "")
     .replace(/<lorebook_title_hints>[\s\S]*?<\/lorebook_title_hints>/gi, "")

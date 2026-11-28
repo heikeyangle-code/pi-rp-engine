@@ -50,7 +50,7 @@ export interface OverlayRow {
 export interface OverlayController {
   getTab(): OverlayTabIndex;
   getSelectedIndex(): number;
-  render(width: number): string[];
+  render(width: number): readonly string[];
   handleInput(data: string): void;
   invalidate(): void;
 }
@@ -113,7 +113,7 @@ function buildRowsForTab(
           actionKey: "scene:storylets",
         },
         {
-          label: `⏳ 切场景 / 跳时间蒙太奇 (Alt+T)`,
+          label: `⏳ 切场景 / 跳时间蒙太奇`,
           actionKey: "scene:skip",
         },
       ];
@@ -295,7 +295,7 @@ function buildRowsForTab(
         { label: `🎛 应用预设采样参数 (before_provider_request)：${state.applyPresetSampling ? "● 开启" : "○ 关闭"}`, actionKey: "set:sampling" },
         { label: `🗂 资产库管理（删除角色卡 / 预设 / 玩家马甲）`, actionKey: "set:library" },
         { label: `🌍 会话总览、导入审计与快捷键速查（${card?.identity.name ?? state.cardSlug ?? "RP"}）`, actionKey: "set:overview" },
-        { label: `🚪 彻底退出本会话 RP 模式 (Alt+Shift+X)`, actionKey: "set:exit" },
+        { label: `🚪 彻底退出本会话 RP 模式`, actionKey: "set:exit" },
       ];
     }
   }
@@ -404,8 +404,7 @@ export function createRpOverlayController(options: {
         data === "q" ||
         data === "Q" ||
         data === "\x03" ||
-        options.keybindings?.matches?.(data, "tui.select.cancel") ||
-        options.keybindings?.matches?.(data, "cancel")
+        options.keybindings?.matches?.(data, "tui.select.cancel")
       ) {
         options.done({ kind: "close", tab });
         return;
@@ -452,8 +451,7 @@ export function createRpOverlayController(options: {
       if (
         data === "\r" ||
         data === "\n" ||
-        options.keybindings?.matches?.(data, "tui.select.confirm") ||
-        options.keybindings?.matches?.(data, "submit")
+        options.keybindings?.matches?.(data, "tui.select.confirm")
       ) {
         const chosen = rows[selectedIdx];
         if (chosen) {

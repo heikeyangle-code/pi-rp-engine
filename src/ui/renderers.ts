@@ -20,7 +20,7 @@ export interface PiThemeLike {
 }
 
 export interface TuiComponent {
-  render(width: number): string[];
+  render(width: number): readonly string[];
   invalidate(): void;
 }
 
@@ -50,6 +50,13 @@ export function styleBold(theme: unknown, text: string): string {
 
 export function styleDim(theme: unknown, text: string): string {
   const t = theme as PiThemeLike | undefined;
+  if (t && typeof t.fg === "function") {
+    try {
+      return t.fg("dim", text);
+    } catch {
+      // fallback below
+    }
+  }
   if (t && typeof t.dim === "function") {
     try {
       return t.dim(text);

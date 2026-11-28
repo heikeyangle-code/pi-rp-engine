@@ -261,10 +261,12 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
       return;
     }
     if (pick.startsWith("⚙")) {
+      const hudZh = state.hudMode === "off" ? "关" : state.hudMode === "full" ? "完整" : "精简";
+      const settleZh = state.settlementMode === "sidecar-light" ? "后台小模型" : state.settlementMode === "off" ? "纯文学关闭" : "主模型随行";
       const sub = await ctx.ui.select("快捷开关", [
-        `🖥 切换 HUD（${state.hudMode}）`,
+        `🖥 切换状态显示（${hudZh}）`,
         `🎛 切换预设（${state.presetId ?? "无"}）`,
-        `⚙️ 结算模式（${state.settlementMode}）`,
+        `⚙️ 记账模式（${settleZh}）`,
         `🛡 原味直通（${state.rawPassthrough ? "开" : "关"}）`,
         "← 返回",
       ]);

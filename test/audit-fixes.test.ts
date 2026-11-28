@@ -1,3 +1,6 @@
+import { resolveCanonicalStatKey } from "../src/engine/cfsm.js";
+import { styleDim } from "../src/ui/renderers.js";
+import { attachZone3ToMessages } from "../src/context/zone-builder.js";
 import { canonicalizeActorName, canonicalizePairBondActors, isNonCharacterEntity, sanitizeNpcList } from "../src/engine/entity-hygiene.js";
 import { getDesiredRpTools } from "../src/index.js";
 import test from "node:test";
@@ -614,4 +617,70 @@ test("audit-11: Entity Hygiene (blocks card titles, metaphors, places & system n
   applyRpTx(state, { kind: "clock_tick", beatDelta: 1 });
   assert.equal(state.npcAgendas["陈墨"]?.etaTurns, 0);
   assert.ok(state.auditLog.some((a) => a.summary.includes("幕后日程达成")));
+});
+
+test("audit-12: Full-codebase audit fixes (entity-hygiene \\b, toolResult Zone3, IDs, drama-beat dedup, temporal, belief dedup, styleDim)", () => {
+  // 1. Entity hygiene regex word boundaries (no literal 0x08 backspace)
+  assert.equal(isNonCharacterEntity("The GM"), true);
+  assert.equal(isNonCharacterEntity("AI Narrator"), true);
+
+  // 2. Temporal parser: Chinese approximate pairs & bare calendar years / age
+  const approx = parseTimeSpan("两三天后");
+  assert.ok(approx.dayDelta >= 2 && approx.dayDelta <= 4, `Expected 2-4 days for 两三天后, got ${approx.dayDelta}`);
+  assert.equal(parseTimeSpan("主角18岁那年").years, 0);
+  assert.equal(parseTimeSpan("2026年").years, 0);
+
+  // 3. Shared synonym stat key dedup
+  const st = createInitialRpState();
+  st.active = true;
+  applyRpTx(st, { kind: "stat_patch", actorId: "艾琳", key: "好感度", op: "set", value: 30 });
+  assert.equal(resolveCanonicalStatKey(st, "艾琳", "好感"), "好感度");
+
+  // 4. Belief dedup by (actorId, target) when id omitted + clock_delete
+  applyRpTx(st, { kind: "belief_update", actorId: "艾琳", target: "player", activatingEvent: "初次见面", belief: "有点警惕", turn: 1 });
+  applyRpTx(st, { kind: "belief_update", actorId: "艾琳", target: "player", activatingEvent: "并肩作战", belief: "开始信任", turn: 2 });
+  assert.equal(st.beliefs.length, 1);
+  assert.equal(st.beliefs[0]?.belief, "开始信任");
+
+  applyRpTx(st, { kind: "progress_clock", clockId: "clk_1", label: "危机", delta: 4, max: 4 });
+  assert.equal(st.clocks["clk_1"]?.completed, true);
+  applyRpTx(st, { kind: "clock_delete", clockId: "clk_1" });
+  assert.equal(st.clocks["clk_1"], undefined);
+
+  // 5. Full Zone 3 preserved on trailing toolResult (no silent lore/director wipe)
+  const loopMsgs = [
+    { role: "user" as const, content: "我推开门。" },
+    { role: "assistant" as const, content: [{ type: "toolCall" as const, name: "rp_roll_check" }] },
+    { role: "toolResult" as const, content: "1d20=17" },
+  ];
+  const fullZ3 = "<rp_state_frame>{}</rp_state_frame>\n\n<rp_director_note>\n- Anti-Godmoding\n</rp_director_note>";
+  const attached = attachZone3ToMessages(loopMsgs, fullZ3, new Set());
+  assert.equal(attached[0]?.content, "我推开门。");
+  assert.ok(String(attached[2]?.content).includes("<rp_director_note>"));
+
+  // 6. Single-NPC epistemic isolation + fact/foresight IDs + Spotlight user mention boost
+  const card = compileCharacterCard(
+    { spec: "chara_card_v2", data: { name: "艾琳", description: "冷静侦探", scenario: "书房", first_mes: "请进。" } },
+    "v2",
+  );
+  st.turn = 3;
+  applyRpTx(st, {
+    kind: "fact_add",
+    fact: { id: "fact_secret_1", statement: "玩家偷偷藏起了怀表", entities: ["怀表"], witnessIds: ["player"], validFromTurn: 1, validUntilTurn: null },
+  });
+  applyRpTx(st, {
+    kind: "foresight_upsert",
+    hook: { id: "hook_1", summary: "信封里的红蜡印记", triggerHint: "调查印章", plantedTurn: 1, status: "open", entities: ["红蜡印记"] },
+  });
+  const z3Single = buildZone3TransientTail({ card, state: st, recalledLore: [], recentText: "怀表 印记", lastUserMessage: "我看着凯尔问他怎么回事" });
+  assert.ok(z3Single.includes("[fact_secret_1] [HIDDEN FROM: 艾琳]"));
+  assert.ok(z3Single.includes("[hook_1] 信封里的红蜡印记"));
+
+  st.presentNpcs = ["艾琳", "凯尔"];
+  const z3Multi = buildZone3TransientTail({ card, state: st, recalledLore: [], recentText: "凯尔", lastUserMessage: "我转向凯尔低声询问" });
+  assert.ok(z3Multi.includes("primarily on 凯尔"));
+
+  // 7. Pi v1.7.0 theme.fg('dim', text) in styleDim
+  const styled = styleDim({ fg: (c: string, t: string) => `<${c}>${t}</${c}>` }, "提示");
+  assert.equal(styled, "<dim>提示</dim>");
 });

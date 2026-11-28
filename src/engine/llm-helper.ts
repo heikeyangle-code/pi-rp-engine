@@ -216,11 +216,20 @@ export async function completeWithRegistry(
       model && typeof model === "object" && typeof (model as PiModelDescriptor).contextWindow === "number"
         ? (model as PiModelDescriptor).contextWindow!
         : undefined;
+    const modelMax =
+      model && typeof model === "object" && typeof (model as { maxTokens?: unknown }).maxTokens === "number"
+        ? (model as { maxTokens: number }).maxTokens
+        : undefined;
+    let resolvedMax: number;
     if (cw !== undefined && cw > 0 && cw < 6000) {
-      options.maxTokens = Math.min(Math.max(req.maxTokens, 256), Math.max(256, Math.floor(cw * 0.5)));
+      resolvedMax = Math.min(Math.max(req.maxTokens, 256), Math.max(256, Math.floor(cw * 0.5)));
     } else {
-      options.maxTokens = Math.max(req.maxTokens, 4096);
+      resolvedMax = Math.max(req.maxTokens, 4096);
     }
+    if (modelMax !== undefined && modelMax > 0) {
+      resolvedMax = Math.min(resolvedMax, modelMax);
+    }
+    options.maxTokens = resolvedMax;
   }
   if (req.signal ?? ctx.signal) options.signal = req.signal ?? ctx.signal;
 

@@ -174,7 +174,9 @@ export interface PiToolDefinition {
     readOnlyHint?: boolean;
     destructiveHint?: boolean;
     idempotentHint?: boolean;
+    openWorldHint?: boolean;
   };
+  prepareArguments?: (args: Record<string, unknown>) => Record<string, unknown>;
   execute(
     toolCallId: string,
     params: Record<string, unknown>,
@@ -569,6 +571,7 @@ export interface ProgressClock {
   value: number;
   max: number;
   completed: boolean;
+  completedTurn?: number;
   onComplete?: ClockCompletionEffect;
 }
 
@@ -760,6 +763,7 @@ export interface NpcPairBond {
   tension: number;
   note: string;
   updatedTurn: number;
+  lastCrisisTurn?: number;
 }
 
 export interface EmbeddingConfig {
@@ -875,6 +879,7 @@ export type RpTxEntry =
   | { kind: "voice_anchor_delete"; actorId: string }
   | { kind: "physical_patch"; snapshot: PhysicalSnapshot; spatialNotes?: string; reason?: string }
   | { kind: "agenda_upsert"; agenda: NpcAgenda }
+  | { kind: "clock_delete"; clockId: string }
   | { kind: "agenda_delete"; actorId: string }
   | { kind: "pair_bond_upsert"; bond: NpcPairBond }
   | { kind: "pair_bond_delete"; id: string }

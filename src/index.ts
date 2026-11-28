@@ -183,6 +183,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   let lastAssistantText = "";
   let lastSidecarSettledTurn = -1;
   let consecutiveLeakRecoveries = 0;
+  let runtimeEpoch = 0;
+  const sessionUnlockedTools = new Set<string>();
   let turnHistoryRecallScope = createTurnRecallScope();
   let historyRecallCooldowns: HistoryRecallCooldown[] = [];
   let lastToolsHash = "";
@@ -244,6 +246,18 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   function activateRpTools(): void {
     const current = pi.getActiveTools();
     const desired = getDesiredRpTools(state, activeCard);
+    if (state.settlementMode === "tool-assisted") {
+      for (const t of desired) {
+        if (t === "rp_era_advance" || t === "rp_npc_deliberate") {
+          sessionUnlockedTools.add(t);
+        }
+      }
+      for (const t of sessionUnlockedTools) {
+        if (!desired.includes(t)) desired.push(t);
+      }
+    } else {
+      sessionUnlockedTools.clear();
+    }
     const hasNonRpTools = current.some((t) => !rpToolSet.has(t));
     if (savedCodingTools === null && hasNonRpTools) {
       savedCodingTools = current.filter((t) => !rpToolSet.has(t));
@@ -278,6 +292,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   }
 
   function teardownSessionRuntime(ctx: PiExtensionContext): void {
+    runtimeEpoch += 1;
+    sessionUnlockedTools.clear();
     state = createInitialRpState();
     activeCard = null;
     extraCastCards = [];
@@ -306,6 +322,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
    * NEVER reads project-level auto-bind config: dormant sessions remain 100% pure coding sessions.
    */
   function reloadRuntime(ctx: PiExtensionContext): void {
+    runtimeEpoch += 1;
+    sessionUnlockedTools.clear();
     const branch = ctx.sessionManager.getBranch();
     state = replayBranchState(branch);
     resetTransientTurnBuffers();
@@ -546,7 +564,10 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     if (oocMatch) {
       const inner = (oocMatch[1] ?? oocMatch[2] ?? "").trim();
       if (inner) {
-        isOocTurn = true;
+        const sb = (event as { streamingBehavior?: string } | undefined)?.streamingBehavior;
+        if (sb !== "followUp" && sb !== "steer") {
+          isOocTurn = true;
+        }
         return {
           action: "transform",
           text: `[OOC - Meta/Director Discussion; do NOT advance story prose. Answer accurately using full context/tools; ONLY call rp_state_patch/rp_fact_commit if the user explicitly asks to fix or update state/memory.]\n${inner}`,
@@ -578,6 +599,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       preset: activePreset,
       initialPersona,
       activeToolNames,
+      loreOverrides: state.loreOverrides,
     };
     const zone1 = buildZone1FrozenPrefix(zone1Options);
 
@@ -625,7 +647,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     });
 
     const memBookRecall = hasMemoryBooks
-      ? recallMemoryBooks(state, recentText, 4)
+      ? recallMemoryBooks(state, recentText, 4, memoryBookBudget)
       : { chapters: [], traces: [] };
     const memBookTokens = memBookRecall.traces.reduce((acc, t) => acc + t.tokens, 0);
 
@@ -650,7 +672,19 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     }
 
     // Genuine lexical repetition & world-state stagnation analysis (zero extra LLM cost!)
-    const narrativeHealth = evaluateNarrativeHealth(state, messages);
+    const visibleMessagesForHealth = messages.filter((m) => {
+      const id = typeof m.id === "string" ? m.id : "";
+      if (id && state.hiddenEntryIds.has(id)) return false;
+      const fp = computeMessageFingerprint(m);
+      if (state.hiddenFingerprints.has(fp)) return false;
+      return true;
+    });
+    const properNouns = [
+      activeCard.identity.name,
+      ...(activeCard.identity.aliases ?? []),
+      ...extraCastCards.map((c) => c.identity.name),
+    ];
+    const narrativeHealth = evaluateNarrativeHealth(state, visibleMessagesForHealth, properNouns);
 
     const zone3 = buildZone3TransientTail({
       card: activeCard,
@@ -909,6 +943,10 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
           );
           return;
         }
+        pendingLoreRuntime = null;
+        isOocTurn = false;
+        renderRpHud(ctx, state, activeCard, lastXRay);
+        return;
       } else if (lastAssistantText.trim().length > 0) {
         consecutiveLeakRecoveries = 0;
       }
@@ -971,14 +1009,18 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     if (lastTurnWasOoc || state.turn <= 0) return;
     if (lastSidecarSettledTurn === state.turn) return;
     lastSidecarSettledTurn = state.turn;
+    const startEpoch = runtimeEpoch;
     try {
       const committed = await runSidecarLightSettlement({
         pi,
         ctx,
         state,
+        getState: () => state,
+        isStale: () => runtimeEpoch !== startEpoch,
         lastUserText,
         lastAssistantText,
       });
+      if (runtimeEpoch !== startEpoch) return;
       const sidecarStatus = (state as SessionRpState & { lastSidecarStatus?: unknown }).lastSidecarStatus;
       if (lastXRay && sidecarStatus !== undefined) {
         (lastXRay as ContextXRaySnapshot & { lastSidecarStatus?: unknown }).lastSidecarStatus = sidecarStatus;
@@ -996,11 +1038,9 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     await triggerSidecarOnce(ctx);
   });
 
-  pi.on("agent_end", async (event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
     ctx?.ui?.setWorkingMessage?.(undefined);
     isOocTurn = false; // Safe recovery if turn was aborted before turn_end
-    if (event?.aborted) return;
-    await triggerSidecarOnce(ctx);
   });
 
   // EverMemOS Semantic MemScene Compaction — 100% Official Pi SDK async CompactionResult contract
@@ -1076,5 +1116,9 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     pendingCompactionBookEntry = null;
     commitTx({ kind: "memory_book_upsert", entry });
     renderRpHud(ctx, state, activeCard, lastXRay);
+  });
+
+  pi.on("session_compact_failed", () => {
+    pendingCompactionBookEntry = null;
   });
 }
