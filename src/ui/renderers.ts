@@ -69,6 +69,39 @@ export function renderProgressBar(value: number, max: number, slots = 6): string
   return `${"▓".repeat(filled)}${"░".repeat(Math.max(0, width - filled))}`;
 }
 
+/** Render a centered bipolar bar like `░▓▓│░░░` or `░░░│▓▓░` for negative-to-positive stats (e.g. -100..+100). */
+export function renderBipolarBar(value: number, min: number, max: number, halfSlots = 3): string {
+  const slots = Math.max(2, Math.min(5, halfSlots));
+  const negSpan = Math.max(1, Math.abs(Math.min(0, min)));
+  const posSpan = Math.max(1, Math.max(0, max));
+  if (value < 0) {
+    const filled = Math.min(slots, Math.max(1, Math.round((Math.abs(value) / negSpan) * slots)));
+    return `${"░".repeat(slots - filled)}${"▓".repeat(filled)}│${"░".repeat(slots)}`;
+  }
+  if (value > 0) {
+    const filled = Math.min(slots, Math.max(1, Math.round((value / posSpan) * slots)));
+    return `${"░".repeat(slots)}│${"▓".repeat(filled)}${"░".repeat(slots - filled)}`;
+  }
+  return `${"░".repeat(slots)}│${"░".repeat(slots)}`;
+}
+
+/** Automatically choose bipolar bar (when min < 0 < max) or standard progress bar (when bounded). */
+export function renderSmartStatBar(
+  value: number,
+  min?: number,
+  max?: number,
+  slots = 5,
+): string | null {
+  if (typeof max !== "number") return null;
+  const lo = typeof min === "number" ? min : 0;
+  if (max <= lo) return null;
+  if (lo < 0 && max > 0) {
+    const sign = value > 0 ? `+${value}` : String(value);
+    return `${renderBipolarBar(value, lo, max, Math.max(2, Math.floor(slots / 2) + 1))} ${sign}`;
+  }
+  return `${renderProgressBar(value - lo, max - lo, slots)} ${value}/${max}`;
+}
+
 function charDisplayWidth(ch: string): number {
   const code = ch.codePointAt(0) ?? 0;
   if (
@@ -112,6 +145,37 @@ export function wrapDisplayLine(line: string, maxWidth: number): string[] {
   }
   if (current.length > 0 || out.length === 0) out.push(current);
   return out;
+}
+
+/** Truncate a single plain-text line to fit within `maxWidth` columns (CJK double-width aware). */
+export function truncateDisplayLine(line: string, maxWidth: number): string {
+  const limit = Math.max(8, Math.floor(maxWidth));
+  if (displayWidth(line) <= limit) return line;
+  const target = Math.max(4, limit - 1);
+  let out = "";
+  let w = 0;
+  for (const ch of line) {
+    const cw = charDisplayWidth(ch);
+    if (w + cw > target) break;
+    out += ch;
+    w += cw;
+  }
+  return `${out}…`;
+}
+
+/** Style optional `<thought>...</thought>` inner monologue blocks into crisp Markdown asides. */
+export function formatThoughtBlocks(markdown: string): string {
+  if (!/<thought\b/i.test(markdown)) return markdown;
+  return markdown.replace(/<thought\b[^>]*>([\s\S]*?)<\/thought>/gi, (_full, inner: string) => {
+    const cleaned = inner
+      .trim()
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line, idx) => (idx === 0 ? `> 💭 *${line}*` : `> *${line}*`))
+      .join("\n");
+    return cleaned ? `${cleaned}\n` : "";
+  });
 }
 
 /** Create a zero-dependency Pi TUI Component from a width-aware line renderer. */
@@ -184,10 +248,23 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
 
   pi.registerMessageRenderer("rp:event", (message, options, theme) => {
     const details = (message.details ?? {}) as { kind?: string; title?: string; subtitle?: string };
-    const tag = details.kind === "roll" ? "CHECK" : details.kind === "recap" ? "RECAP" : "EVENT";
+    const tag =
+      details.kind === "roll"
+        ? "CHECK"
+        : details.kind === "recap"
+          ? "RECAP"
+          : details.kind === "xray"
+            ? "X-RAY"
+            : "EVENT";
     const title =
       details.title ||
-      (details.kind === "roll" ? "掷骰判定" : details.kind === "recap" ? "前情提要" : "世界事件");
+      (details.kind === "roll"
+        ? "掷骰判定"
+        : details.kind === "recap"
+          ? "前情提要"
+          : details.kind === "xray"
+            ? "上下文 X-Ray 透视"
+            : "世界事件");
     const text = extractMessageText(message);
     return createLinesComponent((width) =>
       renderEditorialCard({
@@ -195,10 +272,17 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
         title,
         subtitle: details.subtitle,
         body: text,
-        accentColor: details.kind === "roll" || details.kind === "recap" ? "accent" : "muted",
+        accentColor:
+          details.kind === "roll" || details.kind === "recap" || details.kind === "xray" ? "accent" : "muted",
         theme,
         width,
-        maxLines: options?.expanded ? undefined : details.kind === "recap" ? 20 : 10,
+        maxLines: options?.expanded
+          ? undefined
+          : details.kind === "xray"
+            ? 36
+            : details.kind === "recap"
+              ? 20
+              : 10,
       }),
     );
   });

@@ -93,28 +93,43 @@ export function compileCharacterCard(
   const depthPromptRole: "system" | "user" | "assistant" =
     rawDepthRole === "user" || rawDepthRole === "assistant" ? rawDepthRole : "system";
 
-  // 0. Salvage MVU / macro / YAML variables from RAW pre-sanitization content (including RAW constant lore!)
+  // 0. Salvage MVU / InitVar / nested YAML / JSONPatch / HTML-table / macro variables from ALL RAW pre-sanitization content
+  //    (CRITICAL: includes disabled & non-constant `[InitVar]` lorebook entries!)
   const rawBook =
     data.character_book && typeof data.character_book === "object"
       ? (data.character_book as Record<string, unknown>)
       : null;
-  const rawConstantLoreContents = extractRawLoreEntries(rawBook)
-    .filter((entry) => Boolean(entry.constant))
-    .map((entry) => asString(entry.content))
-    .filter(Boolean);
+  const rawAllLoreEntries = extractRawLoreEntries(rawBook)
+    .map((entry) => ({
+      name: asString(entry.name),
+      comment: asString(entry.comment),
+      keys: asStringArray(entry.keys ?? entry.key),
+      content: asString(entry.content),
+      constant: Boolean(entry.constant),
+      enabled: entry.enabled !== false && entry.disable !== true,
+    }))
+    .filter((e) => e.content.length > 0);
+
+  const rawAlternateGreetings = asStringArray(data.alternate_greetings);
 
   const mvuSalvaged = salvageMvuVariables({
     firstMes: rawFirstMes,
+    alternateGreetings: rawAlternateGreetings,
     description: rawDescription,
     systemPrompt: rawSystemPrompt,
     postHistory: rawPostHistory,
     extensions,
-    rawConstantLoreContents,
+    rawAllLoreEntries,
   });
   const plainStats = extractPlainTextStats(`${rawScenario}\n${rawFirstMes}`);
-  const salvagedByKey = new Map(mvuSalvaged.map((v) => [v.key, v]));
+  const salvagedByKey = new Map(
+    mvuSalvaged.map((v) => [`${(v.actorId ?? "").toLowerCase()}::${v.key.toLowerCase()}`, v]),
+  );
+  const plainKeysExisting = new Set(mvuSalvaged.map((v) => v.key.toLowerCase()));
   for (const ps of plainStats) {
-    if (!salvagedByKey.has(ps.key)) salvagedByKey.set(ps.key, ps);
+    if (!plainKeysExisting.has(ps.key.toLowerCase())) {
+      salvagedByKey.set(`::${ps.key.toLowerCase()}`, ps);
+    }
   }
   const salvagedStateSchema = Array.from(salvagedByKey.values());
 

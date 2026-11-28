@@ -44,6 +44,38 @@ export function evaluateGate(gate: GateCondition | undefined, state: SessionRpSt
     const allPresent = gate.requiredNpcPresent.every((req) => present.has(req.toLowerCase()));
     if (!allPresent) return false;
   }
+  if (gate.statChecks && gate.statChecks.length > 0) {
+    for (const check of gate.statChecks) {
+      const targetKey = check.key.toLowerCase();
+      let matchedVal: number | undefined;
+      if (check.actorId) {
+        const targetActor = check.actorId.toLowerCase();
+        for (const [actor, stats] of Object.entries(state.stats)) {
+          if (actor.toLowerCase() !== targetActor) continue;
+          for (const [k, v] of Object.entries(stats)) {
+            if (k.toLowerCase() === targetKey && typeof v === "number") {
+              matchedVal = v;
+              break;
+            }
+          }
+          if (matchedVal !== undefined) break;
+        }
+      } else {
+        for (const stats of Object.values(state.stats)) {
+          for (const [k, v] of Object.entries(stats)) {
+            if (k.toLowerCase() === targetKey && typeof v === "number") {
+              matchedVal = v;
+              break;
+            }
+          }
+          if (matchedVal !== undefined) break;
+        }
+      }
+      if (matchedVal === undefined) return false;
+      if (check.gte !== undefined && matchedVal < check.gte) return false;
+      if (check.lte !== undefined && matchedVal > check.lte) return false;
+    }
+  }
 
   return true;
 }

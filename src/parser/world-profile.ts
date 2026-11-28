@@ -1,13 +1,11 @@
 /**
- * L0 Zero-Cost Universal World Profile & Plain-Text Heuristic Extractor (0ms, 0 LLM tokens).
+ * L0 Zero-Cost Universal World Profile & Plain-Text State Extractor.
  *
- * Eliminates single-card bias (such as hardcoded "Act I" / "Day 1" on every card):
- *  - Extracts explicit plain-text spatio-temporal anchors (`location`, `time`, `stage`) from
- *    `scenario`, `first_mes`, and `description` when clearly labeled.
- *  - Extracts conservative plain-text key-value stats (e.g. `体力：80/100`, `HP: 100/100`,
- *    or Markdown `| 属性 | 数值 |` tables) for plain-text cards without MVU/JSON blocks.
- *  - Infers `CardArchetype` and `WorldProfileModules` so companion/slice-of-life cards stay
- *    clean and uncluttered while epic/RPG/mystery cards automatically enable stages/inventory/clocks.
+ * v3 Fixes:
+ *  - Negative initial stats (e.g. `好感度：-15`, `声望：-20`) no longer get clamped to 0 by a hardcoded `min: 0`!
+ *    Bipolar relationship/alignment scales preserve negative bounds (`min: -100` or `min: Math.min(-100, val)`).
+ *  - Rich single-character worldbook cards (>= 20 lore entries) are NO LONGER misclassified as `ensemble`
+ *    unless genuine multi-character signals (group greetings or explicit multi-protagonist cues) exist.
  */
 
 import type {
@@ -18,192 +16,168 @@ import type {
   WorldProfileModules,
 } from "../types.js";
 
-function cleanPhrase(raw: string): string {
-  return raw
-    .replace(/^[\s：:·\-—]+/, "")
-    .replace(/[\s。；;]+$/, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
+const STAGE_PATTERNS: RegExp[] = [
+  /【\s*当前(?:纪元|阶段|章节|幕次)[·:：\s]+([^】\n]{2,36})\s*】/i,
+  /(?:当前(?:纪元|阶段|章节|幕次)|纪元|章节|阶段)\s*[:：]\s*([^\n，。,.;；】]{2,36})/i,
+  /(?:^|\n)\s*(第[一二三四五六七八九十百0-9]+[幕章篇卷](?:[·\s：:][^\n]{1,24})?)/m,
+  /(?:^|\n)\s*((?:Act|Chapter|Arc|Episode)\s+[IVX0-9]+(?:[:\s\-–][^\n]{1,24})?)/im,
+];
 
-/** Extract explicitly labeled location, time, or stage/arc from plain-text scenario/first_mes. */
-export function extractPlainTextAnchors(sources: {
-  scenario?: string;
-  firstMes?: string;
-  description?: string;
-}): { initialLocation?: string; initialTime?: string; initialStage?: string } {
-  const pool = [sources.scenario ?? "", sources.firstMes ?? "", sources.description ?? ""].join("\n");
+const TIME_PATTERNS: RegExp[] = [
+  /(?:当前时间|对应时间|初始时间|时间|日期|时刻)\s*[:：]\s*([^\n，。,.;；]{2,36})/i,
+  /\b(?:Time|Date)\s*[:：]\s*([^\n,;]{2,36})/i,
+];
 
-  let initialStage: string | undefined;
-  let initialTime: string | undefined;
-  let initialLocation: string | undefined;
+const LOCATION_PATTERNS: RegExp[] = [
+  /(?:玩家初始位置|初始(?:地点|位置|场景)|当前(?:地点|位置|场景)|地点|场景|位置)\s*[:：]\s*([^\n，。,.;；]{2,40})/i,
+  /\b(?:Location|Place|Setting)\s*[:：]\s*([^\n,;]{2,40})/i,
+];
 
-  // Stage / Era / Act / Chapter header (ONLY when explicitly written by the card author)
-  const stagePatterns = [
-    /【(?:当前纪元|当前阶段|当前幕次|当前章节|序幕|第一幕)[·：:\s]*([^】\n]{2,36})】/,
-    /(?:^|\n)\s*(?:当前纪元|当前阶段|当前幕次|当前章节|Current\s+(?:Era|Stage|Act|Chapter))\s*[：:]\s*([^\n]{2,36})/i,
-  ];
-  for (const re of stagePatterns) {
-    const m = re.exec(pool);
-    if (m && m[1]) {
-      initialStage = cleanPhrase(m[1]);
-      break;
-    }
-  }
+const BIPOLAR_STAT_RE = /(?:好感|关系|声望|信任|阵营|善恶|倾向|态度|亲密|情绪|affection|trust|reputation|karma|alignment|disposition|affinity)/i;
 
-  // Time / Date label
-  const timePatterns = [
-    /【(?:当前时间|时间|对应时间|日期|年代)[·：:\s]*([^】\n]{2,36})】/,
-    /(?:^|\n)\s*(?:当前时间|对应时间|初始时间|时间|日期|Time|Date)\s*[：:]\s*([^\n]{2,36})/i,
-  ];
-  for (const re of timePatterns) {
-    const m = re.exec(pool);
-    if (m && m[1]) {
-      const candidate = cleanPhrase(m[1]).split(/[，,。；;]/)[0]?.trim() ?? "";
-      if (candidate.length >= 2 && candidate.length <= 36) {
-        initialTime = candidate;
-        break;
-      }
-    }
-  }
-
-  // Location label
-  const locationPatterns = [
-    /【(?:当前地点|初始位置|玩家初始位置|所在地点|地点|位置)[·：:\s]*([^】\n]{2,36})】/,
-    /(?:^|\n)\s*(?:玩家初始位置|初始位置|当前地点|所在地点|初始地点|地点|Location)\s*[：:]\s*([^\n]{2,40})/i,
-  ];
-  for (const re of locationPatterns) {
-    const m = re.exec(pool);
-    if (m && m[1]) {
-      const candidate = cleanPhrase(m[1]).split(/[→。；;（(]/)[0]?.trim() ?? "";
-      if (candidate.length >= 2 && candidate.length <= 36) {
-        initialLocation = candidate;
-        break;
-      }
-    }
-  }
-
-  return { initialLocation, initialTime, initialStage };
-}
-
-/**
- * Conservatively extract explicit plain-text stat pairs (e.g. `体力：80/100`, `HP: 100/100`,
- * `好感度：20`, or Markdown 2-column `| 属性 | 数值 |` rows) from plain-text cards.
- */
+/** Extract explicit plain-text stats like `好感度：50/100` or `好感度：-15` or `HP: 80/100` (zero LLM cost). */
 export function extractPlainTextStats(text: string): SalvagedVariable[] {
   if (!text) return [];
-  const found = new Map<string, SalvagedVariable>();
+  const results = new Map<string, SalvagedVariable>();
 
-  const register = (key: string, val: number, max?: number) => {
-    const clean = key.trim();
-    if (!clean || clean.length > 24) return;
-    // Skip obvious non-stat labels like years, chapters, dates, ages in prose
-    if (/^(?:年份|年代|公元|第|章|节|幕|轮|回合|时间|日期|年龄|身高|体重|year|date|time|turn|chapter|act)$/i.test(clean)) {
-      return;
-    }
-    if (!found.has(clean)) {
-      found.set(clean, {
-        key: clean,
+  const boundedRe =
+    /(?:^|[\n|｜·•\s【\[])([\u4e00-\u9fffA-Za-z_]{1,16})\s*[:：=]\s*(-?\d+(?:\.\d+)?)\s*\/\s*(\d+(?:\.\d+)?)/g;
+  let m: RegExpExecArray | null;
+  while ((m = boundedRe.exec(text)) !== null) {
+    const key = m[1]!.trim();
+    const val = Number(m[2]);
+    const max = Number(m[3]);
+    if (!key || !Number.isFinite(val) || !Number.isFinite(max) || max <= 0) continue;
+    if (/^(?:http|https|date|time|年|月|日)$/i.test(key)) continue;
+    if (!results.has(key)) {
+      const allowNegative = val < 0 || BIPOLAR_STAT_RE.test(key);
+      const min = allowNegative ? Math.min(-max, val) : 0;
+      results.set(key, {
+        key,
         initialValue: val,
-        min: 0,
+        min,
         max,
         source: "first_mes",
       });
     }
-  };
-
-  // 1. Bounded fraction form: `体力：80/100`, `HP: 100/100`, `理智 65/100`
-  const boundedRe = /(?:^|[\n|｜·•\s【\[])([\u4e00-\u9fa5A-Za-z]{2,12})\s*[：:=]\s*(\d{1,5})\s*\/\s*(\d{1,5})(?=$|[\n|｜·•\s】\]，,。])/g;
-  let m: RegExpExecArray | null;
-  while ((m = boundedRe.exec(text)) !== null) {
-    const val = Number(m[2]);
-    const max = Number(m[3]);
-    if (Number.isFinite(val) && Number.isFinite(max) && max > 0 && val <= max * 2) {
-      register(m[1]!, val, max);
-    }
   }
 
-  // 2. Explicit RPG/SLG scalar keywords: `好感度：20`, `金钱：500`, `银两：10`
-  const knownStatRe =
-    /(?:^|[\n|｜·•\s【\[])(好感度|好感|信任度|亲密度|体力|生命|血量|精力|理智|饥饿度|饱食度|金钱|银两|铜钱|大洋|金币|声望|压力|HP|MP|SP|SAN|Gold|Affection|Trust|Stamina)\s*[：:=]\s*(-?\d{1,6})(?=$|[\n|｜·•\s】\]，,。%])/gi;
-  while ((m = knownStatRe.exec(text)) !== null) {
+  const singleStatRe =
+    /(?:^|[\n|｜·•\s【\[])(好感度?|信任度?|亲密度?|理智值?|SAN|压力值?|HP|MP|生命值?|体力值?|魔力值?|金币|金钱|银币|铜币|声望|警觉度?|Affection|Trust|Sanity|Stress|Stamina|Gold|Credits|Reputation|Karma)\s*[:：=]\s*(-?\d+(?:\.\d+)?)(?!\s*\/)/gi;
+  while ((m = singleStatRe.exec(text)) !== null) {
+    const key = m[1]!.trim();
     const val = Number(m[2]);
-    if (Number.isFinite(val)) {
-      register(m[1]!, val);
-    }
+    if (!key || !Number.isFinite(val) || results.has(key)) continue;
+    const isCurrency = /^(?:金币|金钱|银币|铜币|gold|credits)$/i.test(key);
+    const isBipolar = val < 0 || BIPOLAR_STAT_RE.test(key);
+    results.set(key, {
+      key,
+      initialValue: val,
+      min: isCurrency ? 0 : isBipolar ? Math.min(-100, val) : 0,
+      max: isCurrency ? undefined : Math.max(100, Math.abs(val)),
+      source: "first_mes",
+    });
   }
 
-  return Array.from(found.values());
+  return Array.from(results.values());
+}
+
+function firstMatch(text: string, patterns: RegExp[]): string | undefined {
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (m?.[1]?.trim()) {
+      return m[1].trim().replace(/[*_`]+/g, "").trim();
+    }
+  }
+  return undefined;
+}
+
+/** Extract explicit plain-text stage, time, and starting location anchors (zero LLM cost). */
+export function extractPlainTextAnchors(input: {
+  scenario?: string;
+  firstMes?: string;
+  description?: string;
+}): {
+  initialStage?: string;
+  initialTime?: string;
+  initialLocation?: string;
+} {
+  const anchorPool = [input.scenario ?? "", input.firstMes ?? "", input.description ?? ""].filter(Boolean).join("\n");
+  const initialStage = firstMatch(anchorPool, STAGE_PATTERNS);
+  const initialTime = firstMatch(anchorPool, TIME_PATTERNS);
+  const rawLocation = firstMatch(anchorPool, LOCATION_PATTERNS);
+  const initialLocation = rawLocation ? rawLocation.split(/\s*(?:→|->|=>)\s*/)[0]?.trim() || rawLocation : undefined;
+  return { initialStage, initialTime, initialLocation };
 }
 
 /**
- * Infer a universal `CardWorldProfile` heuristically at import time (0 tokens).
- * Keeps slice-of-life / companion cards minimal and activates advanced modules only when relevant.
+ * Infer a universal CardWorldProfile strictly from card structure & text signals (0 LLM tokens).
+ * Guarantees that pure companion/slice-of-life cards never get forced RPG inventory/clocks/Act I,
+ * while RPG/mystery/epic-saga cards automatically enable the mechanics they actually use.
  */
-export function inferHeuristicWorldProfile(options: {
+export function inferHeuristicWorldProfile(input: {
   description: string;
   personality: string;
   scenario: string;
   firstMes: string;
   loreEntries: CompiledLoreEntry[];
   salvagedVariables: SalvagedVariable[];
-  hasGroupGreetings: boolean;
+  hasGroupGreetings?: boolean;
 }): CardWorldProfile {
-  const anchors = extractPlainTextAnchors({
-    scenario: options.scenario,
-    firstMes: options.firstMes,
-    description: options.description,
+  const combined = `${input.description}\n${input.personality}\n${input.scenario}\n${input.firstMes}`;
+  const { initialStage, initialTime, initialLocation } = extractPlainTextAnchors({
+    scenario: input.scenario,
+    firstMes: input.firstMes,
   });
 
-  const combined = `${options.description}\n${options.personality}\n${options.scenario}\n${options.firstMes}`;
-  const hasGatedLore = options.loreEntries.some(
-    (e) => Boolean(e.gate?.requiredEra) || (e.gate?.minTurn ?? 0) > 0 || Boolean(e.gate?.requiredMilestones?.length),
-  );
-
-  const mentionsStage =
-    Boolean(anchors.initialStage) ||
-    hasGatedLore ||
-    /(?:纪元[一二三四\d]|第一幕|第二幕|阶段[一二三\d]|Act\s+[I1-4]|Chapter\s+\d)/i.test(combined);
-
-  const mentionsStats =
-    options.salvagedVariables.length > 0 ||
-    /(?:好感度|生命值|体力值|理智值|属性检定|掷骰|\bHP\b|\bMP\b|\bSAN\b|d20|d100)/i.test(combined);
-
-  const mentionsInventory =
-    /(?:行囊|背包|随身物品|道具栏|装备栏|携带物品|inventory|equipment|backpack)/i.test(combined);
-
-  const mentionsClocks =
-    /(?:倒计时|进度条|警觉度|悬疑|凶手|线索|案发现场|势力|阵营|countdown|investigation|faction|clock)/i.test(combined);
-
-  const mentionsMystery = /(?:凶手|推理|剧本杀|嫌疑人|密室|线索|detective|mystery|murder|suspect)/i.test(combined);
-  const mentionsEnsemble = options.hasGroupGreetings || options.loreEntries.length >= 20;
+  const hasRpgSignals =
+    /(?:\bHP\b|\bMP\b|\bATK\b|\bDEF\b|\bLV\b|\bEXP\b|\bD20\b|背包|物品栏|道具栏|装备|属性面板|生命值|魔力值|技能检定|投骰|掷骰|经验值|地下城|冒险者|公会|inventory|hit points|spell slot|skill check)/i.test(
+      combined,
+    );
+  const hasMysterySignals =
+    /(?:案件|侦探|凶手|线索|悬疑|推理|密室|嫌疑人|真相|谜团|调查员|克苏鲁|COC|detective|murder|clue|suspect|investigation|mystery)/i.test(
+      combined,
+    );
+  const hasEpicSignals =
+    Boolean(initialStage) ||
+    /(?:纪元|帝国|王国|大陆|编年史|战争|势力|派系|宗门|朝代|王朝|星际|修仙|史诗|chronicle|kingdom|empire|faction|dynasty|realm|saga)/i.test(
+      combined,
+    );
+  const hasEnsembleCues =
+    Boolean(input.hasGroupGreetings) ||
+    /(?:群像|多角色|攻略对象|全员|众人|后宫|角色列表|人物表|main cast|ensemble|multiple characters)/i.test(
+      `${input.description}\n${input.scenario}`,
+    );
+  const hasSliceSignals =
+    /(?:日常|校园|同居|合租|咖啡馆|青梅竹马|社团|同学|邻家|下班|周末|slice of life|roommate|cafe|school life)/i.test(
+      combined,
+    );
 
   let archetype: CardArchetype = "companion";
-  if (mentionsMystery) {
-    archetype = "mystery";
-  } else if (mentionsStage && options.loreEntries.length >= 6) {
-    archetype = "epic-saga";
-  } else if (mentionsStats || mentionsInventory) {
-    archetype = "rpg-sandbox";
-  } else if (mentionsEnsemble) {
-    archetype = "ensemble";
-  } else if (/(?:县城|都市|现代|校园|日常|经营|小店|生活|office|modern|slice of life)/i.test(combined)) {
-    archetype = "slice-of-life";
-  }
+  if (hasEnsembleCues) archetype = "ensemble";
+  else if (hasMysterySignals) archetype = "mystery";
+  else if (hasRpgSignals) archetype = "rpg-sandbox";
+  else if (hasEpicSignals && input.loreEntries.length >= 6) archetype = "epic-saga";
+  else if (hasSliceSignals) archetype = "slice-of-life";
+  else archetype = "companion";
+
+  const hasExplicitStats = input.salvagedVariables.length > 0;
+  const hasInventoryWords = /(?:背包|物品栏|持有物|道具|装备|金币|inventory|backpack|items?:)/i.test(combined);
+  const hasClockWords = /(?:倒计时|警戒|警觉度|进度条|计时|时钟|期限|countdown|clock|tension|alert level)/i.test(combined);
 
   const modules: WorldProfileModules = {
-    stats: mentionsStats,
-    inventory: mentionsInventory,
-    clocks: mentionsClocks || archetype === "mystery" || archetype === "epic-saga",
-    stages: mentionsStage,
+    stats: hasExplicitStats || archetype === "rpg-sandbox" || archetype === "mystery" || archetype === "epic-saga",
+    inventory: hasInventoryWords || archetype === "rpg-sandbox" || archetype === "mystery",
+    clocks: hasClockWords || archetype === "mystery" || archetype === "epic-saga" || archetype === "rpg-sandbox",
+    stages: Boolean(initialStage) || archetype === "epic-saga",
   };
 
   return {
     archetype,
     modules,
-    initialLocation: anchors.initialLocation,
-    initialTime: anchors.initialTime,
-    initialStage: anchors.initialStage,
+    initialLocation,
+    initialTime,
+    initialStage: modules.stages ? initialStage : undefined,
     initialPresentNpcs: [],
     initialInventory: [],
     suggestedCfsmAxes: [],

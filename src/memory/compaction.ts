@@ -1,11 +1,16 @@
 /**
  * EverMemOS MemScene Compaction (`session_before_compact`) & Inter-Act Montage generator.
- * Condenses older turns into structured narrative MemScenes without duplicating live L1 state,
- * and returns official Pi SDK `{ summary, firstKeptEntryId, tokensBefore, details }`.
+ *
+ * v3 Upgrade:
+ *  - `buildSemanticMemSceneCompaction`: runs REAL LLM semantic narrative compaction using
+ *    Pi's official `ctx.modelRegistry` (preferring `state.sidecarModel`, falling back to `ctx.model`),
+ *    preserving plot causality, relationship shifts, promises, emotional beats, and clues.
+ *  - Gracefully falls back to deterministic `buildMemSceneCompactionSummary` when offline or headless.
  */
 
-import type { PiMessage, SessionRpState } from "../types.js";
+import type { PiExtensionContext, PiMessage, SessionRpState } from "../types.js";
 import { getActiveFacts } from "./bitemporal.js";
+import { canCompleteWithRegistry, completeWithRegistry, resolveSidecarModel } from "../engine/llm-helper.js";
 
 function extractMessagePlainText(msg: PiMessage): string {
   if (typeof msg.content === "string") return msg.content;
@@ -18,13 +23,14 @@ function extractMessagePlainText(msg: PiMessage): string {
   return "";
 }
 
-/** Condense a slice of historical Pi messages into compact narrative beat bullets. */
+/** Condense a slice of historical Pi messages into compact narrative beat bullets (local deterministic fallback). */
 export function condenseMessagesToBeats(messages: PiMessage[] | undefined, maxBeats = 10): string {
   if (!messages || messages.length === 0) return "";
-  const dialog = messages.filter((m) => m.role === "user" || m.role === "assistant");
+  const dialog = messages.filter(
+    (m) => (m.role === "user" || m.role === "assistant") && m.customType !== "rp:ooc" && m.customType !== "rp:event",
+  );
   if (dialog.length === 0) return "";
 
-  // Sample evenly if there are many messages so both early and late turning points survive
   const picked: PiMessage[] = [];
   if (dialog.length <= maxBeats) {
     picked.push(...dialog);
@@ -40,6 +46,7 @@ export function condenseMessagesToBeats(messages: PiMessage[] | undefined, maxBe
     const clean = extractMessagePlainText(m)
       .replace(/<rp_state_frame>[\s\S]*?<\/rp_state_frame>/gi, "")
       .replace(/<rp_recalled_context>[\s\S]*?<\/rp_recalled_context>/gi, "")
+      .replace(/<rp_director_note>[\s\S]*?<\/rp_director_note>/gi, "")
       .replace(/\s+/g, " ")
       .trim();
     if (!clean) continue;
@@ -67,6 +74,10 @@ export function buildMemSceneCompactionSummary(
     );
   }
 
+  if (state.sceneObjective) {
+    lines.push(`- 当前场景目标：${state.sceneObjective}`);
+  }
+
   const milestones = Array.from(state.milestones);
   if (milestones.length > 0) {
     lines.push(`- 已解锁里程碑：${milestones.join("、")}`);
@@ -81,9 +92,10 @@ export function buildMemSceneCompactionSummary(
 
   if (state.beliefs.length > 0) {
     const recentBeliefs = state.beliefs.slice(-6);
-    lines.push("## 人物信念演化（DREAM ABC）");
+    lines.push("## 人物信念与主观洞察（DualMem）");
     for (const b of recentBeliefs) {
-      lines.push(`- ${b.actorId} → ${b.target} [T${b.turn}]：因「${b.activatingEvent}」形成信念「${b.belief}」`);
+      const sub = b.subjectiveInsight ? `；内心解读「${b.subjectiveInsight}」` : "";
+      lines.push(`- ${b.actorId} → ${b.target} [T${b.turn}]：因「${b.activatingEvent}」形成信念「${b.belief}」${sub}`);
     }
   }
 
@@ -96,7 +108,10 @@ export function buildMemSceneCompactionSummary(
   }
 
   const activeCount = getActiveFacts(state).length;
-  lines.push(`- 账本注记：${activeCount} 条有效双时态事实与全部 L1 数值/背包实时挂载于 <rp_state_frame>，此处不重复赘述。`);
+  const bookCount = state.memoryBooks.size;
+  lines.push(
+    `- 账本注记：${activeCount} 条有效事实、${bookCount} 卷场景记忆书与全部 L1 数值/背包实时挂载于 <rp_state_frame> / <rp_recalled_context>，此处不重复赘述。`,
+  );
 
   if (options?.previousSummary?.trim()) {
     lines.push(`## 更早幕次脉络\n${options.previousSummary.trim().slice(0, 1200)}`);
@@ -108,4 +123,75 @@ export function buildMemSceneCompactionSummary(
   }
 
   return lines.join("\n");
+}
+
+/**
+ * Semantic LLM-powered EverMemOS MemScene Compaction for `session_before_compact`.
+ * Uses `state.sidecarModel` (or `ctx.model`) to synthesize causal plot progression instead of hard 140-char truncation.
+ * Always falls back safely to `buildMemSceneCompactionSummary` on error/timeout/offline.
+ */
+export async function buildSemanticMemSceneCompaction(
+  ctx: PiExtensionContext,
+  state: SessionRpState,
+  options?: {
+    messagesToSummarize?: PiMessage[];
+    previousSummary?: string;
+    signal?: AbortSignal;
+  },
+): Promise<string> {
+  const dialog = (options?.messagesToSummarize ?? []).filter(
+    (m) => (m.role === "user" || m.role === "assistant") && m.customType !== "rp:ooc" && m.customType !== "rp:event",
+  );
+
+  const model = resolveSidecarModel(ctx, state.sidecarModel);
+  if (dialog.length < 2 || !canCompleteWithRegistry(ctx, model)) {
+    return buildMemSceneCompactionSummary(state, options);
+  }
+
+  // Build compact transcript capped to ~8000 chars so compaction stays fast and cheap
+  const lines: string[] = [];
+  let charBudget = 8000;
+  for (const m of dialog) {
+    const clean = extractMessagePlainText(m)
+      .replace(/<rp_state_frame>[\s\S]*?<\/rp_state_frame>/gi, "")
+      .replace(/<rp_recalled_context>[\s\S]*?<\/rp_recalled_context>/gi, "")
+      .replace(/<rp_director_note>[\s\S]*?<\/rp_director_note>/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!clean) continue;
+    const speaker = m.role === "user" ? state.currentPersona.name : "叙事";
+    const snippet = `[${speaker}] ${clean.slice(0, 420)}`;
+    if (charBudget - snippet.length < 0) break;
+    charBudget -= snippet.length;
+    lines.push(snippet);
+  }
+
+  if (lines.length === 0) {
+    return buildMemSceneCompactionSummary(state, options);
+  }
+
+  try {
+    const semanticSummary = await completeWithRegistry(ctx, model, {
+      systemPrompt:
+        "You are a narrative memory archivist compressing roleplay history into an EverMemOS MemScene summary. " +
+        "Preserve: (1) concrete plot events in chronological order, (2) emotional/relationship turning points and character subtext, " +
+        "(3) promises, secrets, clues, and unresolved tensions. Match the story's language. Be dense and accurate (max 380 Chinese chars or 220 English words). Output ONLY the summary bullets.",
+      userPrompt:
+        (options?.previousSummary ? `Prior Arc:\n${options.previousSummary.slice(0, 800)}\n\n` : "") +
+        `Transcript to compress:\n${lines.join("\n")}`,
+      maxTokens: 520,
+      signal: options?.signal ?? ctx.signal,
+    });
+
+    if (semanticSummary.trim().length >= 24) {
+      return buildMemSceneCompactionSummary(state, {
+        ...options,
+        droppedMessagesSummary: semanticSummary.trim(),
+      });
+    }
+  } catch {
+    // Graceful fallback to deterministic summary
+  }
+
+  return buildMemSceneCompactionSummary(state, options);
 }

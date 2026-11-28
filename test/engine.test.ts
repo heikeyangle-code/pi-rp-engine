@@ -440,9 +440,11 @@ test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, re
     const h = createMockPiHarness(tmpDir);
     rpEngineExtension(h.pi);
 
-    // 10 shortcuts registered + 4 message renderers + 6 tools (all defaultActive: false)
-    assert.equal(h.shortcuts.size, 14);
+    // 16 shortcuts registered + 3 message renderers + 6 tools (all defaultActive: false)
+    assert.equal(h.shortcuts.size, 16);
     assert.ok(h.shortcuts.has("alt+r"));
+    assert.ok(h.shortcuts.has("alt+e"));
+    assert.ok(h.shortcuts.has("alt+x"));
     assert.ok(h.shortcuts.has("alt+shift+x"));
     assert.equal(h.messageRenderers.size, 3);
     assert.equal(h.tools.size, 6);

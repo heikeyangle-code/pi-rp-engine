@@ -15,12 +15,15 @@ import type {
   CompiledCard,
   CompiledLoreEntry,
   CompiledPreset,
+  ContextXRaySnapshot,
   HudMode,
+  MemoryBookEntry,
   PacingMode,
   PersonaProfile,
   PiExtensionAPI,
   PiExtensionContext,
   PiMessage,
+  QuickReplyItem,
   RpTxEntry,
   SessionRpState,
   SettlementMode,
@@ -34,8 +37,18 @@ import { evaluateMacros } from "../parser/macros.js";
 import { rollDiceCheck } from "../engine/dice.js";
 import { computeMessageFingerprint } from "../engine/state-replay.js";
 import { getActiveFacts } from "../memory/bitemporal.js";
-import { canCompleteWithRegistry, completeWithRegistry } from "../engine/llm-helper.js";
 import {
+  canCompleteWithRegistry,
+  completeWithRegistry,
+  extractJsonObject,
+  listRegistryModels,
+  resolveSidecarModel,
+  stripThinkingBlocks,
+} from "../engine/llm-helper.js";
+import {
+  deleteCompiledCard,
+  deleteCompiledPreset,
+  deletePersona,
   getGlobalLibraryDir,
   getProjectRpDir,
   listAllCardSummaries,
@@ -48,8 +61,17 @@ import {
   saveCompiledCard,
   saveCompiledPreset,
   savePersona,
+  saveUpdatedCard,
 } from "../storage/workspace-store.js";
-import { loadUiPrefs, normalizeUserFilePath, pickFilesToImport, saveUiPrefs } from "./file-picker.js";
+import {
+  DEFAULT_QUICK_REPLIES,
+  loadQuickReplies,
+  loadUiPrefs,
+  normalizeUserFilePath,
+  pickFilesToImport,
+  saveQuickReplies,
+  saveUiPrefs,
+} from "./file-picker.js";
 import { RP_SHORTCUT_LIST } from "./shortcuts.js";
 
 export interface RpRuntimeHandle {
@@ -58,6 +80,7 @@ export interface RpRuntimeHandle {
   getCard(): CompiledCard | null;
   getExtraCastCards(): CompiledCard[];
   getPreset(): CompiledPreset | null;
+  getLastXRay(): ContextXRaySnapshot | null;
   commitTx(tx: RpTxEntry): void;
   reloadRuntime(ctx: PiExtensionContext): void;
   refreshHud(ctx: PiExtensionContext): void;
@@ -141,6 +164,219 @@ async function pickOrCreatePersona(ctx: PiExtensionContext, current: PersonaProf
   return preferred;
 }
 
+/**
+ * Deterministically hydrate ALL 7 narrative dimensions of a CompiledCard's WorldProfile
+ * and multi-actor/category-routed `salvagedStateSchema` into the active session.
+ * Runs in <2ms with 0 LLM cost whenever binding a card or applying `/rp analyze`.
+ */
+export function hydrateWorldProfileAndVariables(
+  rt: RpRuntimeHandle,
+  card: CompiledCard,
+  reasonPrefix: "salvaged" | "llm_analyze" = "salvaged",
+): void {
+  const wp = card.worldProfile;
+
+  // 1. WorldProfile core archetype, modules & spatio-temporal anchors
+  if (wp) {
+    const s0 = rt.getState();
+    rt.commitTx({
+      kind: "profile_apply",
+      archetype: wp.archetype,
+      modules: wp.modules,
+      initialStage: wp.modules.stages ? wp.initialStage : undefined,
+      initialTime: wp.initialTime,
+    });
+    const nextLoc = !s0.location && wp.initialLocation ? wp.initialLocation : s0.location;
+    const nextNpcs = s0.presentNpcs.length === 0 && wp.initialPresentNpcs.length > 0 ? wp.initialPresentNpcs : s0.presentNpcs;
+    if (nextLoc !== s0.location || nextNpcs.join("|") !== s0.presentNpcs.join("|")) {
+      rt.commitTx({
+        kind: "location_set",
+        location: nextLoc,
+        presentNpcs: nextNpcs,
+      });
+    }
+    if (wp.initialObjective && !rt.getState().sceneObjective) {
+      rt.commitTx({ kind: "scene_objective_set", objective: wp.initialObjective });
+    }
+    // 2. Multi-actor inventory (idempotent: never double-add an item already owned!)
+    for (const inv of wp.initialInventory ?? []) {
+      const targetActor = inv.actorId || "player";
+      if (inv.item && inv.count > 0 && !rt.getState().inventory[targetActor]?.[inv.item]) {
+        rt.commitTx({
+          kind: "inventory_patch",
+          actorId: targetActor,
+          item: inv.item,
+          delta: inv.count,
+          note: `${reasonPrefix}:profile_init`,
+        });
+      }
+    }
+    // 3. Multi-actor CFSM axes (idempotent: never overwrite an already-defined axis)
+    for (const ax of wp.suggestedCfsmAxes ?? []) {
+      const targetActor = ax.actorId || card.identity.name;
+      if (!rt.getState().cfsmDefs[targetActor]?.[ax.axis]) {
+        rt.commitTx({
+          kind: "cfsm_define",
+          actorId: targetActor,
+          def: ax,
+        });
+      }
+    }
+    // 4. Initial RoleMemo DualMem beliefs (idempotent by id)
+    (wp.initialBeliefs ?? []).forEach((b, idx) => {
+      const id = `belief_init_${idx}`;
+      const stNow = rt.getState();
+      if (!stNow.beliefs.some((existing) => existing.id === id)) {
+        rt.commitTx({
+          kind: "belief_update",
+          id,
+          actorId: b.actorId || card.identity.name,
+          target: b.target || stNow.currentPersona.name,
+          activatingEvent: b.activatingEvent || "初始设定",
+          belief: b.belief,
+          subjectiveInsight: b.subjectiveInsight,
+          emotionalTone: b.emotionalTone,
+          turn: stNow.turn,
+        });
+      }
+    });
+    // 5. Initial FANToM facts & hidden secrets (idempotent by id; never resurrect invalidated facts)
+    (wp.initialFacts ?? []).forEach((f, idx) => {
+      const id = `fact_init_${idx}`;
+      const stNow = rt.getState();
+      if (!stNow.facts.has(id)) {
+        rt.commitTx({
+          kind: "fact_add",
+          fact: {
+            id,
+            statement: f.statement,
+            entities: f.entities,
+            validFromTurn: 0,
+            validUntilTurn: null,
+            ingestedAtTurn: stNow.turn,
+            eventTimeLabel: wp.initialTime || undefined,
+            witnessIds: f.witnessIds,
+          },
+        });
+      }
+    });
+    // 6. Initial EverMemOS foresights (idempotent by id; never reset paid_off hooks)
+    (wp.initialForesights ?? []).forEach((h, idx) => {
+      const id = `hook_init_${idx}`;
+      if (!rt.getState().foresights.has(id)) {
+        rt.commitTx({
+          kind: "foresight_upsert",
+          hook: {
+            id,
+            summary: h.summary,
+            triggerHint: h.triggerHint,
+            entities: h.entities,
+            plantedTurn: 0,
+            status: "open",
+          },
+        });
+      }
+    });
+    // 7. Initial condition-gated Storylets & clocks (idempotent by id; never reset completed storylets or double-tick clocks)
+    (wp.initialStorylets ?? []).forEach((st, idx) => {
+      const id = `st_init_${idx}`;
+      if (!rt.getState().storylets.has(id)) {
+        rt.commitTx({
+          kind: "storylet_upsert",
+          storylet: {
+            id,
+            title: st.title,
+            triggerPrompt: st.triggerPrompt,
+            gate: st.gate,
+            postEffects: st.postEffects,
+            oneTime: st.oneTime ?? true,
+            status: "armed",
+            createdTurn: 0,
+          },
+        });
+      }
+    });
+    for (const ck of wp.initialClocks ?? []) {
+      if (!rt.getState().clocks[ck.clockId]) {
+        rt.commitTx({
+          kind: "progress_clock",
+          clockId: ck.clockId,
+          label: ck.label,
+          delta: ck.value,
+          max: ck.max,
+        });
+      }
+    }
+  }
+
+  // 8. Route salvaged / LLM-analyzed variables cleanly by actorId & semantic category (idempotent!)
+  const allVars = card.salvagedStateSchema.length > 0 ? card.salvagedStateSchema : wp?.initialStats ?? [];
+  for (const v of allVars) {
+    const stNow = rt.getState();
+    const actor = v.actorId || card.identity.name;
+    const cat = v.category ?? "stat";
+    if (cat === "inventory") {
+      const targetActor = actor === "world" ? "player" : actor;
+      if (!stNow.inventory[targetActor]?.[v.key]) {
+        const count = typeof v.initialValue === "number" && v.initialValue > 0 ? Math.trunc(v.initialValue) : 1;
+        rt.commitTx({
+          kind: "inventory_patch",
+          actorId: targetActor,
+          item: v.key,
+          delta: count,
+          note: `${reasonPrefix}:${v.source}`,
+        });
+      }
+    } else if (cat === "flag") {
+      const flagKey = actor !== card.identity.name && actor !== "world" ? `${actor}.${v.key}` : v.key;
+      if (!Object.prototype.hasOwnProperty.call(stNow.flags, flagKey)) {
+        rt.commitTx({
+          kind: "flag_set",
+          flag: flagKey,
+          value: Boolean(v.initialValue),
+        });
+      }
+    } else if (cat === "clock") {
+      const clockId = v.key.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_").slice(0, 24) || `clk_${v.key}`;
+      if (!stNow.clocks[clockId]) {
+        const cur = typeof v.initialValue === "number" ? Math.max(0, Math.trunc(v.initialValue)) : 0;
+        const max = typeof v.max === "number" && v.max > 0 ? Math.trunc(v.max) : Math.max(4, cur);
+        rt.commitTx({ kind: "progress_clock", clockId, label: v.key, delta: cur, max });
+      }
+    } else if (cat === "anchor") {
+      const valStr = String(v.initialValue).trim();
+      const kLower = v.key.toLowerCase();
+      if (valStr && /(?:地点|位置|场景|location|place)/i.test(kLower) && !stNow.location) {
+        rt.commitTx({ kind: "location_set", location: valStr, presentNpcs: stNow.presentNpcs });
+      } else if (valStr && /(?:时间|日期|时刻|天气|time|date|clock)/i.test(kLower) && !stNow.worldTimeLabel) {
+        rt.commitTx({ kind: "clock_tick", beatDelta: 0, worldTimeLabel: valStr });
+      } else if (stNow.stats[actor]?.[v.key] === undefined) {
+        rt.commitTx({
+          kind: "stat_patch",
+          actorId: actor,
+          key: v.key,
+          op: "set",
+          value: v.initialValue,
+          min: v.min,
+          max: v.max,
+          reason: `${reasonPrefix}:${v.source}`,
+        });
+      }
+    } else if (stNow.stats[actor]?.[v.key] === undefined) {
+      rt.commitTx({
+        kind: "stat_patch",
+        actorId: actor,
+        key: v.key,
+        op: "set",
+        value: v.initialValue,
+        min: v.min,
+        max: v.max,
+        reason: `${reasonPrefix}:${v.source}`,
+      });
+    }
+  }
+}
+
 /** Bind a compiled card strictly to THIS session (never touches any project auto-bind config!). */
 export async function bindCardToCurrentSession(
   rt: RpRuntimeHandle,
@@ -170,48 +406,8 @@ export async function bindCardToCurrentSession(
     persona,
   });
 
-  // Seed universal WorldProfile (archetype, enabled modules, initial anchors & inventory)
-  if (card.worldProfile) {
-    const wp = card.worldProfile;
-    rt.commitTx({
-      kind: "profile_apply",
-      archetype: wp.archetype,
-      modules: wp.modules,
-      initialStage: wp.modules.stages ? wp.initialStage : undefined,
-      initialTime: wp.initialTime,
-    });
-    if (wp.initialLocation || wp.initialPresentNpcs.length > 0) {
-      rt.commitTx({
-        kind: "location_set",
-        location: wp.initialLocation ?? "",
-        presentNpcs: wp.initialPresentNpcs,
-      });
-    }
-    if (wp.modules.inventory) {
-      for (const inv of wp.initialInventory) {
-        if (inv.item && inv.count > 0) {
-          rt.commitTx({ kind: "inventory_patch", actorId: "player", item: inv.item, delta: inv.count, note: "profile_init" });
-        }
-      }
-    }
-    for (const ax of wp.suggestedCfsmAxes) {
-      rt.commitTx({ kind: "cfsm_define", actorId: card.identity.name, def: ax });
-    }
-  }
-
-  // Seed salvaged MVU/YAML/macro variables into deterministic L1 stats
-  for (const v of card.salvagedStateSchema) {
-    rt.commitTx({
-      kind: "stat_patch",
-      actorId: card.identity.name,
-      key: v.key,
-      op: "set",
-      value: v.initialValue,
-      min: v.min,
-      max: v.max,
-      reason: `salvaged:${v.source}`,
-    });
-  }
+  // Hydrate full 7-dimension WorldProfile + multi-actor/category-routed variables in <2ms!
+  hydrateWorldProfileAndVariables(rt, card, "salvaged");
 
   rt.reloadRuntime(ctx);
   rt.activateRpTools();
@@ -407,7 +603,9 @@ export async function actionImportFile(rt: RpRuntimeHandle, ctx: PiExtensionCont
 
   const { card, source, baseDir } = singleRes;
   const alreadyActive = rt.getState().active;
+  const canAiAnalyze = card.worldProfile?.source !== "llm-analyzed" && canCompleteWithRegistry(ctx);
   const nextOpts = [
+    ...(canAiAnalyze ? ["✨ 用 AI 深度建档后立即开玩（推荐纯文字卡 · 提取 7 维变量/秘密/伏笔/剧情卡并永久缓存）"] : []),
     "▶ 立即在本会话开启角色扮演（进入此角色）",
     ...(alreadyActive ? ["👥 加入当前同场共演阵容（保留当前主卡）"] : []),
     "📚 仅存入角色库，稍后再玩",
@@ -424,6 +622,7 @@ export async function actionImportFile(rt: RpRuntimeHandle, ctx: PiExtensionCont
     return;
   }
 
+  const runAnalyzeFirst = nextPick.startsWith("✨");
   const greetingIndex = await pickGreeting(ctx, card);
   const persona = await pickOrCreatePersona(ctx, rt.getState().currentPersona);
   await bindCardToCurrentSession(rt, ctx, {
@@ -434,6 +633,9 @@ export async function actionImportFile(rt: RpRuntimeHandle, ctx: PiExtensionCont
     persona,
     rawPassthrough: rawMode,
   });
+  if (runAnalyzeFirst) {
+    await actionAnalyzeCard(rt, ctx);
+  }
 }
 
 /** Humanized `/rp load`: rich card picker, seamless fallback to import when library is empty, quick-start option. */
@@ -1283,7 +1485,7 @@ export async function actionShowShortcuts(ctx: PiExtensionContext): Promise<void
   );
 }
 
-/** L1 One-Click AI Deep Card Analyzer (`/rp analyze`): extracts universal WorldProfile and caches it to card.compiled.json. */
+/** L1 One-Click AI 7-Dimension Deep Card Analyzer (`/rp analyze`): extracts full structured narrative world and caches it permanently to card.compiled.json. */
 export async function actionAnalyzeCard(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
   const state = rt.getState();
   const card = rt.getCard();
@@ -1296,13 +1498,15 @@ export async function actionAnalyzeCard(rt: RpRuntimeHandle, ctx: PiExtensionCon
     return;
   }
 
-  ctx.ui.notify(`🔍 正在智能分析「${card.identity.name}」的卡型、初态与隐藏门禁…`, "info");
+  ctx.ui.setWorkingMessage?.(`正在对「${card.identity.name}」执行 7 维深度建档…`);
   let res;
   try {
-    res = await analyzeCardWithModel(ctx, card);
+    res = await analyzeCardWithModel(ctx, card, state.sidecarModel);
   } catch (err) {
     ctx.ui.notify(`智能建档失败：${(err as Error).message}`, "error");
     return;
+  } finally {
+    ctx.ui.setWorkingMessage?.(undefined);
   }
   if (!res) {
     ctx.ui.notify("未能解析模型返回的结构化画像，请稍后重试。", "warning");
@@ -1314,77 +1518,58 @@ export async function actionAnalyzeCard(rt: RpRuntimeHandle, ctx: PiExtensionCon
     .filter(([, on]) => on)
     .map(([k]) => k)
     .join(", ") || "仅基础叙事";
+  const secretCount = (profile.initialFacts ?? []).filter((f) => f.witnessIds !== "public").length;
   const preview = [
-    `卡型判定：${profile.archetype}（启用模块：${enabledMods}）`,
-    `初始时空：${[profile.initialStage, profile.initialTime, profile.initialLocation].filter(Boolean).join(" · ") || "无显式初态"}`,
-    profile.initialPresentNpcs.length ? `在场人物：${profile.initialPresentNpcs.join("、")}` : null,
-    profile.initialInventory.length ? `初始物品：${profile.initialInventory.map((i) => `${i.item}×${i.count}`).join("、")}` : null,
-    initialStats.length ? `初始数值：${initialStats.map((s) => `${s.key}=${s.initialValue}`).join("、")}` : null,
-    profile.suggestedCfsmAxes.length ? `关系/状态轴：${profile.suggestedCfsmAxes.map((a) => `${a.axis}(${a.states.join("→")})`).join("；")}` : null,
-    Object.keys(profile.entityAliases).length ? `实体别名：${Object.keys(profile.entityAliases).length} 组` : null,
-    profile.suggestedLoreGates.length ? `建议防剧透门禁：${profile.suggestedLoreGates.length} 条世界书` : null,
+    `1. 卡型与时空：${profile.archetype}（模块：${enabledMods}） · ${[profile.initialStage, profile.initialTime, profile.initialLocation].filter(Boolean).join(" · ") || "无显式初态"}`,
+    profile.initialObjective ? `   开局目标：${profile.initialObjective}` : null,
+    profile.initialPresentNpcs.length ? `   在场人物：${profile.initialPresentNpcs.join("、")}` : null,
+    initialStats.length ? `2. 数值变量 (${initialStats.length})：${initialStats.slice(0, 6).map((s) => `${s.actorId ?? card.identity.name}.${s.key}=${s.initialValue}`).join("、")}` : null,
+    profile.initialInventory.length ? `   初始物品 (${profile.initialInventory.length})：${profile.initialInventory.map((i) => `${i.actorId ?? "player"}:${i.item}×${i.count}`).join("、")}` : null,
+    profile.suggestedCfsmAxes.length ? `3. 角色心态轴 (${profile.suggestedCfsmAxes.length})：${profile.suggestedCfsmAxes.map((a) => `${a.actorId ?? card.identity.name}.${a.axis}(${a.states.join("→")})`).join("；")}` : null,
+    profile.initialBeliefs?.length ? `4. 初始信念 DualMem：${profile.initialBeliefs.length} 条人物潜台词` : null,
+    profile.initialFacts?.length ? `5. 初始事实与秘密 FANToM：${profile.initialFacts.length} 条（含 ${secretCount} 条隐藏秘密/盲区）` : null,
+    profile.initialForesights?.length ? `6. 初始伏笔与悬念：${profile.initialForesights.length} 条` : null,
+    profile.initialStorylets?.length || profile.initialClocks?.length
+      ? `7. 动态剧情卡与时钟：Storylets ${profile.initialStorylets?.length ?? 0} 张 · 时钟 ${profile.initialClocks?.length ?? 0} 个`
+      : null,
+    Object.keys(profile.entityAliases).length || profile.suggestedLoreGates.length
+      ? `   实体别名 ${Object.keys(profile.entityAliases).length} 组 · 防剧透门禁 ${profile.suggestedLoreGates.length} 条`
+      : null,
   ]
     .filter(Boolean)
     .join("\n");
 
-  const ok = await ctx.ui.confirm("应用并永久缓存智能建档结果？", preview);
+  const ok = await ctx.ui.confirm("应用并永久缓存 7 维深度建档结果？", preview);
   if (!ok) {
     ctx.ui.notify("已取消应用建档结果。", "info");
     return;
   }
 
-  applyAnalyzedProfileToCard(card, profile, true);
+  applyAnalyzedProfileToCard(card, profile, true, initialStats);
   if (state.worldDir) {
-    const rawJson = loadRawCardJson(state.worldDir, card.slug) ?? {};
-    saveCompiledCard({ baseDir: state.worldDir, card, rawJson });
+    saveUpdatedCard(state.worldDir, card);
   }
 
-  rt.commitTx({
-    kind: "profile_apply",
-    archetype: profile.archetype,
-    modules: profile.modules,
-    initialStage: profile.modules.stages ? profile.initialStage : undefined,
-    initialTime: profile.initialTime,
-  });
-  if (profile.initialLocation || profile.initialPresentNpcs.length > 0) {
-    rt.commitTx({
-      kind: "location_set",
-      location: profile.initialLocation ?? state.location,
-      presentNpcs: profile.initialPresentNpcs.length ? profile.initialPresentNpcs : state.presentNpcs,
-    });
-  }
-  for (const s of initialStats) {
-    rt.commitTx({
-      kind: "stat_patch",
-      actorId: card.identity.name,
-      key: s.key,
-      op: "set",
-      value: s.initialValue,
-      min: s.min,
-      max: s.max,
-      reason: "llm_analyze",
-    });
-  }
-  if (profile.modules.inventory) {
-    for (const inv of profile.initialInventory) {
-      rt.commitTx({ kind: "inventory_patch", actorId: "player", item: inv.item, delta: inv.count, note: "llm_analyze" });
-    }
-  }
-  for (const ax of profile.suggestedCfsmAxes) {
-    rt.commitTx({ kind: "cfsm_define", actorId: card.identity.name, def: ax });
-  }
-
+  hydrateWorldProfileAndVariables(rt, card, "llm_analyze");
   rt.reloadRuntime(ctx);
   rt.refreshHud(ctx);
-  ctx.ui.notify(`✅ 已完成「${card.identity.name}」智能建档并永久缓存，后续新开局 0 Token 复用！`, "info");
+  ctx.ui.notify(`✅ 已完成「${card.identity.name}」7 维深度建档并永久缓存，后续开局 <2ms 复用！`, "info");
 }
 
 
-/** True SillyTavern-style Swipe / Reroll (`/rp reroll` & `Alt+W`): branches on Pi's native Session Tree or hides+regenerates cleanly. */
+/** True SillyTavern-style Swipe / Guided Reroll (`/rp reroll` & `Alt+W`):
+ *  - Guards against mid-stream calls (`ctx.isIdle() === false`)
+ *  - Detects BOTH user turns AND custom continue/montage/reroll triggers so rerolling after `/rp continue`
+ *    never rewinds across multiple turns!
+ *  - Includes 1-click Guided Reroll presets. */
 export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
   const state = rt.getState();
   if (!state.active) {
     ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  if (ctx.isIdle?.() === false) {
+    ctx.ui.notify("当前正在生成回复，请等待本轮输出结束后再重摇。", "warning");
     return;
   }
 
@@ -1402,37 +1587,60 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
     return;
   }
 
-  let lastUserIdx = -1;
+  // Locate the exact trigger message right before the last assistant reply (user OR custom continue/montage/reroll)
+  let triggerIdx = -1;
+  let triggerKind: "user" | "custom" = "user";
   for (let i = lastAssistantIdx - 1; i >= 0; i--) {
     const e = branch[i]!;
     if (e.type === "message" && e.message?.role === "user") {
-      lastUserIdx = i;
+      triggerIdx = i;
+      triggerKind = "user";
       break;
+    }
+    if (
+      (e.type === "custom_message" || e.type === "message") &&
+      (e.customType === "rp:event" || e.customType === "rp:era" || e.message?.customType === "rp:event" || e.message?.customType === "rp:era")
+    ) {
+      const details = ((e.message?.details ?? e.data) ?? {}) as { kind?: string };
+      if (details.kind === "continue" || details.kind === "montage" || details.kind === "reroll") {
+        triggerIdx = i;
+        triggerKind = "custom";
+        break;
+      }
     }
   }
 
   let steerHint = argsText.trim();
   if (!steerHint) {
-    const pick = await ctx.ui.select("🎲 重摇上一条回复 (Swipe / Reroll)", [
+    const pick = await ctx.ui.select("🎲 重摇上一条回复 (Guided Swipe / Reroll)", [
       "🎲 直接重摇（换一种演绎，原分支保留在 /tree 中）",
-      "✨ 带微调方向重摇（如：语气更克制 / 细节更细腻 / 推进冲突）",
+      "🌙 定向重摇：更细腻的感官细节、微表情与潜台词",
+      "⚡ 定向重摇：更紧凑的节奏与更高的戏剧张力",
+      "🎭 定向重摇：更贴合原卡性格口吻，减少套话",
+      "✂️ 定向重摇：篇幅更精炼（200-350 字）并留出互动钩子",
+      "✏️ 输入自定义微调方向（仅生效 1 轮）",
       "✕ 取消",
     ]);
     if (!pick || pick.startsWith("✕")) return;
-    if (pick.startsWith("✨")) {
-      const entered = (await ctx.ui.input("输入本次重摇的微调提示（仅生效 1 轮）", "语气更细腻，增加微表情与环境细节"))?.trim();
+    if (pick.startsWith("🌙")) steerHint = "放慢镜头，强化环境感官细节、微表情与人物内心潜台词。";
+    else if (pick.startsWith("⚡")) steerHint = "收紧节奏，提高戏剧张力并让潜在冲突或悬念显露出来。";
+    else if (pick.startsWith("🎭")) steerHint = "严格贴合角色原始性格、说话习惯与当下给定情境，去除通用套话。";
+    else if (pick.startsWith("✂️")) steerHint = "保持精炼紧凑（约 200-350 字），结尾自然抛出留给玩家的互动钩子。";
+    else if (pick.startsWith("✏️")) {
+      const entered = (await ctx.ui.input("输入本次重摇的微调提示（仅生效 1 轮）", "语气更克制，增加环境细节"))?.trim();
       if (!entered) return;
       steerHint = entered;
     }
   }
 
   const assistantEntry = branch[lastAssistantIdx]!;
-  const userEntry = lastUserIdx >= 0 ? branch[lastUserIdx]! : undefined;
-  const userText = userEntry ? extractMsgPlain(userEntry.message) : "";
+  const triggerEntry = triggerIdx >= 0 ? branch[triggerIdx]! : undefined;
+  const triggerText = triggerEntry?.message ? extractMsgPlain(triggerEntry.message) : "";
+  const rewindParentId = triggerEntry?.parentId ?? (triggerIdx > 0 ? branch[triggerIdx - 1]?.id : undefined);
 
   // Preferred path: true tree-branching Swipe via navigateTree so old swipe stays intact in Pi /tree!
-  if (typeof ctx.navigateTree === "function" && userEntry && userEntry.parentId) {
-    const nav = await ctx.navigateTree(userEntry.parentId);
+  if (typeof ctx.navigateTree === "function" && triggerEntry && rewindParentId) {
+    const nav = await ctx.navigateTree(rewindParentId);
     if (nav?.cancelled) return;
     rt.reloadRuntime(ctx);
     if (steerHint) {
@@ -1442,13 +1650,15 @@ export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext,
       });
     }
     rt.refreshHud(ctx);
-    if (userText && typeof rt.pi.sendUserMessage === "function") {
-      rt.pi.sendUserMessage(userText);
+    if (triggerKind === "user" && triggerText && typeof rt.pi.sendUserMessage === "function") {
+      rt.pi.sendUserMessage(triggerText);
     } else {
       rt.pi.sendMessage(
         {
           customType: "rp:event",
-          content: userText || "[Please respond to the current scene with a fresh take.]",
+          content:
+            triggerText ||
+            "[Continue and regenerate the response with a fresh narrative angle while staying faithful to the current scene.]",
           display: false,
           details: { kind: "reroll" },
         },
@@ -1724,9 +1934,9 @@ export async function actionSidePrompt(rt: RpRuntimeHandle, ctx: PiExtensionCont
 }
 
 /**
- * Memory-Books style Summarize & Hide Old Floors (`/rp summarize`):
- * Summarizes the earliest visible N dialogue floors into a bi-temporal memory entry and hides them
- * non-destructively so context stays lean without losing story continuity.
+ * Memory-Books Archive & Hide Old Floors (`/rp summarize`):
+ * Summarizes the earliest visible N dialogue floors into a structured, keyword/entity-recalled
+ * Memory Book chapter (`memory_book_upsert`) and hides them non-destructively!
  */
 export async function actionSummarizeOldFloors(
   rt: RpRuntimeHandle,
@@ -1759,18 +1969,26 @@ export async function actionSummarizeOldFloors(
 
   let count = Number(argsText.trim());
   if (!Number.isFinite(count) || count <= 0) {
+    const opt10 = Math.min(10, visibleMsgs.length - 2);
+    const opt20 = Math.min(20, visibleMsgs.length - 2);
+    const optKeep6 = Math.max(0, visibleMsgs.length - 6);
+    const choices: Array<{ label: string; count: number }> = [
+      { label: `总结最早的 ${opt10} 条并归档为记忆书章节（推荐）`, count: opt10 },
+    ];
+    if (opt20 > opt10) {
+      choices.push({ label: `总结最早的 ${opt20} 条并归档为记忆书章节`, count: opt20 });
+    }
+    if (optKeep6 > 0 && optKeep6 !== opt10 && optKeep6 !== opt20) {
+      choices.push({ label: `仅保留最近 6 条原文，其余 ${optKeep6} 条全部归档隐藏`, count: optKeep6 });
+    }
+    const labels = [...choices.map((c) => c.label), "✕ 取消"];
     const pick = await ctx.ui.select(
-      `📦 总结并隐藏较早的对话楼层（当前可见 ${visibleMsgs.length} 条，保留最新几轮原文）`,
-      [
-        `总结最早的 ${Math.min(10, visibleMsgs.length - 2)} 条（推荐）`,
-        `总结最早的 ${Math.min(20, visibleMsgs.length - 2)} 条`,
-        `保留最近 6 条，其余全部总结并隐藏（${Math.max(0, visibleMsgs.length - 6)} 条）`,
-        "✕ 取消",
-      ],
+      `📦 归档较早的对话楼层 → 记忆书章节（当前可见 ${visibleMsgs.length} 条）`,
+      labels,
     );
     if (!pick || pick.startsWith("✕")) return;
-    const m = /(\d+)\s*条/.exec(pick);
-    count = m ? Number(m[1]) : 0;
+    const chosenIdx = labels.indexOf(pick);
+    count = chosenIdx >= 0 && choices[chosenIdx] ? choices[chosenIdx]!.count : 0;
   }
 
   count = Math.min(Math.max(0, Math.floor(count)), visibleMsgs.length - 2);
@@ -1787,18 +2005,17 @@ export async function actionSummarizeOldFloors(
     })
     .join("\n");
 
-  ctx.ui.setWorkingMessage?.(`正在将最早 ${count} 条对话归档进记忆本…`);
-  let summary = "";
+  const model = resolveSidecarModel(ctx, state.sidecarModel);
+  ctx.ui.setWorkingMessage?.(`正在将最早 ${count} 条对话凝练为记忆书章节…`);
+  let raw = "";
   try {
-    summary = (
-      await completeWithRegistry(ctx, ctx.model, {
-        systemPrompt:
-          "Summarize the following roleplay excerpt into 1 concise, dense factual memory paragraph (max 180 Chinese chars or 90 English words) preserving key plot events, relationship shifts, promises, and clues. Output ONLY the summary text.",
-        userPrompt: transcript,
-        maxTokens: 320,
-        signal: ctx.signal,
-      })
-    ).trim();
+    raw = await completeWithRegistry(ctx, model, {
+      systemPrompt:
+        'Summarize the roleplay excerpt into a structured Memory Book chapter. Return ONLY strict JSON: {"title": string, "summary": string, "keywords": string[], "entities": string[]}. Keep summary dense, factual, and under 220 Chinese chars or 110 English words, preserving promises, clues, relationship changes, and emotional turning points.',
+      userPrompt: transcript,
+      maxTokens: 480,
+      signal: ctx.signal,
+    });
   } catch (err) {
     ctx.ui.notify(`总结失败：${(err as Error).message}`, "error");
     return;
@@ -1806,28 +2023,49 @@ export async function actionSummarizeOldFloors(
     ctx.ui.setWorkingMessage?.(undefined);
   }
 
+  const parsed = extractJsonObject<{
+    title?: string;
+    summary?: string;
+    keywords?: string[];
+    entities?: string[];
+  }>(raw);
+
+  const chapterNum = state.memoryBooks.size + 1;
+  const title = parsed?.title?.trim() || `第 ${chapterNum} 章 · ${state.location || state.era || "往事归档"}`;
+  const summary = (parsed?.summary ?? stripThinkingBlocks(raw)).trim();
+  const entities = Array.isArray(parsed?.entities)
+    ? parsed.entities.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim())
+    : [card.identity.name, ...(state.location ? [state.location] : [])];
+  const keywords = Array.isArray(parsed?.keywords)
+    ? parsed.keywords.filter((x): x is string => typeof x === "string" && x.trim().length > 0).map((x) => x.trim())
+    : entities;
+
   if (!summary) {
     ctx.ui.notify("未能生成有效摘要。", "warning");
     return;
   }
 
   const ok = await ctx.ui.confirm(
-    `写入记忆本并隐藏这 ${count} 条旧楼层？`,
-    `摘要预览：\n${summary}\n\n（旧楼层仅对模型隐藏，原聊天记录完整保留，随时可 /rp unhide 恢复）`,
+    `写入记忆书「${title}」并隐藏这 ${count} 条旧楼层？`,
+    `触发词：${keywords.join("、") || "自动实体"}\n\n${summary}\n\n（旧楼层仅对模型隐藏，随时可 /rp unhide 恢复）`,
   );
   if (!ok) return;
 
-  rt.commitTx({
-    kind: "fact_add",
-    fact: {
-      id: `mem_arc_${Date.now().toString(36)}`,
-      statement: `[阶段归档] ${summary}`,
-      entities: [card.identity.name, ...(state.location ? [state.location] : [])],
-      validFromTurn: state.turn,
-      validUntilTurn: null,
-      witnessIds: "public",
-    },
-  });
+  const startTurn = Math.max(1, state.turn - Math.ceil(visibleMsgs.length / 2));
+  const endTurn = Math.max(startTurn, startTurn + Math.max(1, Math.floor(count / 2)));
+  const book: MemoryBookEntry = {
+    id: `book_${Date.now().toString(36)}`,
+    title,
+    summary,
+    entities: Array.from(new Set(entities)),
+    keywords: Array.from(new Set(keywords)),
+    turnRange: [startTurn, endTurn],
+    enabled: true,
+    pinned: false,
+    createdTurn: state.turn,
+  };
+
+  rt.commitTx({ kind: "memory_book_upsert", entry: book });
   rt.commitTx({
     kind: "hide_toggle",
     entryIds: targets.map((e) => e.id),
@@ -1835,13 +2073,13 @@ export async function actionSummarizeOldFloors(
     hidden: true,
   });
   rt.refreshHud(ctx);
-  ctx.ui.notify(`✅ 已将 ${count} 条旧楼层总结写入记忆本并隐藏，上下文已瘦身。`, "info");
+  ctx.ui.notify(`✅ 已归档为记忆书章节「${title}」并隐藏 ${count} 条旧楼层（将随关键词/实体自动召回）。`, "info");
 }
 
 /**
  * Dynamic World Info Entry Generator (`/rp loregen`):
  * Extracts a new structured Lorebook entry for an emergent NPC, location, or organization
- * from the recent dialogue and saves it to the active card's compiled lorebook.
+ * from the recent dialogue and saves it cleanly via `saveUpdatedCard`.
  */
 export async function actionGenerateLoreEntry(
   rt: RpRuntimeHandle,
@@ -1867,14 +2105,15 @@ export async function actionGenerateLoreEntry(
   }
 
   const recent = collectRecentDialogueLines(ctx, state, 10);
+  const model = resolveSidecarModel(ctx, state.sidecarModel);
   ctx.ui.setWorkingMessage?.(`正在为「${subject}」生成世界书条目…`);
   let raw = "";
   try {
-    raw = await completeWithRegistry(ctx, ctx.model, {
+    raw = await completeWithRegistry(ctx, model, {
       systemPrompt:
         'Extract a concise World Info (Lorebook) entry for the requested subject based on the recent roleplay dialogue. Return ONLY strict JSON: {"title": string, "keys": string[], "content": string}. Keep content factual and under 220 chars.',
       userPrompt: `Subject: ${subject}\nRecent dialogue:\n${recent.join("\n")}`,
-      maxTokens: 400,
+      maxTokens: 420,
       signal: ctx.signal,
     });
   } catch (err) {
@@ -1884,17 +2123,9 @@ export async function actionGenerateLoreEntry(
     ctx.ui.setWorkingMessage?.(undefined);
   }
 
-  const m = /\{[\s\S]*\}/.exec(raw);
-  if (!m) {
+  const parsed = extractJsonObject<{ title?: string; keys?: string[]; content?: string }>(raw);
+  if (!parsed) {
     ctx.ui.notify("未能解析生成的世界书 JSON，请重试。", "warning");
-    return;
-  }
-
-  let parsed: { title?: string; keys?: string[]; content?: string };
-  try {
-    parsed = JSON.parse(m[0]!);
-  } catch {
-    ctx.ui.notify("生成的世界书格式无效，请重试。", "warning");
     return;
   }
 
@@ -1932,13 +2163,366 @@ export async function actionGenerateLoreEntry(
   if (!newEntry) return;
 
   card.loreBook.entries.push(newEntry);
-  card.importReport.loreCount = card.loreBook.entries.length;
-  card.importReport.dynamicLoreCount += 1;
-
   if (state.worldDir) {
-    const rawJson = loadRawCardJson(state.worldDir, card.slug) ?? {};
-    saveCompiledCard({ baseDir: state.worldDir, card, rawJson });
+    saveUpdatedCard(state.worldDir, card);
   }
   rt.reloadRuntime(ctx);
   ctx.ui.notify(`✅ 已将「${title}」收录进当前角色卡世界书（触发词：${keys.join("、")}）。`, "info");
 }
+
+// ---------------------------------------------------------------------------
+// v3 New Actions: Quick Replies, Context X-Ray, Reversible Undo, Sidecar Model Picker, Asset Library CRUD
+// ---------------------------------------------------------------------------
+
+/** 1-tap Quick Replies & Action Macros (`/rp qr` & `Alt+E`), persisted in global `ui-prefs.json`. */
+export async function actionQuickReplies(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  let items = loadQuickReplies();
+  const arg = argsText.trim();
+  if (arg) {
+    const byIdx = /^\d+$/.test(arg) ? items[Number(arg) - 1] : undefined;
+    const matched = byIdx ?? items.find((i) => i.id === arg || i.label.includes(arg));
+    if (matched) {
+      executeQuickReply(rt, ctx, matched);
+      return;
+    }
+  }
+
+  while (true) {
+    items = loadQuickReplies();
+    const modeTag = (m: QuickReplyItem["mode"]) => (m === "send" ? "发送" : m === "editor" ? "预填" : "导演");
+    const opts = [
+      ...items.map((it, idx) => `${idx + 1}. [${modeTag(it.mode)}] ${it.label} — ${previewText(it.text, 34)}`),
+      "+ 新建快捷回复 / 动作宏",
+      "🗑 删除一条快捷回复",
+      "↺ 恢复默认快捷回复",
+      "✕ 关闭",
+    ];
+    const pick = await ctx.ui.select("⚡ 快捷回复与常用动作宏（点选即触发 · Alt+E）", opts);
+    if (!pick || pick.startsWith("✕")) return;
+
+    if (pick.startsWith("+")) {
+      const label = (await ctx.ui.input("按钮名称（如：🔍 搜查房间）", ""))?.trim();
+      if (!label) continue;
+      const text = (await ctx.ui.input("触发内容文本", ""))?.trim();
+      if (!text) continue;
+      const mPick = await ctx.ui.select("触发方式", [
+        "send — 立即作为玩家消息发送",
+        "editor — 填入输入框等待修改后发送",
+        "steer — 注入 1 轮临时导演指令",
+      ]);
+      if (!mPick) continue;
+      const mode = mPick.split(" ")[0] as QuickReplyItem["mode"];
+      items.push({ id: `qr_${Date.now().toString(36)}`, label, text, mode });
+      saveQuickReplies(items);
+      ctx.ui.notify(`已添加快捷回复：${label}`, "info");
+      continue;
+    }
+
+    if (pick.startsWith("🗑")) {
+      const delOpts = [...items.map((it, i) => `${i + 1}. ${it.label}`), "← 返回"];
+      const delPick = await ctx.ui.select("选择要删除的快捷回复", delOpts);
+      if (!delPick || delPick.startsWith("←")) continue;
+      const delIdx = delOpts.indexOf(delPick);
+      if (delIdx >= 0 && items[delIdx]) {
+        const removed = items.splice(delIdx, 1)[0]!;
+        saveQuickReplies(items);
+        ctx.ui.notify(`已删除快捷回复：${removed.label}`, "info");
+      }
+      continue;
+    }
+
+    if (pick.startsWith("↺")) {
+      saveQuickReplies(DEFAULT_QUICK_REPLIES.map((d) => ({ ...d })));
+      ctx.ui.notify("已恢复默认快捷回复列表。", "info");
+      continue;
+    }
+
+    const idx = opts.indexOf(pick);
+    const chosen = items[idx];
+    if (chosen) {
+      executeQuickReply(rt, ctx, chosen);
+      return;
+    }
+  }
+}
+
+function executeQuickReply(rt: RpRuntimeHandle, ctx: PiExtensionContext, item: QuickReplyItem): void {
+  if (item.mode === "editor") {
+    ctx.ui.setEditorText(item.text);
+    ctx.ui.notify(`已预填至输入框：${item.label}`, "info");
+    return;
+  }
+  if (item.mode === "steer") {
+    rt.commitTx({
+      kind: "note_set",
+      note: { id: `qr_note_${Date.now().toString(36)}`, text: item.text, remainingTurns: 1 },
+    });
+    rt.refreshHud(ctx);
+    ctx.ui.notify(`已注入 1 轮导演微调：${item.label}`, "info");
+    return;
+  }
+  if (typeof rt.pi.sendUserMessage === "function") {
+    const busy = ctx.isIdle?.() === false;
+    rt.pi.sendUserMessage(item.text, busy ? { deliverAs: "followUp" } : undefined);
+  } else {
+    rt.pi.sendMessage(
+      { customType: "rp:event", content: item.text, display: true, details: { kind: "quick_reply" } },
+      { triggerTurn: true },
+    );
+  }
+}
+
+/** Live Context X-Ray Inspector (`/rp xray` & `Alt+X`): displays Zone 1/2/3 budget, KV-Cache hash, and exact lore/memory recall traces. */
+export async function actionXRay(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const xray = rt.getLastXRay();
+  if (!xray) {
+    ctx.ui.notify("尚未捕获上下文快照，发送一轮对话后即可查看完整 X-Ray 透视。", "info");
+    return;
+  }
+
+  const totalTokens = xray.zone1Tokens + xray.zone2Tokens + xray.zone3Tokens;
+  const kvReasonMap: Record<string, string> = {
+    prefix_hit: "✅ 三层前缀全命中",
+    first_turn: "🆕 首轮建立缓存",
+    tools_changed: "⚠ 工具列表变更导致刷新",
+    zone1_changed: "⚠ Zone 1 冻结前缀变更导致刷新",
+    history_mutated: "⚠ Zone 2 历史前缀变更（隐藏/压缩/回溯）",
+  };
+  const kvReason = kvReasonMap[xray.cacheInvalidationReason ?? ""] ?? "已监控";
+  const repPct = Math.round((xray.repetitionScore ?? 0) * 100);
+  const stagTurns = xray.stagnantTurns ?? 0;
+
+  const lines: string[] = [
+    `三层 KV-Cache: ${kvReason}  │  连续命中 ×${xray.cacheHitStreak}`,
+    `前缀指纹: Tools=${xray.toolsHash ?? "—"}  │  Zone1=${xray.zone1Hash}  │  Zone2前缀=${xray.zone2PrefixMatch === false ? "✗断开" : "✓连续"}`,
+    `Token 分布: Zone1 ~${xray.zone1Tokens}t · Zone2 ~${xray.zone2Tokens}t · Zone3 ~${xray.zone3Tokens}t · 总计 ~${totalTokens}t`,
+    `世界书预算: ${xray.loreTokens}/${xray.loreBudget}t  │  已隐藏楼层: ${xray.hiddenFloorCount} 楼`,
+    `叙事健康度: 复读重叠率 ${repPct}%${repPct >= 42 ? " (⚠触发去重)" : " (正常)"}  │  距上次世界推进 ${stagTurns} 轮${stagTurns >= 4 ? " (⚠停滞)" : ""}`,
+    `记忆与隔离: 有效事实 ${xray.activeFactCount} 条 · FANToM 盲区保护 ${xray.blindSpotCount} 处 · 激活剧情卡 ${xray.activeStoryletTitles.length} 张`,
+  ];
+
+  if (xray.activeStoryletTitles.length > 0) {
+    lines.push(`触发 Storylets: ${xray.activeStoryletTitles.join("、")}`);
+  }
+
+  if (xray.recalled.length > 0) {
+    lines.push("", `【本轮召回条目 (${xray.recalled.length})】`);
+    for (const r of xray.recalled) {
+      const src = r.source === "memory_book" ? "记忆书" : "世界书";
+      const key = r.matchedKey ? ` 命中="${r.matchedKey}"` : "";
+      lines.push(`· [${src}/${r.reason}] ${r.title}${key} (分:${r.score} · ~${r.tokens}t)`);
+    }
+  } else {
+    lines.push("", "【本轮召回条目】无动态召回（仅 Zone 1 常驻设定生效）");
+  }
+
+  if (xray.gatedOut.length > 0) {
+    lines.push("", `【防剧透门禁拦截 (${xray.gatedOut.length})】${xray.gatedOut.slice(0, 6).map((g) => g.title).join("、")}`);
+  }
+  if (xray.budgetDropped.length > 0) {
+    lines.push(
+      "",
+      `【超出预算裁切 (${xray.budgetDropped.length})】${xray.budgetDropped
+        .slice(0, 5)
+        .map((d) => `${d.title}(${d.tokens}t)`)
+        .join("、")}`,
+    );
+  }
+
+  rt.pi.sendMessage(
+    {
+      customType: "rp:event",
+      content: lines.join("\n"),
+      display: true,
+      details: {
+        kind: "xray",
+        title: `${card.identity.name} · 上下文 X-Ray 透视`,
+        subtitle: `T${xray.turn} · KV×${xray.cacheHitStreak} · ~${totalTokens}t`,
+      },
+    },
+    { triggerTurn: false },
+  );
+}
+
+/** Reversible State Audit Log & 1-Click Undo (`/rp undo`). */
+export async function actionUndoTx(rt: RpRuntimeHandle, ctx: PiExtensionContext, autoLast = false): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const undoable = state.auditLog.filter((r) => Boolean(r.undoTx)).slice().reverse();
+  if (undoable.length === 0) {
+    ctx.ui.notify("暂无可撤销的状态变更记录。", "info");
+    return;
+  }
+
+  if (autoLast) {
+    const latest = undoable[0]!;
+    const ok = await ctx.ui.confirm("撤销最近一次状态变更？", `[T${latest.turn}] ${latest.summary}`);
+    if (!ok) return;
+    rt.commitTx(latest.undoTx!);
+    rt.refreshHud(ctx);
+    ctx.ui.notify(`↩ 已撤销：${latest.summary}`, "info");
+    return;
+  }
+
+  const opts = [
+    ...undoable.slice(0, 14).map((r, i) => `${i + 1}. [T${r.turn}] ${r.summary}`),
+    "✕ 取消",
+  ];
+  const pick = await ctx.ui.select(`↩ 状态变更审计日志（点击任一条目即可反向撤销 · 共 ${undoable.length} 条）`, opts);
+  if (!pick || pick.startsWith("✕")) return;
+  const idx = opts.indexOf(pick);
+  const chosen = undoable[idx];
+  if (!chosen?.undoTx) return;
+
+  rt.commitTx(chosen.undoTx);
+  rt.refreshHud(ctx);
+  ctx.ui.notify(`↩ 已反向撤销：[T${chosen.turn}] ${chosen.summary}`, "info");
+}
+
+/** Pick a dedicated fast/cheap model from `ctx.modelRegistry` for Sidecar settlement, Compaction & Loregen (`/rp sidecar`). */
+export async function actionSidecarModel(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const arg = argsText.trim();
+  if (arg === "default" || arg === "auto" || arg === "off") {
+    rt.commitTx({ kind: "config_patch", sidecarModel: null });
+    rt.refreshHud(ctx);
+    ctx.ui.notify("Sidecar 后台模型已恢复为：跟随当前主对话模型。", "info");
+    return;
+  }
+  if (arg) {
+    rt.commitTx({ kind: "config_patch", sidecarModel: arg });
+    rt.refreshHud(ctx);
+    ctx.ui.notify(`Sidecar 后台模型已设为：${arg}`, "info");
+    return;
+  }
+
+  const models = listRegistryModels(ctx);
+  const opts = [
+    "🔄 跟随当前主对话模型（默认）",
+    ...models.slice(0, 30).map((m) => `🤖 ${m.label}${m.isFastHint ? " ⚡推荐" : ""}`),
+    "✏️ 手动输入 provider/model-id",
+    "✕ 取消",
+  ];
+  const pick = await ctx.ui.select(
+    `🤖 选择 Sidecar 后台专职模型（当前：${state.sidecarModel || "跟随主模型"} · 用于后台结算/摘要/世界书生成）`,
+    opts,
+  );
+  if (!pick || pick.startsWith("✕")) return;
+
+  if (pick.startsWith("🔄")) {
+    rt.commitTx({ kind: "config_patch", sidecarModel: null });
+    rt.refreshHud(ctx);
+    ctx.ui.notify("Sidecar 后台模型已恢复为跟随主对话模型。", "info");
+    return;
+  }
+  if (pick.startsWith("✏️")) {
+    const manual = (await ctx.ui.input("输入 provider/model-id（如 google/gemini-2.5-flash）", state.sidecarModel ?? ""))?.trim();
+    if (!manual) return;
+    rt.commitTx({ kind: "config_patch", sidecarModel: manual });
+    rt.refreshHud(ctx);
+    ctx.ui.notify(`Sidecar 后台模型已设为：${manual}`, "info");
+    return;
+  }
+
+  const chosen = models[opts.indexOf(pick) - 1];
+  if (chosen) {
+    rt.commitTx({ kind: "config_patch", sidecarModel: chosen.key });
+    rt.refreshHud(ctx);
+    ctx.ui.notify(`Sidecar 后台模型已设为：${chosen.key}`, "info");
+  }
+}
+
+/** Asset Library CRUD manager (`/rp library`): inspect & safely delete cards, presets, and personas. */
+export async function actionManageLibrary(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const cards = listAllCardSummaries(ctx.cwd);
+    const presets = listPresetIds(ctx.cwd);
+    const personas = loadPersonas(ctx.cwd);
+    const pick = await ctx.ui.select("🗂 RP 资产库管理（项目库 & 全局库）", [
+      `🎭 管理已导入角色卡 (${cards.length} 张)`,
+      `🎛 管理已导入酒馆预设 (${presets.length} 个)`,
+      `🧑 管理已保存玩家马甲 (${personas.length} 个)`,
+      "← 返回",
+    ]);
+    if (!pick || pick.startsWith("←")) return;
+
+    if (pick.startsWith("🎭")) {
+      if (cards.length === 0) {
+        ctx.ui.notify("角色库为空。", "info");
+        continue;
+      }
+      const opts = [
+        ...cards.map((c) => `🗑 ${c.name} (${c.slug}) [${c.source === "project" ? "项目" : "全局库"} · 世界书 ${c.loreCount} 条]`),
+        "← 返回",
+      ];
+      const sub = await ctx.ui.select("选择要删除的角色卡（当前正在游玩的主卡受保护）", opts);
+      if (!sub || sub.startsWith("←")) continue;
+      const chosen = cards[opts.indexOf(sub)];
+      if (!chosen) continue;
+      if (rt.getState().active && rt.getState().cardSlug === chosen.slug) {
+        ctx.ui.notify("无法删除当前会话正在游玩的主角色卡，请先 /rp exit 或切换角色。", "warning");
+        continue;
+      }
+      const ok = await ctx.ui.confirm("确认删除角色卡？", `永久删除「${chosen.name}」(${chosen.slug}) 及其解包资源？`);
+      if (ok) {
+        deleteCompiledCard(chosen.baseDir, chosen.slug);
+        ctx.ui.notify(`已删除角色卡：${chosen.name}`, "info");
+      }
+    } else if (pick.startsWith("🎛")) {
+      if (presets.length === 0) {
+        ctx.ui.notify("暂无已导入的酒馆预设。", "info");
+        continue;
+      }
+      const sub = await ctx.ui.select("选择要删除的酒馆预设", [...presets.map((p) => `🗑 ${p}`), "← 返回"]);
+      if (!sub || sub.startsWith("←")) continue;
+      const id = sub.replace(/^🗑\s+/, "");
+      const ok = await ctx.ui.confirm("确认删除预设？", `删除预设「${id}」？`);
+      if (ok) {
+        deleteCompiledPreset(ctx.cwd, id);
+        if (rt.getState().presetId === id) {
+          rt.commitTx({ kind: "preset_set", presetId: null });
+          rt.reloadRuntime(ctx);
+        }
+        ctx.ui.notify(`已删除预设：${id}`, "info");
+      }
+    } else if (pick.startsWith("🧑")) {
+      if (personas.length === 0) {
+        ctx.ui.notify("暂无已保存的玩家马甲。", "info");
+        continue;
+      }
+      const opts = [...personas.map((p) => `🗑 ${p.name} (${p.id})`), "← 返回"];
+      const sub = await ctx.ui.select("选择要删除的玩家马甲", opts);
+      if (!sub || sub.startsWith("←")) continue;
+      const chosen = personas[opts.indexOf(sub)];
+      if (!chosen) continue;
+      const ok = await ctx.ui.confirm("确认删除玩家马甲？", `删除马甲「${chosen.name}」？`);
+      if (ok) {
+        deletePersona(ctx.cwd, chosen.id);
+        ctx.ui.notify(`已删除玩家马甲：${chosen.name}`, "info");
+      }
+    }
+  }
+}
+

@@ -6,6 +6,7 @@ import { applyAnalyzedProfileToCard, parseAnalyzeResponse } from "../src/parser/
 import { createInitialRpState, applyRpTx } from "../src/engine/state-replay.js";
 import { formatRpStatusLine } from "../src/ui/hud.js";
 import { buildZone3TransientTail } from "../src/context/zone-builder.js";
+import { evaluateNarrativeHealth } from "../src/engine/stagnation.js";
 import { runSidecarLightSettlement } from "../src/engine/settlement.js";
 import type { PiExtensionAPI, PiExtensionContext, RpTxEntry } from "../src/types.js";
 
@@ -232,12 +233,28 @@ test("Zone 3 applies List-First Epistemic Boundaries and NARRA-Gym anti-stagnati
     },
   });
 
-  const z3Mystery = buildZone3TransientTail({ card, state, recalledLore: [], recentText: "遗嘱" });
+  // Genuine stagnation: state.turn=5 and lastMeaningfulProgressTurn=0 (stagnantTurns=5 >= 4)
+  state.lastMeaningfulProgressTurn = 0;
+  const mysteryHealth = evaluateNarrativeHealth(state, []);
+  const z3Mystery = buildZone3TransientTail({
+    card,
+    state,
+    recalledLore: [],
+    recentText: "遗嘱",
+    narrativeHealth: mysteryHealth,
+  });
   assert.ok(z3Mystery.includes("[HIDDEN FROM: 管家] 玩家藏起了遗嘱原件"));
   assert.ok(z3Mystery.includes("Anti-stagnation cue"));
 
   state.archetype = "companion";
-  const z3Companion = buildZone3TransientTail({ card, state, recalledLore: [], recentText: "你好" });
+  const companionHealth = evaluateNarrativeHealth(state, []);
+  const z3Companion = buildZone3TransientTail({
+    card,
+    state,
+    recalledLore: [],
+    recentText: "你好",
+    narrativeHealth: companionHealth,
+  });
   assert.equal(z3Companion.includes("Anti-stagnation cue"), false);
 });
 
@@ -310,6 +327,7 @@ test("Forum workflows: actionImpersonate prefills editor via setEditorText witho
     getCard: () => card,
     getExtraCastCards: () => [],
     getPreset: () => null,
+    getLastXRay: () => null,
     commitTx() {
       txCount++;
     },

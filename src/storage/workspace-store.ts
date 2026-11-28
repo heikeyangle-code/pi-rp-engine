@@ -215,6 +215,36 @@ export function listPresetIds(cwd: string): string[] {
   return Array.from(ids).sort();
 }
 
+export function saveUpdatedCard(baseDir: string, card: CompiledCard): void {
+  card.frozen.constantLoreIds = card.loreBook.entries
+    .filter((e) => e.enabled && e.constant && [0, 1, 5, 6].includes(e.position))
+    .map((e) => e.id);
+  const constantCount = card.loreBook.entries.filter((e) => e.constant).length;
+  card.importReport.loreCount = card.loreBook.entries.length;
+  card.importReport.constantLoreCount = constantCount;
+  card.importReport.dynamicLoreCount = Math.max(0, card.loreBook.entries.length - constantCount);
+  writeJson(path.join(baseDir, "cards", card.slug, "card.compiled.json"), card);
+}
+
+export function deleteCompiledCard(baseDir: string, slug: string): boolean {
+  const cardDir = path.join(baseDir, "cards", slug);
+  if (!fs.existsSync(cardDir)) return false;
+  fs.rmSync(cardDir, { recursive: true, force: true });
+  return true;
+}
+
+export function deleteCompiledPreset(cwd: string, presetId: string): boolean {
+  let removed = false;
+  for (const base of [getProjectRpDir(cwd), getGlobalLibraryDir()]) {
+    const file = path.join(base, "presets", `${presetId}.json`);
+    if (fs.existsSync(file)) {
+      fs.rmSync(file, { force: true });
+      removed = true;
+    }
+  }
+  return removed;
+}
+
 export function mergeExternalLoreBook(baseDir: string, slug: string, extraBook: CompiledLoreBook): CompiledCard | null {
   const card = loadCompiledCard(baseDir, slug);
   if (!card) return null;
@@ -223,11 +253,8 @@ export function mergeExternalLoreBook(baseDir: string, slug: string, extraBook: 
     const uniqueId = existingIds.has(entry.id) ? `ext_${entry.id}_${existingIds.size}` : entry.id;
     existingIds.add(uniqueId);
     card.loreBook.entries.push({ ...entry, id: uniqueId });
-    if (entry.enabled && entry.constant && [0, 1, 5, 6].includes(entry.position)) {
-      card.frozen.constantLoreIds.push(uniqueId);
-    }
   }
-  writeJson(path.join(baseDir, "cards", slug, "card.compiled.json"), card);
+  saveUpdatedCard(baseDir, card);
   return card;
 }
 
@@ -250,3 +277,19 @@ export function savePersona(cwd: string, persona: PersonaProfile, scope: "projec
   else list.push(persona);
   writeJson(filePath, list);
 }
+
+export function deletePersona(cwd: string, personaId: string): boolean {
+  let removed = false;
+  for (const base of [getProjectRpDir(cwd), getGlobalLibraryDir()]) {
+    const filePath = path.join(base, "personas.json");
+    const list = readJsonSafe<PersonaProfile[]>(filePath);
+    if (!list) continue;
+    const next = list.filter((p) => p.id !== personaId);
+    if (next.length !== list.length) {
+      writeJson(filePath, next);
+      removed = true;
+    }
+  }
+  return removed;
+}
+

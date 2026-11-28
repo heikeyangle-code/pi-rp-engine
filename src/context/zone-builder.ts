@@ -1,5 +1,5 @@
 /**
- * Three-Zone KV-Cache Zero-Fragmentation Context Assembler.
+ * Three-Zone KV-Cache Zero-Fragmentation Context Assembler (v3).
  *
  * Strict Invariants:
  *  - Zone 1 (`before_agent_start`): 100% byte-identical across turns. Respects SillyTavern
@@ -11,27 +11,43 @@
  *    reliably on Pi SDK's `AgentMessage[]`.
  *  - Zone 3 (Transient tail frame via `context` hook): Attached ONLY to the final user message
  *    (or final message if none) of the outbound copy — NEVER persisted to JSONL. Includes:
- *    `<rp_state_frame>` (with milestones & flags), DREAM ABC beliefs, recalled lore (with preset `wiFormat`
- *    & dynamic `outlet` expansion), bi-temporal facts with FANToM blind spots, open foresights,
- *    optional Director Pacing cue, active director notes, preset tail prompts, `depth_prompt`,
+ *    `<rp_state_frame>` (with scene objective, milestones & flags), RoleMemo DualMem beliefs,
+ *    recalled lore + Memory Book chapters (with preset `wiFormat` & dynamic `outlet` expansion),
+ *    bi-temporal facts with FANToM blind spots, open foresights, condition-gated Storylets,
+ *    optional Inner Monologue cue, Director Pacing & notes, preset tail prompts, `depth_prompt`,
  *    and `post_history_instructions`.
  */
 
+import { createHash } from "node:crypto";
 import type {
   CompiledCard,
   CompiledLoreEntry,
   CompiledPreset,
+  MemoryBookEntry,
   PacingMode,
   PersonaProfile,
   PiContentBlock,
   PiMessage,
   SessionRpState,
+  StoryletEntry,
 } from "../types.js";
 import { evaluateMacros, type MacroContext } from "../parser/macros.js";
 import { computeMessageFingerprint } from "../engine/state-replay.js";
-import { getActiveFacts } from "../memory/bitemporal.js";
-import { partitionEpistemicFacts } from "../engine/gates.js";
+import { selectFactsForZone3 } from "../memory/bitemporal.js";
+import { evaluateGate, partitionEpistemicFacts } from "../engine/gates.js";
 import { selectActiveForesights } from "../memory/foresight.js";
+import { selectRelevantBeliefs } from "../memory/graph-ppr.js";
+import type { NarrativeHealthReport } from "../engine/stagnation.js";
+import { estimateTokens } from "./token-budget.js";
+
+function fnv1aSeed(str: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) {
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
 
 const ENGINE_PROTOCOL_COMPACT = `[RP Engine Protocol]
 - You are the sole narrative writer for this interactive world. Maintain consistent literary voice, given-circumstance character psychology, and organic pacing.
@@ -57,6 +73,45 @@ function stableStringify(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+/** Deterministic 12-char SHA-256 fingerprint of Zone 1 prefix for KV-Cache stability verification. */
+export function computeZone1Hash(zone1Text: string): string {
+  return createHash("sha256").update(zone1Text, "utf8").digest("hex").slice(0, 12);
+}
+
+/** Estimate total tokens across a message array (Zone 2 history). */
+export function computeMessagesTokens(messages: PiMessage[]): number {
+  let total = 0;
+  for (const m of messages) {
+    if (typeof m.content === "string") {
+      total += estimateTokens(m.content) + 4;
+    } else if (Array.isArray(m.content)) {
+      total += 4;
+      for (const b of m.content) {
+        if (b && typeof b === "object" && b.type === "text" && typeof b.text === "string") {
+          total += estimateTokens(b.text);
+        }
+      }
+    }
+  }
+  return total;
+}
+
+/** Evaluate armed/triggered storylets whose gate conditions currently match the world state. */
+export function evaluateActiveStorylets(state: SessionRpState): StoryletEntry[] {
+  const active: StoryletEntry[] = [];
+  for (const s of state.storylets.values()) {
+    if (s.status === "completed") continue;
+    if (s.status === "triggered") {
+      active.push(s);
+      continue;
+    }
+    if (s.status === "armed" && evaluateGate(s.gate, state)) {
+      active.push(s);
+    }
+  }
+  return active;
 }
 
 function collectStaticOutlets(card: CompiledCard, macroCtx: MacroContext): Record<string, string> {
@@ -101,11 +156,14 @@ export function buildZone1FrozenPrefix(options: {
   const { card, extraCastCards = [], preset, initialPersona } = options;
   const charName = card.identity.nickname || card.identity.name;
   const groupMembers = [charName, ...extraCastCards.map((c) => c.identity.nickname || c.identity.name)];
+  // Stable per-session deterministic seed ensures {{random}} / {{roll}} in Zone 1 NEVER break KV-Cache!
+  const zone1Seed = fnv1aSeed(`${card.id}:${initialPersona.name}`);
   const baseMacroCtx: MacroContext = {
     charName,
     userName: initialPersona.name,
     personaDescription: initialPersona.description,
     groupMembers,
+    deterministicSeed: zone1Seed,
   };
   const staticOutlets = collectStaticOutlets(card, baseMacroCtx);
   const macroCtx: MacroContext = { ...baseMacroCtx, outlets: staticOutlets };
@@ -165,6 +223,7 @@ export function buildZone1FrozenPrefix(options: {
       userName: initialPersona.name,
       personaDescription: initialPersona.description,
       groupMembers,
+      deterministicSeed: fnv1aSeed(`${co.id}:${initialPersona.name}`),
     };
     const parts: string[] = [`# Co-Character: ${coName}`];
     if (co.frozen.description.trim()) parts.push(evaluateMacros(co.frozen.description, coCtx));
@@ -212,11 +271,24 @@ export function buildZone3TransientTail(options: {
   state: SessionRpState;
   preset?: CompiledPreset | null;
   recalledLore: CompiledLoreEntry[];
+  recalledMemoryBooks?: MemoryBookEntry[];
   recentText: string;
   lastUserMessage?: string;
   lastCharMessage?: string;
+  narrativeHealth?: NarrativeHealthReport;
 }): string {
-  const { card, extraCastCards = [], state, preset, recalledLore, recentText, lastUserMessage, lastCharMessage } = options;
+  const {
+    card,
+    extraCastCards = [],
+    state,
+    preset,
+    recalledLore,
+    recalledMemoryBooks = [],
+    recentText,
+    lastUserMessage,
+    lastCharMessage,
+    narrativeHealth,
+  } = options;
   const charName = card.identity.nickname || card.identity.name;
   const groupMembers = [charName, ...extraCastCards.map((c) => c.identity.nickname || c.identity.name)];
 
@@ -267,6 +339,7 @@ export function buildZone3TransientTail(options: {
     turn: state.turn,
     time: state.worldTimeLabel || undefined,
     location: state.location || undefined,
+    objective: state.sceneObjective || undefined,
     presentNpcs: state.presentNpcs.length > 0 ? state.presentNpcs : undefined,
     milestones: sortedMilestones.length > 0 ? sortedMilestones : undefined,
     flags: activeFlags.length > 0 ? activeFlags : undefined,
@@ -304,7 +377,7 @@ export function buildZone3TransientTail(options: {
     );
   }
 
-  // 3. Recalled Lore + Bi-Temporal Facts (with Epistemic Blind Spots) + DREAM Beliefs + Foresights
+  // 3. Recalled Lore + Memory Books + Bi-Temporal Facts (with Epistemic Blind Spots) + RoleMemo DualMem Beliefs + Foresights
   const recalledSections: string[] = [];
 
   if (normalRecalledLore.length > 0) {
@@ -323,7 +396,14 @@ export function buildZone3TransientTail(options: {
     if (loreText) recalledSections.push(`## World Lore\n${loreText}`);
   }
 
-  const activeFacts = getActiveFacts(state).slice(0, 12);
+  if (recalledMemoryBooks.length > 0) {
+    const bookText = recalledMemoryBooks
+      .map((b) => `- [${b.title} | T${b.turnRange[0]}-T${b.turnRange[1]}] ${b.summary}`)
+      .join("\n");
+    recalledSections.push(`## Archived Story Chapters (Memory Books)\n${bookText}`);
+  }
+
+  const activeFacts = selectFactsForZone3(state, recentText, 8, 6);
   if (activeFacts.length > 0) {
     const { known, blindSpots } = partitionEpistemicFacts(activeFacts, state.presentNpcs);
     if (known.length > 0) {
@@ -340,21 +420,17 @@ export function buildZone3TransientTail(options: {
     }
   }
 
-  // DREAM ABC Character Beliefs (prioritize present NPCs, then latest shifts)
+  // RoleMemo DualMem Character Beliefs (query-relevant ranking by present NPCs + entity/token overlap + recency)
   if (state.beliefs.length > 0) {
-    const presentSet = new Set(state.presentNpcs.map((n) => n.toLowerCase()));
-    const relevantBeliefs = state.beliefs
-      .slice()
-      .sort((a, b) => {
-        const aPresent = presentSet.has(a.actorId.toLowerCase()) ? 1 : 0;
-        const bPresent = presentSet.has(b.actorId.toLowerCase()) ? 1 : 0;
-        return bPresent - aPresent || b.turn - a.turn;
-      })
-      .slice(0, 6);
+    const relevantBeliefs = selectRelevantBeliefs(state, recentText, 6);
     if (relevantBeliefs.length > 0) {
       recalledSections.push(
-        `## Character Beliefs (DREAM ABC)\n${relevantBeliefs
-          .map((b) => `- ${b.actorId} → ${b.target} [T${b.turn}]: ${b.belief} (because: ${b.activatingEvent})`)
+        `## Character Beliefs (DREAM ABC) · DualMem\n${relevantBeliefs
+          .map((b) => {
+            const tone = b.emotionalTone ? ` [${b.emotionalTone}]` : "";
+            const subtext = b.subjectiveInsight ? ` | inner subtext: ${b.subjectiveInsight}` : "";
+            return `- ${b.actorId} → ${b.target} [T${b.turn}]: ${b.belief}${tone} (because: ${b.activatingEvent})${subtext}`;
+          })
           .join("\n")}`,
       );
     }
@@ -371,24 +447,26 @@ export function buildZone3TransientTail(options: {
     parts.push(`<rp_recalled_context>\n${recalledSections.join("\n\n")}\n</rp_recalled_context>`);
   }
 
-  // 4. Optional Director Pacing, NARRA-Gym Anti-Stagnation Guard & Active Director Notes (/rp note)
+  // 4. Optional Director Pacing, Active Storylets, Genuine Narrative Health Guards & Active Director Notes
   const pacingCue = PACING_HINTS[state.pacingMode];
-  const needsAntiStagnation =
-    state.pacingMode === "balanced" &&
-    state.archetype !== "companion" &&
-    state.archetype !== "slice-of-life" &&
-    state.turn > 0 &&
-    state.turn % 5 === 0;
-  const antiStagnationCue = needsAntiStagnation
-    ? "Anti-stagnation cue: Introduce a concrete sensory detail, subtle consequence, or small narrative shift so the scene keeps organic forward momentum."
-    : null;
+  const activeStorylets = evaluateActiveStorylets(state);
   const noteLines = [
+    ...(state.sceneObjective ? [`- Scene Objective: ${state.sceneObjective}`] : []),
+    ...activeStorylets.map((s) => `- [Triggered Storylet · ${s.title}] ${s.triggerPrompt}`),
     ...(pacingCue ? [`- ${pacingCue}`] : []),
-    ...(antiStagnationCue ? [`- ${antiStagnationCue}`] : []),
+    ...(narrativeHealth?.antiRepetitionCue ? [`- ${narrativeHealth.antiRepetitionCue}`] : []),
+    ...(narrativeHealth?.antiStagnationCue ? [`- ${narrativeHealth.antiStagnationCue}`] : []),
     ...state.notes.map((n) => `- ${n.text}`),
   ];
   if (noteLines.length > 0) {
     parts.push(`<rp_director_note>\n${noteLines.join("\n")}\n</rp_director_note>`);
+  }
+
+  // 4b. Optional Inner Monologue cue (styled cleanly by Markdown transformer)
+  if (state.innerMonologue) {
+    parts.push(
+      `<rp_monologue_cue>\nBefore the visible narrative prose, briefly include 1-2 intimate sentences of the focal character's unspoken inner monologue wrapped in <thought>...</thought>. Keep it deeply in-character and never leak out-of-world meta commentary.\n</rp_monologue_cue>`,
+    );
   }
 
   // 5. Preset Zone 3 tail prompts (sorted by depth desc)
@@ -412,8 +490,8 @@ export function buildZone3TransientTail(options: {
 
 /**
  * Non-destructively filter hidden messages (matching entryId OR deterministic fingerprint)
- * & attach Zone 3 ONLY to the final user message (or final message if none) of the outbound copy.
- * Guarantees Zone 2 history objects are NEVER mutated.
+ * & attach Zone 3 ONLY to the very last message of the outbound copy.
+ * Guarantees Zone 2 prefix history objects are NEVER mutated (even during tool-call loops).
  */
 export function attachZone3ToMessages(
   messages: PiMessage[],
@@ -437,17 +515,10 @@ export function attachZone3ToMessages(
   if (!zone3Text.trim() || filtered.length === 0) return filtered;
 
   const out = filtered.slice();
-  // Prefer attaching to the last user/custom message when a toolResult is at the tail,
-  // or to the very last message otherwise.
-  let targetIdx = out.length - 1;
-  if (out[targetIdx]!.role === "toolResult") {
-    for (let i = out.length - 1; i >= 0; i--) {
-      if (out[i]!.role === "user") {
-        targetIdx = i;
-        break;
-      }
-    }
-  }
+  // STRICT KV-CACHE INVARIANT: ALWAYS attach Zone 3 to the VERY LAST message (`out[out.length - 1]`),
+  // even if it is a `toolResult` inside a multi-step tool loop. NEVER jump backwards to mutate
+  // an earlier `user` message — doing so invalidates the entire `user + toolCall + toolResult` prefix cache!
+  const targetIdx = out.length - 1;
   const target = out[targetIdx]!;
 
   if (typeof target.content === "string") {
@@ -466,9 +537,15 @@ export function attachZone3ToMessages(
   return out;
 }
 
-/** Extract plain text from the last N messages for lore/foresight recall. */
+/**
+ * Extract plain text from the last N in-character messages for lore/foresight recall.
+ * Explicitly skips `rp:ooc` and `rp:event` auxiliary cards so meta chatter never pollutes scanDepth!
+ */
 export function extractRecentMessagesText(messages: PiMessage[], depth = 4): string {
-  const slice = messages.slice(-Math.max(1, depth));
+  const inWorld = messages.filter(
+    (m) => m.customType !== "rp:ooc" && m.customType !== "rp:event" && m.role !== "toolResult",
+  );
+  const slice = inWorld.slice(-Math.max(1, depth));
   const chunks: string[] = [];
   for (const m of slice) {
     if (typeof m.content === "string") {

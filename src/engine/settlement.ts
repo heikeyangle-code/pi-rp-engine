@@ -1,12 +1,14 @@
 /**
  * Post-turn deterministic settlement (`turn_end`, < 2ms, ONLY on final narrative assistant step)
  * & closed-loop zero-TTFT asynchronous sidecar extractor (`agent_settled` / `agent_end`):
- *  - Passes active fact IDs so contradicted facts are cleanly invalidated (`invalidatedFactIds`,
- *    addressing NCP-Bench 2026's 40–68% fact-conflict failure mode).
- *  - Tracks universal spatio-temporal anchors (`location`, `presentNpcs`, `worldTimeLabel`).
- *  - Dynamically prunes the JSON schema based on `state.modules` (`stats`, `inventory`, `clocks`)
- *    so slice-of-life/companion cards never hallucinate RPG inventories.
- *  - Validates every extracted mutation against deterministic bounds/CFSM rules before committing.
+ *
+ * v3 Upgrades:
+ *  - Uses thinking-safe `extractJsonObject` & `resolveSidecarModel` with `maxTokens: 1100`.
+ *  - RoleMemo DualMem extraction: captures both objective world facts AND persona-conditioned
+ *    `subjectiveInsight` + `emotionalTone` on character beliefs.
+ *  - Auto-closes resolved foresights (`paidOffForesightIds`).
+ *  - Fixes private-fact witness bug: includes player persona + present NPCs so player-witnessed
+ *    secrets never lock out the player!
  */
 
 import type {
@@ -19,10 +21,11 @@ import type {
   SessionRpState,
 } from "../types.js";
 import { RP_ENTRY_TYPE, applyRpTx } from "./state-replay.js";
-import { canCompleteWithRegistry, completeWithRegistry } from "./llm-helper.js";
+import { canCompleteWithRegistry, completeWithRegistry, extractJsonObject, resolveSidecarModel } from "./llm-helper.js";
 import { computeCheckedStatValue, validateCfsmTransition, validateInventoryPatch } from "./cfsm.js";
-import { getActiveFacts } from "../memory/bitemporal.js";
+import { selectFactsForConflictCheck } from "../memory/bitemporal.js";
 import { tickLoreRuntime } from "../memory/graph-ppr.js";
+import { evaluateActiveStorylets } from "../context/zone-builder.js";
 
 /** Detect whether an assistant message is an intermediate tool-call step rather than a completed narrative turn. */
 export function isIntermediateToolCallMessage(msg: PiMessage | undefined): boolean {
@@ -87,26 +90,23 @@ export async function runSidecarLightSettlement(options: {
 }): Promise<number> {
   const { pi, ctx, state, lastUserText, lastAssistantText } = options;
   if (!state.active || state.settlementMode !== "sidecar-light") return 0;
-  if (!canCompleteWithRegistry(ctx)) return 0;
   if (!lastAssistantText.trim()) return 0;
 
-  let model = ctx.model;
-  if (state.sidecarModel && ctx.modelRegistry?.find) {
-    const [provider, id] = state.sidecarModel.split("/");
-    if (provider && id) {
-      model = ctx.modelRegistry?.find?.(provider, id) ?? model;
-    }
-  }
-  if (!model) return 0;
+  const model = resolveSidecarModel(ctx, state.sidecarModel);
+  if (!canCompleteWithRegistry(ctx, model)) return 0;
 
   const schemaFields: string[] = [
     `"location": string|null`,
     `"presentNpcs": string[]|null`,
     `"worldTimeLabel": string|null`,
+    `"sceneObjective": string|null`,
     `"facts": [{"statement":"...","entities":["..."],"public":true}]`,
     `"invalidatedFactIds": [{"id":"...","reason":"..."}]`,
-    `"beliefs": [{"actorId":"...","target":"...","activatingEvent":"...","belief":"..."}]`,
+    `"beliefs": [{"actorId":"...","target":"...","activatingEvent":"...","belief":"...","subjectiveInsight":"how this character emotionally interprets it","emotionalTone":"..."}]`,
     `"foresights": [{"summary":"...","triggerHint":"...","entities":["..."]}]`,
+    `"paidOffForesightIds": ["hook_id"]`,
+    `"completedStoryletIds": ["storylet_id"]`,
+    `"newStorylets": [{"title":"...","triggerPrompt":"...","requiredFlags":["..."],"minTurn":number|null}]`,
     `"cfsm": [{"actorId":"...","axis":"...","to":"...","reason":"..."}]`,
   ];
   if (state.modules.stats) {
@@ -120,14 +120,34 @@ export async function runSidecarLightSettlement(options: {
   }
 
   const systemPrompt =
-    `You are a silent RP world-state ledger extractor. Extract durable changes established by EITHER the player OR the narrative.\n` +
+    `You are a silent RP world-state ledger extractor (PDVA + RoleMemo DualMem + QBN Storylets). Extract durable changes established by EITHER the player OR the narrative.\n` +
     `Output ONLY strict JSON with optional fields:\n{${schemaFields.join(", ")}}\n` +
     `- Only include fields that genuinely changed this turn; omit unchanged fields or leave arrays empty.\n` +
-    `- If a new development contradicts or supersedes an existing active fact listed below, include its exact id in invalidatedFactIds.`;
+    `- If a new development contradicts or supersedes an active fact listed below, include its exact id in invalidatedFactIds.\n` +
+    `- If an open foresight listed below was resolved/fulfilled this turn, include its id in paidOffForesightIds.\n` +
+    `- If an active Storylet listed below was clearly played out / resolved this turn, include its exact id in completedStoryletIds.\n` +
+    `- Only add newStorylets when the narrative plants a concrete deferred turning point or confrontation.\n` +
+    `- For beliefs, capture BOTH the objective activatingEvent and the character's persona-conditioned subjectiveInsight.`;
 
-  const activeFactsSummary = getActiveFacts(state)
-    .slice(0, 15)
-    .map((f) => `[${f.id}] ${f.statement}`)
+  const conflictCandidates = selectFactsForConflictCheck(
+    state,
+    `${lastUserText}\n${lastAssistantText}`,
+    10,
+    15,
+  );
+  const activeFactsSummary = conflictCandidates
+    .map((f) => `[${f.id} | T${f.validFromTurn}] ${f.statement}`)
+    .join("\n");
+
+  const openHooksSummary = Array.from(state.foresights.values())
+    .filter((h) => h.status === "open")
+    .slice(0, 8)
+    .map((h) => `[${h.id}] ${h.summary}`)
+    .join("\n");
+
+  const activeStoryletsSummary = evaluateActiveStorylets(state)
+    .slice(0, 6)
+    .map((s) => `[${s.id}] ${s.title}: ${s.triggerPrompt}`)
     .join("\n");
 
   const contextHeader = [
@@ -135,6 +155,7 @@ export async function runSidecarLightSettlement(options: {
     state.era || null,
     state.worldTimeLabel || null,
     `Location: ${state.location || "(unset)"}`,
+    state.sceneObjective ? `Objective: ${state.sceneObjective}` : null,
     `Present: ${state.presentNpcs.join(", ") || "none"}`,
   ]
     .filter(Boolean)
@@ -143,32 +164,45 @@ export async function runSidecarLightSettlement(options: {
   try {
     const userPrompt =
       `${contextHeader}\n` +
-      (activeFactsSummary ? `Active Facts:\n${activeFactsSummary}\n\n` : "\n") +
-      `Player: ${lastUserText.slice(0, 600)}\n` +
-      `Narrative: ${lastAssistantText.slice(0, 1500)}`;
+      (activeFactsSummary ? `Active Facts (Recent + Entity-Matched):\n${activeFactsSummary}\n\n` : "") +
+      (openHooksSummary ? `Open Foresights:\n${openHooksSummary}\n\n` : "") +
+      (activeStoryletsSummary ? `Active Storylets:\n${activeStoryletsSummary}\n\n` : "") +
+      `Player (${state.currentPersona.name}): ${lastUserText.slice(0, 700)}\n` +
+      `Narrative: ${lastAssistantText.slice(0, 1800)}`;
+
     const rawText = await completeWithRegistry(ctx, model, {
       systemPrompt,
       userPrompt,
-      maxTokens: 700,
+      maxTokens: 1200,
       signal: ctx.signal,
     });
     if (!rawText) return 0;
 
-    const jsonMatch = /\{[\s\S]*\}/.exec(rawText);
-    if (!jsonMatch) return 0;
-    const parsed = JSON.parse(jsonMatch[0]!) as {
+    const parsed = extractJsonObject<{
       location?: string | null;
       presentNpcs?: string[] | null;
       worldTimeLabel?: string | null;
+      sceneObjective?: string | null;
       facts?: Array<{ statement?: string; entities?: string[]; public?: boolean }>;
       invalidatedFactIds?: Array<{ id?: string; reason?: string }>;
-      beliefs?: Array<{ actorId?: string; target?: string; activatingEvent?: string; belief?: string }>;
+      beliefs?: Array<{
+        actorId?: string;
+        target?: string;
+        activatingEvent?: string;
+        belief?: string;
+        subjectiveInsight?: string;
+        emotionalTone?: string;
+      }>;
       foresights?: Array<{ summary?: string; triggerHint?: string; entities?: string[] }>;
+      paidOffForesightIds?: string[];
+      completedStoryletIds?: string[];
+      newStorylets?: Array<{ title?: string; triggerPrompt?: string; requiredFlags?: string[]; minTurn?: number | null }>;
       cfsm?: Array<{ actorId?: string; axis?: string; to?: string; reason?: string }>;
       stats?: Array<{ actorId?: string; key?: string; op?: "set" | "add"; value?: number | string | boolean; reason?: string }>;
       inventory?: Array<{ actorId?: string; item?: string; delta?: number; note?: string }>;
       clocks?: Array<{ clockId?: string; label?: string; delta?: number; max?: number }>;
-    };
+    }>(rawText);
+    if (!parsed) return 0;
 
     let committed = 0;
     const commit = (tx: RpTxEntry) => {
@@ -177,7 +211,7 @@ export async function runSidecarLightSettlement(options: {
       committed++;
     };
 
-    // 1. Spatio-temporal updates (location / presentNpcs / worldTimeLabel)
+    // 1. Spatio-temporal updates
     const nextLocation = typeof parsed.location === "string" && parsed.location.trim() ? parsed.location.trim() : null;
     const nextPresent = Array.isArray(parsed.presentNpcs)
       ? parsed.presentNpcs.map((x) => String(x).trim()).filter(Boolean)
@@ -201,6 +235,14 @@ export async function runSidecarLightSettlement(options: {
       commit({ kind: "clock_tick", beatDelta: 0, worldTimeLabel: parsed.worldTimeLabel.trim() });
     }
 
+    if (
+      typeof parsed.sceneObjective === "string" &&
+      parsed.sceneObjective.trim() &&
+      parsed.sceneObjective.trim() !== state.sceneObjective
+    ) {
+      commit({ kind: "scene_objective_set", objective: parsed.sceneObjective.trim() });
+    }
+
     // 2. Non-destructive invalidation of superseded facts
     for (const inv of parsed.invalidatedFactIds ?? []) {
       const factId = typeof inv.id === "string" ? inv.id.trim() : "";
@@ -211,38 +253,44 @@ export async function runSidecarLightSettlement(options: {
         kind: "fact_invalidate",
         factId,
         validUntilTurn: state.turn,
-        reason: typeof inv.reason === "string" && inv.reason.trim() ? inv.reason.trim() : "superseded",
+        reason: typeof inv.reason === "string" && inv.reason.trim() ? `sidecar:${inv.reason.trim()}` : "sidecar:superseded",
       });
     }
 
-    // 3. New bi-temporal facts
+    // 3. New bi-temporal facts (includes both validFromTurn and ingestedAtTurn + eventTimeLabel!)
     for (const f of parsed.facts ?? []) {
       if (!f.statement?.trim()) continue;
+      const privateWitnesses = Array.from(new Set([state.currentPersona.name, ...state.presentNpcs].filter(Boolean)));
       const fact: BiTemporalFact = {
         id: `fact_t${state.turn}_${committed}`,
         statement: f.statement.trim(),
         entities: Array.isArray(f.entities) ? f.entities.map(String) : [],
         validFromTurn: state.turn,
         validUntilTurn: null,
-        witnessIds: f.public === false && state.presentNpcs.length > 0 ? [...state.presentNpcs] : "public",
+        ingestedAtTurn: state.turn,
+        eventTimeLabel: state.worldTimeLabel || undefined,
+        witnessIds: f.public === false && privateWitnesses.length > 0 ? privateWitnesses : "public",
       };
       commit({ kind: "fact_add", fact });
     }
 
-    // 4. DREAM belief shifts
+    // 4. RoleMemo DualMem beliefs & subjective insights
     for (const b of parsed.beliefs ?? []) {
       if (!b.actorId?.trim() || !b.belief?.trim()) continue;
       commit({
         kind: "belief_update",
+        id: `belief_t${state.turn}_${committed}`,
         actorId: b.actorId.trim(),
-        target: b.target?.trim() || "player",
+        target: b.target?.trim() || state.currentPersona.name,
         activatingEvent: b.activatingEvent?.trim() || "recent scene",
         belief: b.belief.trim(),
+        subjectiveInsight: typeof b.subjectiveInsight === "string" && b.subjectiveInsight.trim() ? b.subjectiveInsight.trim() : undefined,
+        emotionalTone: typeof b.emotionalTone === "string" && b.emotionalTone.trim() ? b.emotionalTone.trim() : undefined,
         turn: state.turn,
       });
     }
 
-    // 5. Foresights
+    // 5. Foresights (plant new + auto-payoff resolved hooks)
     for (const h of parsed.foresights ?? []) {
       if (!h.summary?.trim()) continue;
       commit({
@@ -257,8 +305,44 @@ export async function runSidecarLightSettlement(options: {
         },
       });
     }
+    for (const hookId of parsed.paidOffForesightIds ?? []) {
+      const existing = typeof hookId === "string" ? state.foresights.get(hookId.trim()) : undefined;
+      if (existing && existing.status === "open") {
+        commit({ kind: "foresight_upsert", hook: { ...existing, status: "paid_off" } });
+      }
+    }
 
-    // 6. CFSM transitions (strictly validated)
+    // 5b. Storylet completion (auto-applies postEffects!) & dynamic new storylets
+    for (const sid of parsed.completedStoryletIds ?? []) {
+      const existing = typeof sid === "string" ? state.storylets.get(sid.trim()) : undefined;
+      if (existing && existing.status !== "completed") {
+        commit({ kind: "storylet_upsert", storylet: { ...existing, status: "completed" } });
+      }
+    }
+    for (const ns of parsed.newStorylets ?? []) {
+      if (!ns.title?.trim() || !ns.triggerPrompt?.trim()) continue;
+      const gate: Record<string, unknown> = {};
+      if (Array.isArray(ns.requiredFlags) && ns.requiredFlags.length > 0) {
+        gate.requiredFlags = ns.requiredFlags.map((x) => String(x).trim()).filter(Boolean);
+      }
+      if (typeof ns.minTurn === "number" && ns.minTurn > 0) {
+        gate.minTurn = Math.trunc(ns.minTurn);
+      }
+      commit({
+        kind: "storylet_upsert",
+        storylet: {
+          id: `st_t${state.turn}_${committed}`,
+          title: ns.title.trim(),
+          triggerPrompt: ns.triggerPrompt.trim(),
+          gate: Object.keys(gate).length > 0 ? (gate as any) : undefined,
+          oneTime: true,
+          status: "armed",
+          createdTurn: state.turn,
+        },
+      });
+    }
+
+    // 6. CFSM transitions (strictly validated against adjacent transitions)
     for (const c of parsed.cfsm ?? []) {
       if (!c.actorId?.trim() || !c.axis?.trim() || !c.to?.trim()) continue;
       const check = validateCfsmTransition(state, c.actorId.trim(), c.axis.trim(), c.to.trim());
@@ -270,7 +354,7 @@ export async function runSidecarLightSettlement(options: {
         axis: c.axis.trim(),
         from,
         to: c.to.trim(),
-        reason: c.reason?.trim() || "sidecar",
+        reason: c.reason?.trim() ? `sidecar:${c.reason.trim()}` : "sidecar",
         turn: state.turn,
       });
     }
@@ -284,7 +368,7 @@ export async function runSidecarLightSettlement(options: {
         const op = s.op === "add" ? "add" : "set";
         const check = computeCheckedStatValue(state, actorId, key, op, s.value);
         if (!check.ok) continue;
-        commit({ kind: "stat_patch", actorId, key, op, value: s.value, reason: s.reason?.trim() || "sidecar" });
+        commit({ kind: "stat_patch", actorId, key, op, value: s.value, reason: s.reason?.trim() ? `sidecar:${s.reason.trim()}` : "sidecar" });
       }
     }
 
@@ -296,7 +380,7 @@ export async function runSidecarLightSettlement(options: {
         if (!item || delta === 0) continue;
         const check = validateInventoryPatch(state, actorId, item, delta);
         if (!check.ok) continue;
-        commit({ kind: "inventory_patch", actorId, item, delta, note: inv.note?.trim() || "sidecar" });
+        commit({ kind: "inventory_patch", actorId, item, delta, note: inv.note?.trim() ? `sidecar:${inv.note.trim()}` : "sidecar" });
       }
     }
 

@@ -12,6 +12,43 @@ export interface ValidationResult {
   clampedValue?: number | string | boolean;
 }
 
+/**
+ * Build default step-by-step bidirectional adjacency transitions for an ordered state list
+ * (e.g. ["陌生", "熟悉", "信任", "亲密"] -> each state can only move to adjacent states,
+ * preventing 1-turn jumps from "敌对" straight to "死心塌地").
+ */
+export function buildAdjacentTransitions(states: string[]): Record<string, string[]> {
+  const transitions: Record<string, string[]> = {};
+  for (let i = 0; i < states.length; i++) {
+    const curr = states[i]!;
+    const neighbors: string[] = [];
+    if (i > 0) neighbors.push(states[i - 1]!);
+    if (i + 1 < states.length) neighbors.push(states[i + 1]!);
+    transitions[curr] = neighbors;
+  }
+  return transitions;
+}
+
+/** Normalize a CFSM axis definition, auto-generating adjacent transitions if omitted. */
+export function normalizeCfsmAxisDef(def: CfsmAxisDef): CfsmAxisDef {
+  const uniqueStates = Array.from(new Set(def.states.map((s) => s.trim()).filter(Boolean)));
+  const initial = uniqueStates.includes(def.initial) ? def.initial : uniqueStates[0] ?? def.initial;
+  const hasExplicitTransitions =
+    def.transitions &&
+    typeof def.transitions === "object" &&
+    Object.keys(def.transitions).length > 0;
+  return {
+    axis: def.axis.trim(),
+    states: uniqueStates,
+    initial,
+    transitions: hasExplicitTransitions
+      ? def.transitions
+      : uniqueStates.length >= 2
+        ? buildAdjacentTransitions(uniqueStates)
+        : undefined,
+  };
+}
+
 export function validateCfsmTransition(
   state: SessionRpState,
   actorId: string,

@@ -14,8 +14,8 @@ import type {
 } from "../types.js";
 import { RP_ENTRY_TYPE, applyRpTx } from "../engine/state-replay.js";
 import { rollDiceCheck } from "../engine/dice.js";
-import { computeCheckedStatValue, validateCfsmTransition } from "../engine/cfsm.js";
-import { recallLoreWithGraphPpr } from "../memory/graph-ppr.js";
+import { computeCheckedStatValue, validateCfsmTransition, validateInventoryPatch } from "../engine/cfsm.js";
+import { recallLoreWithGraphPpr, tokenizeHybrid } from "../memory/graph-ppr.js";
 import { getActiveFacts } from "../memory/bitemporal.js";
 import { isFactVisibleToActor } from "../engine/gates.js";
 import { createLinesComponent, styleBold, styleDim, styleFg, wrapDisplayLine } from "../ui/renderers.js";
@@ -297,10 +297,15 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
 
       if (Array.isArray(params.inventory)) {
         for (const item of params.inventory as Array<Record<string, unknown>>) {
-          const actorId = String(item.actor ?? "player");
+          const actorId = String(item.actor ?? item.actorId ?? "player");
           const name = String(item.item ?? "");
           const delta = Number(item.delta ?? 0);
           if (!name || !Number.isFinite(delta) || delta === 0) continue;
+          const invCheck = validateInventoryPatch(state, actorId, name, delta);
+          if (!invCheck.ok) {
+            rejected.push(`${actorId}.inv[${name}]: ${invCheck.error ?? "insufficient"}`);
+            continue;
+          }
           rt.commitTx({
             kind: "inventory_patch",
             actorId,
@@ -380,6 +385,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       ].filter(Boolean);
 
       return {
+        isError: applied.length === 0 && rejected.length > 0 ? true : undefined,
         content: [{ type: "text", text: lines.join("\n") }],
         details: { applied, rejected },
       };
@@ -432,6 +438,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               target: { type: "string" },
               activatingEvent: { type: "string" },
               belief: { type: "string" },
+              subjectiveInsight: { type: "string", description: "Optional character-subjective inner subtext (DualMem)" },
+              emotionalTone: { type: "string", description: "Optional emotional tone label" },
             },
             required: ["actor", "target", "activatingEvent", "belief"],
           },
@@ -489,6 +497,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             entities: Array.isArray(f.entities) ? f.entities.map(String) : [],
             validFromTurn: state.turn,
             validUntilTurn: null,
+            ingestedAtTurn: state.turn,
+            eventTimeLabel: state.worldTimeLabel || undefined,
             witnessIds: Array.isArray(f.witnesses) ? f.witnesses.map(String) : "public",
             causeEvent: typeof f.causeEvent === "string" ? f.causeEvent : undefined,
           };
@@ -520,6 +530,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             target: String(b.target ?? ""),
             activatingEvent: String(b.activatingEvent ?? ""),
             belief: String(b.belief ?? ""),
+            subjectiveInsight: typeof b.subjectiveInsight === "string" ? b.subjectiveInsight.trim() || undefined : undefined,
+            emotionalTone: typeof b.emotionalTone === "string" ? b.emotionalTone.trim() || undefined : undefined,
             turn: state.turn,
           });
           log.push(`belief(${String(b.actor)}->${String(b.target)})`);
@@ -601,9 +613,32 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       });
 
       const qLower = query.toLowerCase();
+      const qTokens = new Set(tokenizeHybrid(qLower));
       const matchedFacts = getActiveFacts(state)
-        .filter((f) => f.statement.toLowerCase().includes(qLower) || f.entities.some((e) => e.toLowerCase().includes(qLower)))
+        .filter((f) => {
+          if (f.statement.toLowerCase().includes(qLower) || f.entities.some((e) => e.toLowerCase().includes(qLower))) {
+            return true;
+          }
+          if (qTokens.size === 0) return false;
+          const factTokens = tokenizeHybrid(`${f.statement} ${f.entities.join(" ")}`);
+          let hits = 0;
+          for (const t of factTokens) {
+            if (qTokens.has(t)) hits++;
+          }
+          return hits >= Math.min(2, qTokens.size);
+        })
         .slice(0, 6);
+
+      const matchedBooks = Array.from(state.memoryBooks.values())
+        .filter(
+          (b) =>
+            b.enabled &&
+            (b.title.toLowerCase().includes(qLower) ||
+              b.summary.toLowerCase().includes(qLower) ||
+              b.keywords.some((k) => k.toLowerCase().includes(qLower)) ||
+              b.entities.some((e) => e.toLowerCase().includes(qLower))),
+        )
+        .slice(0, 4);
 
       const matchedHooks = Array.from(state.foresights.values())
         .filter((h) => h.status === "open" && (h.summary.toLowerCase().includes(qLower) || h.triggerHint.toLowerCase().includes(qLower)))
@@ -612,6 +647,13 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const parts: string[] = [];
       if (loreRes.selected.length > 0) {
         parts.push(`## Recalled Lore\n${loreRes.selected.map((e) => `### ${e.title}\n${e.content}`).join("\n\n")}`);
+      }
+      if (matchedBooks.length > 0) {
+        parts.push(
+          `## Matching Memory Books\n${matchedBooks
+            .map((b) => `### ${b.title} (T${b.turnRange[0]}-T${b.turnRange[1]})\n${b.summary}`)
+            .join("\n\n")}`,
+        );
       }
       if (matchedFacts.length > 0) {
         parts.push(`## Matching Facts\n${matchedFacts.map((f) => `- [T${f.validFromTurn}] ${f.statement}`).join("\n")}`);
@@ -622,7 +664,11 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
 
       return {
         content: [{ type: "text", text: parts.length ? parts.join("\n\n") : `No records matched "${query}".` }],
-        details: { loreCount: loreRes.selected.length, factCount: matchedFacts.length },
+        details: {
+          loreCount: loreRes.selected.length,
+          memoryBookCount: matchedBooks.length,
+          factCount: matchedFacts.length,
+        },
       };
     },
   });
@@ -735,7 +781,9 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const situation = String(params.situation ?? "").trim();
       const visibleFacts = getActiveFacts(state).filter((f) => isFactVisibleToActor(f, actor));
       const actorBeliefs = state.beliefs.filter((b) => b.actorId.toLowerCase() === actor.toLowerCase()).slice(-6);
-      const actorCfsm = state.cfsmStates[actor] ?? {};
+      const actorLower = actor.toLowerCase();
+      const cfsmKey = Object.keys(state.cfsmStates).find((k) => k.toLowerCase() === actorLower);
+      const actorCfsm = cfsmKey ? state.cfsmStates[cfsmKey] ?? {} : {};
 
       const lines: string[] = [`# Isolated Epistemic View: ${actor}`];
       if (situation) lines.push(`Situation: ${situation}`);
@@ -748,8 +796,14 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       );
       if (actorBeliefs.length > 0) {
         lines.push(
-          `Personal Beliefs (DREAM ABC):\n` +
-            actorBeliefs.map((b) => `- About ${b.target}: ${b.belief} (from: ${b.activatingEvent})`).join("\n"),
+          `Personal Beliefs (DREAM ABC · DualMem):\n` +
+            actorBeliefs
+              .map((b) => {
+                const sub = b.subjectiveInsight ? ` | inner subtext: ${b.subjectiveInsight}` : "";
+                const tone = b.emotionalTone ? ` [${b.emotionalTone}]` : "";
+                return `- About ${b.target}: ${b.belief}${tone} (from: ${b.activatingEvent})${sub}`;
+              })
+              .join("\n"),
         );
       }
       lines.push("Rule: This NPC MUST act strictly within the facts and beliefs above; do NOT leak unwitnessed player secrets.");

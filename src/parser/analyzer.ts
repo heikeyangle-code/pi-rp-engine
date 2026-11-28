@@ -1,18 +1,20 @@
 /**
- * L1 On-Demand One-Click AI Deep Card Analyzer (`/rp analyze`).
+ * L1 One-Click LLM Card Deep Analyzer (`/rp analyze`) — v4 World-Class 7-Dimension Narrative Extractor.
  *
- * Performs a single structured extraction pass (inspired by NCP-Bench 2026 & Mem0 2026) over a
- * compiled card's prose (`description`, `personality`, `scenario`, `first_mes`, and lorebook index)
- * to produce a universal `CardWorldProfile`:
- *  - Detects `archetype` and which optional modules (`stats`, `inventory`, `clocks`, `stages`) fit.
- *  - Extracts implicit spatio-temporal anchors (`initialLocation`, `initialTime`, `initialStage`, `initialPresentNpcs`).
- *  - Extracts implicit starting items (`initialInventory`) and numeric stats (`initialStats`) from prose.
- *  - Proposes character psychological/relationship `CfsmAxisDef` axes.
- *  - Builds an `entityAliases` map to boost 2-hop PPR recall on plain-text lorebooks.
- *  - Suggests physical `GateCondition` locks for late-game / spoiler lorebook entries.
+ * Designed to elevate BOTH pure-text literary cards and hybrid/variable cards into full living worlds:
+ *  1) Spatio-temporal & Scene Objective: archetype, modules, location, time, stage, objective, present NPCs
+ *  2) Multi-Actor Variables & Inventory: player/world/NPC stats with bounds, semantic notes, categories & items
+ *  3) Multi-Actor CFSM Emotional/Relationship State Machines: step-by-step transition graphs per character
+ *  4) RoleMemo DualMem Initial Beliefs: initial character impressions & psychological subtext
+ *  5) FANToM Epistemic Facts & Hidden Secrets: public facts vs secret facts with strict `witnessIds` blind spots
+ *  6) EverMemOS Foresights: planted Chekhov's guns, mysteries, and ticking hooks
+ *  7) Condition-Gated Storylets (QBN) & Clocks: plot twists with `GateCondition` (incl. `statChecks`) & `postEffects`,
+ *     plus entity aliases & spoiler lore gates.
+ *
+ * Permanently cached into `card.compiled.json` (`card.worldProfile` + merged `salvagedStateSchema`)
+ * so every new session hydrates the full structured world in <2ms with 0 repeat LLM cost!
  */
 
-import { canCompleteWithRegistry, completeWithRegistry } from "../engine/llm-helper.js";
 import type {
   CardArchetype,
   CardWorldProfile,
@@ -21,7 +23,11 @@ import type {
   GateCondition,
   PiExtensionContext,
   SalvagedVariable,
+  StoryletEntry,
+  WorldProfileModules,
 } from "../types.js";
+import { completeWithRegistry, extractJsonObject, resolveSidecarModel } from "../engine/llm-helper.js";
+import { normalizeCfsmAxisDef } from "../engine/cfsm.js";
 
 const VALID_ARCHETYPES = new Set<CardArchetype>([
   "companion",
@@ -32,45 +38,201 @@ const VALID_ARCHETYPES = new Set<CardArchetype>([
   "ensemble",
 ]);
 
+const VALID_VAR_CATEGORIES = new Set<NonNullable<SalvagedVariable["category"]>>([
+  "stat",
+  "inventory",
+  "clock",
+  "flag",
+  "anchor",
+]);
+
 export interface AnalyzeCardResult {
   profile: CardWorldProfile;
   initialStats: SalvagedVariable[];
 }
 
-export function buildAnalyzePrompt(card: CompiledCard): { systemPrompt: string; userPrompt: string } {
-  const loreIndex = card.loreBook.entries
-    .slice(0, 60)
-    .map((e) => `- [${e.id}] ${e.title}${e.keys.length ? ` (keys: ${e.keys.slice(0, 5).join(", ")})` : ""}: ${e.content.slice(0, 90).replace(/\s+/g, " ")}`)
-    .join("\n");
+function parseGateFromRaw(r: Record<string, unknown>): GateCondition | undefined {
+  const gate: GateCondition = {};
+  if (Array.isArray(r.requiredFlags)) {
+    const flags = r.requiredFlags.map((x) => String(x).trim()).filter(Boolean);
+    if (flags.length > 0) gate.requiredFlags = flags;
+  }
+  if (Array.isArray(r.forbiddenFlags)) {
+    const flags = r.forbiddenFlags.map((x) => String(x).trim()).filter(Boolean);
+    if (flags.length > 0) gate.forbiddenFlags = flags;
+  }
+  if (typeof r.minTurn === "number" && r.minTurn > 0) gate.minTurn = Math.trunc(r.minTurn);
+  if (typeof r.requiredEra === "string" && r.requiredEra.trim()) gate.requiredEra = r.requiredEra.trim();
+  if (Array.isArray(r.requiredLocations)) {
+    const locs = r.requiredLocations.map((x) => String(x).trim()).filter(Boolean);
+    if (locs.length > 0) gate.requiredLocations = locs;
+  }
+  if (Array.isArray(r.requiredNpcPresent)) {
+    const npcs = r.requiredNpcPresent.map((x) => String(x).trim()).filter(Boolean);
+    if (npcs.length > 0) gate.requiredNpcPresent = npcs;
+  }
+  if (Array.isArray(r.statChecks)) {
+    const checks: NonNullable<GateCondition["statChecks"]> = [];
+    for (const c of r.statChecks) {
+      if (!c || typeof c !== "object") continue;
+      const cr = c as Record<string, unknown>;
+      const key = typeof cr.key === "string" && cr.key.trim() ? cr.key.trim() : "";
+      const gte = typeof cr.gte === "number" ? cr.gte : undefined;
+      const lte = typeof cr.lte === "number" ? cr.lte : undefined;
+      if (!key || (gte === undefined && lte === undefined)) continue;
+      const actorId = typeof cr.actorId === "string" && cr.actorId.trim() ? cr.actorId.trim() : undefined;
+      checks.push({ actorId, key, gte, lte });
+    }
+    if (checks.length > 0) gate.statChecks = checks;
+  }
+  return Object.keys(gate).length > 0 ? gate : undefined;
+}
 
-  const systemPrompt =
-    `You are a universal RP world-profile analyzer. Inspect the character card and return ONLY strict JSON (no markdown commentary) with this schema:\n` +
-    `{\n` +
-    `  "archetype": "companion" | "slice-of-life" | "rpg-sandbox" | "mystery" | "epic-saga" | "ensemble",\n` +
-    `  "modules": { "stats": boolean, "inventory": boolean, "clocks": boolean, "stages": boolean },\n` +
-    `  "initialLocation": string | null,\n` +
-    `  "initialTime": string | null,\n` +
-    `  "initialStage": string | null,\n` +
-    `  "initialPresentNpcs": string[],\n` +
-    `  "initialInventory": [{ "item": string, "count": number }],\n` +
-    `  "initialStats": [{ "key": string, "initialValue": number|string|boolean, "min"?: number, "max"?: number }],\n` +
-    `  "suggestedCfsmAxes": [{ "axis": string, "states": string[], "initial": string }],\n` +
-    `  "entityAliases": { "CanonicalName": ["Alias1", "Alias2"] },\n` +
-    `  "suggestedLoreGates": [{ "entryId": string, "requiredEra"?: string, "minTurn"?: number, "reason": string }]\n` +
-    `}\n` +
-    `Rules:\n` +
-    `- Only enable modules genuinely fitting this card. For pure 1v1 romance/companion/slice-of-life cards, set stages=false and inventory=false unless explicitly warranted.\n` +
-    `- Set initialStage ONLY if the card truly has multi-act/era/chapter/phase progression; otherwise null.\n` +
-    `- Extract concrete starting items mentioned in scenario/first_mes into initialInventory.\n` +
-    `- Only propose suggestedLoreGates for lorebook entries that clearly contain late-game spoilers, later eras, or hidden mysteries.`;
+export function buildAnalyzePrompt(card: CompiledCard): { systemPrompt: string; userPrompt: string } {
+  const systemPrompt = `You are a world-class interactive fiction & roleplay structural architect.
+Inspect the character card (whether it is a pure-text literary card or a card with explicit variables) and extract a complete, faithful 7-dimension narrative blueprint.
+Return ONLY a strict JSON object (no markdown fences, no commentary) matching this schema:
+{
+  "archetype": "companion" | "slice-of-life" | "rpg-sandbox" | "mystery" | "epic-saga" | "ensemble",
+  "modules": { "stats": boolean, "inventory": boolean, "clocks": boolean, "stages": boolean },
+  "initialLocation": string | null,
+  "initialTime": string | null,
+  "initialStage": string | null,
+  "initialObjective": string | null,
+  "initialPresentNpcs": string[],
+  "initialInventory": [{ "actorId": "player" | "<npcName>", "item": string, "count": number }],
+  "initialStats": [
+    {
+      "actorId": "player" | "world" | "<npcName>",
+      "key": string,
+      "initialValue": number | string | boolean,
+      "category": "stat" | "flag" | "anchor",
+      "min": number | null,
+      "max": number | null,
+      "note": string | null
+    }
+  ],
+  "suggestedCfsmAxes": [
+    {
+      "actorId": "<npcName>",
+      "axis": string,
+      "states": string[],
+      "initial": string,
+      "transitions": { "<state>": ["<nextState>"] } | null
+    }
+  ],
+  "initialBeliefs": [
+    {
+      "actorId": "<npcName>",
+      "target": "player" | "<npcName>",
+      "activatingEvent": string,
+      "belief": string,
+      "subjectiveInsight": string,
+      "emotionalTone": string
+    }
+  ],
+  "initialFacts": [
+    {
+      "statement": string,
+      "entities": string[],
+      "witnessIds": "public" | string[]
+    }
+  ],
+  "initialForesights": [
+    {
+      "summary": string,
+      "triggerHint": string,
+      "entities": string[]
+    }
+  ],
+  "initialStorylets": [
+    {
+      "title": string,
+      "triggerPrompt": string,
+      "gate": {
+        "minTurn": number | null,
+        "requiredFlags": string[],
+        "forbiddenFlags": string[],
+        "requiredLocations": string[],
+        "requiredNpcPresent": string[],
+        "statChecks": [{ "actorId": string | null, "key": string, "gte": number | null, "lte": number | null }]
+      },
+      "postEffects": { "setFlags": { "<flag>": boolean }, "nextObjective": string | null },
+      "oneTime": boolean
+    }
+  ],
+  "initialClocks": [{ "clockId": string, "label": string, "value": number, "max": number }],
+  "entityAliases": { "<canonicalName>": ["<alias1>", "<alias2>"] },
+  "suggestedLoreGates": [
+    {
+      "entryId": string,
+      "requiredFlags": string[],
+      "minTurn": number | null,
+      "requiredEra": string | null,
+      "statChecks": [{ "actorId": string | null, "key": string, "gte": number | null, "lte": number | null }],
+      "reason": string
+    }
+  ]
+}
+Strict Quality Rules:
+1. PURE-TEXT CARD INTELLIGENCE: Even if the card has zero explicit numeric status bars, carefully identify implied trackable narrative states (e.g. affection/trust/suspicion/sanity/favor/money/health/clothing/mood), unspoken secrets, foreshadowed mysteries, character inner attitudes, and natural turning points described in the prose.
+2. FAITHFULNESS & ZERO BLOAT: Stay 100% loyal to the card's actual genre. Do NOT invent RPG HP/MP/inventory/clocks for a pure romantic slice-of-life card unless genuinely present in the text. Keep every list crisp and high-signal (e.g. 2-8 stats, 1-4 CFSM axes, 1-4 initial beliefs, 2-6 key facts/secrets, 1-4 foresights, 1-3 storylets, 0-3 clocks).
+3. MULTI-ACTOR PRECISION: Assign exact "actorId" ("player", "world", or specific character name) to every stat, inventory item, and CFSM axis. If L0 salvaged variables are provided below, refine their actorId/bounds/notes instead of duplicating them.
+4. BIPOLAR SCALES: For affection/trust/reputation/suspicion, allow negative min (e.g. -100..100) when appropriate; never force negative initial values to 0.
+5. EPISTEMIC SECRETS (FANToM): If a character hides a secret, true identity, or hidden agenda from the player or another NPC, record it in "initialFacts" with witnessIds listing ONLY who knows (e.g. ["<npcName>"]) instead of "public"!
+6. STEPWISE CFSM: Order states gradually (e.g. ["戒备","试探","信任","依恋"]) so relationships evolve organically.
+7. SPOILER LORE GATES: Only gate lorebook entries that contain genuine late-game twists, secret identities, or sealed truths.
+8. LANGUAGE: Write all extracted labels, beliefs, facts, foresights, and storylets in the primary language of the character card.`;
+
+  // Prioritize constant, high-priority, and spoiler-candidate entries up to 140 entries within a smart budget
+  const prioritizedLore = [...card.loreBook.entries]
+    .sort((a, b) => Number(b.constant) - Number(a.constant) || b.priority - a.priority)
+    .slice(0, 140);
+
+  let loreChars = 0;
+  const maxLoreChars = 9000;
+  const loreLines: string[] = [];
+  for (const e of prioritizedLore) {
+    const excerptLen = e.constant ? 240 : 140;
+    const line = `- id="${e.id}" title="${e.title}" keys=[${e.keys.slice(0, 6).join(", ")}] constant=${e.constant}: ${e.content
+      .replace(/\s+/g, " ")
+      .slice(0, excerptLen)}`;
+    if (loreChars + line.length > maxLoreChars) break;
+    loreLines.push(line);
+    loreChars += line.length + 1;
+  }
+
+  const salvagedSummary =
+    card.salvagedStateSchema.length > 0
+      ? card.salvagedStateSchema
+          .slice(0, 40)
+          .map(
+            (v) =>
+              `- [${v.actorId ?? card.identity.name}] (${v.category ?? "stat"}) ${v.key} = ${JSON.stringify(v.initialValue)}${
+                v.min !== undefined || v.max !== undefined ? ` [${v.min ?? ""}..${v.max ?? ""}]` : ""
+              }${v.note ? ` // ${v.note}` : ""}`,
+          )
+          .join("\n")
+      : "";
+
+  const altGreetingsSummary =
+    card.greetings.alternates.length > 0
+      ? card.greetings.alternates
+          .slice(0, 3)
+          .map((g, i) => `Alt Greeting #${i + 1}: ${g.replace(/\s+/g, " ").slice(0, 500)}`)
+          .join("\n")
+      : "";
 
   const userPrompt = [
-    `# Card: ${card.identity.name}${card.identity.nickname ? ` (${card.identity.nickname})` : ""}`,
-    card.frozen.description ? `## Description\n${card.frozen.description.slice(0, 2200)}` : "",
-    card.frozen.personality ? `## Personality\n${card.frozen.personality.slice(0, 1000)}` : "",
-    card.frozen.scenario ? `## Scenario\n${card.frozen.scenario.slice(0, 1200)}` : "",
-    card.greetings.firstMes ? `## First Message\n${card.greetings.firstMes.slice(0, 1800)}` : "",
-    loreIndex ? `## Lorebook Index (${card.loreBook.entries.length} entries)\n${loreIndex}` : "",
+    `Card Name: ${card.identity.name}${card.identity.nickname ? ` (nickname: ${card.identity.nickname})` : ""}`,
+    card.meta.tags.length ? `Tags: ${card.meta.tags.join(", ")}` : "",
+    card.frozen.description ? `Description:\n${card.frozen.description.slice(0, 5500)}` : "",
+    card.frozen.personality ? `Personality:\n${card.frozen.personality.slice(0, 2200)}` : "",
+    card.frozen.scenario ? `Scenario:\n${card.frozen.scenario.slice(0, 2600)}` : "",
+    card.greetings.firstMes ? `First Message:\n${card.greetings.firstMes.slice(0, 3200)}` : "",
+    altGreetingsSummary ? `Alternate Greetings Preview:\n${altGreetingsSummary}` : "",
+    salvagedSummary ? `Already Extracted L0 Variables (${card.salvagedStateSchema.length} total):\n${salvagedSummary}` : "",
+    loreLines.length > 0 ? `Lorebook Entries (${loreLines.length}/${card.loreBook.entries.length} shown):\n${loreLines.join("\n")}` : "",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -79,173 +241,342 @@ export function buildAnalyzePrompt(card: CompiledCard): { systemPrompt: string; 
 }
 
 export function parseAnalyzeResponse(rawText: string, card: CompiledCard): AnalyzeCardResult | null {
-  const jsonMatch = /\{[\s\S]*\}/.exec(rawText);
-  if (!jsonMatch) return null;
+  const parsed = extractJsonObject<Record<string, unknown>>(rawText);
+  if (!parsed) return null;
 
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(jsonMatch[0]!) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
+  const archetype: CardArchetype =
+    typeof parsed.archetype === "string" && VALID_ARCHETYPES.has(parsed.archetype as CardArchetype)
+      ? (parsed.archetype as CardArchetype)
+      : card.worldProfile?.archetype ?? "companion";
 
-  const rawArchetype = typeof parsed.archetype === "string" ? (parsed.archetype as CardArchetype) : "companion";
-  const archetype: CardArchetype = VALID_ARCHETYPES.has(rawArchetype) ? rawArchetype : "companion";
-
-  const rawModules = (parsed.modules && typeof parsed.modules === "object" ? parsed.modules : {}) as Record<string, unknown>;
-  const modules = {
-    stats: Boolean(rawModules.stats),
-    inventory: Boolean(rawModules.inventory),
-    clocks: Boolean(rawModules.clocks),
-    stages: Boolean(rawModules.stages),
+  const rawMod = (parsed.modules && typeof parsed.modules === "object" ? parsed.modules : {}) as Record<string, unknown>;
+  const fallbackMods = card.worldProfile?.modules ?? { stats: false, inventory: false, clocks: false, stages: false };
+  const modules: WorldProfileModules = {
+    stats: typeof rawMod.stats === "boolean" ? rawMod.stats : fallbackMods.stats,
+    inventory: typeof rawMod.inventory === "boolean" ? rawMod.inventory : fallbackMods.inventory,
+    clocks: typeof rawMod.clocks === "boolean" ? rawMod.clocks : fallbackMods.clocks,
+    stages: typeof rawMod.stages === "boolean" ? rawMod.stages : fallbackMods.stages,
   };
 
-  const optStr = (v: unknown): string | undefined =>
-    typeof v === "string" && v.trim().length > 0 ? v.trim().slice(0, 48) : undefined;
-
+  const asOptStr = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
   const initialPresentNpcs = Array.isArray(parsed.initialPresentNpcs)
-    ? parsed.initialPresentNpcs.map((x) => String(x).trim()).filter(Boolean).slice(0, 12)
+    ? parsed.initialPresentNpcs.map((x) => String(x).trim()).filter(Boolean)
     : [];
 
-  const initialInventory: Array<{ item: string; count: number }> = [];
+  const initialInventory: Array<{ actorId?: string; item: string; count: number }> = [];
   if (Array.isArray(parsed.initialInventory)) {
-    for (const entry of parsed.initialInventory) {
-      if (!entry || typeof entry !== "object") continue;
-      const rec = entry as Record<string, unknown>;
-      const item = typeof rec.item === "string" ? rec.item.trim() : "";
-      const count = typeof rec.count === "number" && Number.isFinite(rec.count) ? Math.max(1, Math.round(rec.count)) : 1;
-      if (item && item.length <= 40) initialInventory.push({ item, count });
+    for (const row of parsed.initialInventory) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const item = asOptStr(r.item);
+      const count = typeof r.count === "number" && r.count > 0 ? Math.trunc(r.count) : 1;
+      const actorId = asOptStr(r.actorId);
+      if (item) initialInventory.push({ actorId, item, count });
     }
   }
 
   const initialStats: SalvagedVariable[] = [];
   if (Array.isArray(parsed.initialStats)) {
-    for (const entry of parsed.initialStats) {
-      if (!entry || typeof entry !== "object") continue;
-      const rec = entry as Record<string, unknown>;
-      const key = typeof rec.key === "string" ? rec.key.trim() : "";
-      const val = rec.initialValue;
+    for (const row of parsed.initialStats) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const key = asOptStr(r.key);
+      const val = r.initialValue;
       if (!key || (typeof val !== "number" && typeof val !== "string" && typeof val !== "boolean")) continue;
+      const rawMin = typeof r.min === "number" ? r.min : undefined;
+      const rawMax = typeof r.max === "number" ? r.max : undefined;
+      const safeMin = typeof val === "number" && rawMin !== undefined && val < rawMin ? val : rawMin;
+      const safeMax = typeof val === "number" && rawMax !== undefined && val > rawMax ? val : rawMax;
+      const rawCat = asOptStr(r.category) as SalvagedVariable["category"] | undefined;
+      const category = rawCat && VALID_VAR_CATEGORIES.has(rawCat) ? rawCat : "stat";
       initialStats.push({
         key,
         initialValue: val,
-        min: typeof rec.min === "number" ? rec.min : undefined,
-        max: typeof rec.max === "number" ? rec.max : undefined,
-        source: "first_mes",
+        actorId: asOptStr(r.actorId) ?? card.identity.name,
+        category,
+        min: safeMin,
+        max: safeMax,
+        note: asOptStr(r.note),
+        source: "llm_analyze",
       });
     }
   }
 
-  const suggestedCfsmAxes: CfsmAxisDef[] = [];
+  const suggestedCfsmAxes: Array<CfsmAxisDef & { actorId?: string }> = [];
   if (Array.isArray(parsed.suggestedCfsmAxes)) {
-    for (const ax of parsed.suggestedCfsmAxes) {
-      if (!ax || typeof ax !== "object") continue;
-      const rec = ax as Record<string, unknown>;
-      const axis = typeof rec.axis === "string" ? rec.axis.trim() : "";
-      const states = Array.isArray(rec.states) ? rec.states.map((s) => String(s).trim()).filter(Boolean) : [];
-      const initial = typeof rec.initial === "string" && states.includes(rec.initial.trim()) ? rec.initial.trim() : states[0];
+    for (const row of parsed.suggestedCfsmAxes) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const axis = asOptStr(r.axis);
+      const states = Array.isArray(r.states) ? r.states.map((s) => String(s).trim()).filter(Boolean) : [];
+      const initial = asOptStr(r.initial) ?? states[0];
+      const transitions =
+        r.transitions && typeof r.transitions === "object" && !Array.isArray(r.transitions)
+          ? (r.transitions as Record<string, string[]>)
+          : undefined;
       if (axis && states.length >= 2 && initial) {
-        suggestedCfsmAxes.push({ axis, states, initial });
+        suggestedCfsmAxes.push({
+          ...normalizeCfsmAxisDef({ axis, states, initial, transitions }),
+          actorId: asOptStr(r.actorId) ?? card.identity.name,
+        });
       }
+    }
+  }
+
+  const initialBeliefs: NonNullable<CardWorldProfile["initialBeliefs"]> = [];
+  if (Array.isArray(parsed.initialBeliefs)) {
+    for (const row of parsed.initialBeliefs) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const actorId = asOptStr(r.actorId) ?? card.identity.name;
+      const target = asOptStr(r.target) ?? "player";
+      const belief = asOptStr(r.belief);
+      if (!belief) continue;
+      initialBeliefs.push({
+        actorId,
+        target,
+        activatingEvent: asOptStr(r.activatingEvent) ?? "初始设定",
+        belief,
+        subjectiveInsight: asOptStr(r.subjectiveInsight),
+        emotionalTone: asOptStr(r.emotionalTone),
+      });
+    }
+  }
+
+  const initialFacts: NonNullable<CardWorldProfile["initialFacts"]> = [];
+  if (Array.isArray(parsed.initialFacts)) {
+    for (const row of parsed.initialFacts) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const statement = asOptStr(r.statement);
+      if (!statement) continue;
+      const entities = Array.isArray(r.entities) ? r.entities.map((e) => String(e).trim()).filter(Boolean) : [];
+      const witnessIds: string[] | "public" =
+        r.witnessIds === "public"
+          ? "public"
+          : Array.isArray(r.witnessIds)
+            ? r.witnessIds.map((w) => String(w).trim()).filter(Boolean)
+            : "public";
+      initialFacts.push({
+        statement,
+        entities,
+        witnessIds: Array.isArray(witnessIds) && witnessIds.length === 0 ? "public" : witnessIds,
+      });
+    }
+  }
+
+  const initialForesights: NonNullable<CardWorldProfile["initialForesights"]> = [];
+  if (Array.isArray(parsed.initialForesights)) {
+    for (const row of parsed.initialForesights) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const summary = asOptStr(r.summary);
+      if (!summary) continue;
+      const triggerHint = asOptStr(r.triggerHint) ?? "剧情推进至关键转折时";
+      const entities = Array.isArray(r.entities) ? r.entities.map((e) => String(e).trim()).filter(Boolean) : [];
+      initialForesights.push({ summary, triggerHint, entities });
+    }
+  }
+
+  const initialStorylets: NonNullable<CardWorldProfile["initialStorylets"]> = [];
+  if (Array.isArray(parsed.initialStorylets)) {
+    for (const row of parsed.initialStorylets) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const title = asOptStr(r.title);
+      const triggerPrompt = asOptStr(r.triggerPrompt);
+      if (!title || !triggerPrompt) continue;
+      const gate =
+        r.gate && typeof r.gate === "object" && !Array.isArray(r.gate)
+          ? parseGateFromRaw(r.gate as Record<string, unknown>)
+          : undefined;
+      let postEffects: StoryletEntry["postEffects"];
+      if (r.postEffects && typeof r.postEffects === "object" && !Array.isArray(r.postEffects)) {
+        const pe = r.postEffects as Record<string, unknown>;
+        const setFlags: Record<string, boolean> = {};
+        if (pe.setFlags && typeof pe.setFlags === "object" && !Array.isArray(pe.setFlags)) {
+          for (const [fk, fv] of Object.entries(pe.setFlags as Record<string, unknown>)) {
+            if (fk.trim() && typeof fv === "boolean") setFlags[fk.trim()] = fv;
+          }
+        }
+        const nextObjective = asOptStr(pe.nextObjective);
+        if (Object.keys(setFlags).length > 0 || nextObjective) {
+          postEffects = {
+            setFlags: Object.keys(setFlags).length > 0 ? setFlags : undefined,
+            nextObjective,
+          };
+        }
+      }
+      initialStorylets.push({
+        title,
+        triggerPrompt,
+        gate,
+        postEffects,
+        oneTime: typeof r.oneTime === "boolean" ? r.oneTime : true,
+      });
+    }
+  }
+
+  const initialClocks: NonNullable<CardWorldProfile["initialClocks"]> = [];
+  if (Array.isArray(parsed.initialClocks)) {
+    for (const row of parsed.initialClocks) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const label = asOptStr(r.label);
+      const clockId = asOptStr(r.clockId) ?? (label ? label.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_") : "");
+      const max = typeof r.max === "number" && r.max >= 2 ? Math.trunc(r.max) : 6;
+      const value = typeof r.value === "number" && r.value >= 0 ? Math.min(max, Math.trunc(r.value)) : 0;
+      if (label && clockId) initialClocks.push({ clockId, label, value, max });
     }
   }
 
   const entityAliases: Record<string, string[]> = {};
   if (parsed.entityAliases && typeof parsed.entityAliases === "object" && !Array.isArray(parsed.entityAliases)) {
-    for (const [canon, vals] of Object.entries(parsed.entityAliases as Record<string, unknown>)) {
-      const cleanCanon = canon.trim();
-      if (!cleanCanon || !Array.isArray(vals)) continue;
-      const list = vals.map((v) => String(v).trim()).filter((v) => v.length >= 2 && v.length <= 36);
-      if (list.length > 0) entityAliases[cleanCanon] = Array.from(new Set(list));
+    for (const [k, v] of Object.entries(parsed.entityAliases as Record<string, unknown>)) {
+      if (!k.trim() || !Array.isArray(v)) continue;
+      const aliases = v.map((x) => String(x).trim()).filter(Boolean);
+      if (aliases.length > 0) entityAliases[k.trim()] = aliases;
     }
   }
 
   const loreById = new Map(card.loreBook.entries.map((e) => [e.id, e]));
   const suggestedLoreGates: CardWorldProfile["suggestedLoreGates"] = [];
   if (Array.isArray(parsed.suggestedLoreGates)) {
-    for (const g of parsed.suggestedLoreGates) {
-      if (!g || typeof g !== "object") continue;
-      const rec = g as Record<string, unknown>;
-      const entryId = typeof rec.entryId === "string" ? rec.entryId.trim() : "";
-      const lore = loreById.get(entryId);
-      if (!lore) continue;
-      const gate: GateCondition = {};
-      if (typeof rec.requiredEra === "string" && rec.requiredEra.trim()) gate.requiredEra = rec.requiredEra.trim();
-      if (typeof rec.minTurn === "number" && Number.isFinite(rec.minTurn) && rec.minTurn > 0) gate.minTurn = Math.round(rec.minTurn);
-      if (Object.keys(gate).length === 0) continue;
+    for (const row of parsed.suggestedLoreGates) {
+      if (!row || typeof row !== "object") continue;
+      const r = row as Record<string, unknown>;
+      const entryId = asOptStr(r.entryId);
+      if (!entryId || !loreById.has(entryId)) continue;
+      const gate = parseGateFromRaw(r);
+      if (!gate) continue;
       suggestedLoreGates.push({
         entryId,
-        title: lore.title,
+        title: loreById.get(entryId)!.title,
         gate,
-        reason: typeof rec.reason === "string" ? rec.reason.trim() : "LLM detected late-game content",
+        reason: asOptStr(r.reason) ?? "spoiler_protection",
       });
     }
   }
 
-  const profile: CardWorldProfile = {
-    archetype,
-    modules,
-    initialLocation: optStr(parsed.initialLocation),
-    initialTime: optStr(parsed.initialTime),
-    initialStage: modules.stages ? optStr(parsed.initialStage) : undefined,
-    initialPresentNpcs,
-    initialInventory,
-    suggestedCfsmAxes,
-    entityAliases,
-    suggestedLoreGates,
-    source: "llm-analyzed",
-  };
+  // Auto-enable stats/inventory/clocks modules if concrete items were extracted
+  if (initialStats.length > 0) modules.stats = true;
+  if (initialInventory.length > 0) modules.inventory = true;
+  if (initialClocks.length > 0) modules.clocks = true;
 
-  return { profile, initialStats };
+  return {
+    profile: {
+      archetype,
+      modules,
+      initialLocation: asOptStr(parsed.initialLocation),
+      initialTime: asOptStr(parsed.initialTime),
+      initialStage: modules.stages ? asOptStr(parsed.initialStage) : undefined,
+      initialObjective: asOptStr(parsed.initialObjective),
+      initialPresentNpcs,
+      initialInventory,
+      initialStats: initialStats.length > 0 ? initialStats : undefined,
+      suggestedCfsmAxes,
+      initialBeliefs: initialBeliefs.length > 0 ? initialBeliefs : undefined,
+      initialFacts: initialFacts.length > 0 ? initialFacts : undefined,
+      initialForesights: initialForesights.length > 0 ? initialForesights : undefined,
+      initialStorylets: initialStorylets.length > 0 ? initialStorylets : undefined,
+      initialClocks: initialClocks.length > 0 ? initialClocks : undefined,
+      entityAliases,
+      suggestedLoreGates,
+      source: "llm-analyzed",
+    },
+    initialStats,
+  };
 }
 
-/** Merge analyzed `entityAliases` and confirmed `suggestedLoreGates` into a compiled card in place. */
-export function applyAnalyzedProfileToCard(card: CompiledCard, profile: CardWorldProfile, applyGates = true): void {
-  card.worldProfile = profile;
+/**
+ * Permanently apply an analyzed WorldProfile to a CompiledCard in place:
+ *  - Saves all 7 extracted dimensions into `card.worldProfile`
+ *  - Merges `initialStats` into `card.salvagedStateSchema` (deduplicated by `actorId::key`)
+ *  - Propagates `entityAliases` to card identity & lorebook entities
+ *  - Optionally attaches `suggestedLoreGates` to spoiler lorebook entries
+ */
+export function applyAnalyzedProfileToCard(
+  card: CompiledCard,
+  profile: CardWorldProfile,
+  applySpoilerGates = true,
+  extraInitialStats?: SalvagedVariable[],
+): void {
+  const mergedStatsInput = extraInitialStats ?? profile.initialStats ?? [];
+  card.worldProfile = {
+    ...profile,
+    initialStats: mergedStatsInput.length > 0 ? mergedStatsInput : profile.initialStats,
+  };
 
-  // Propagate entity aliases into card identity & matching lorebook entries for richer 2-hop PPR recall
-  for (const [canon, aliases] of Object.entries(profile.entityAliases)) {
-    if (
-      canon.toLowerCase() === card.identity.name.toLowerCase() ||
-      (card.identity.nickname && canon.toLowerCase() === card.identity.nickname.toLowerCase())
-    ) {
-      card.identity.aliases = Array.from(new Set([...card.identity.aliases, ...aliases]));
+  // Merge LLM-analyzed stats into salvagedStateSchema without losing L0 explicit variables
+  if (mergedStatsInput.length > 0) {
+    const byKey = new Map<string, SalvagedVariable>();
+    for (const v of card.salvagedStateSchema) {
+      const id = `${(v.actorId ?? card.identity.name).toLowerCase()}::${v.key.toLowerCase()}`;
+      byKey.set(id, v);
     }
-    const canonLower = canon.toLowerCase();
+    for (const v of mergedStatsInput) {
+      const id = `${(v.actorId ?? card.identity.name).toLowerCase()}::${v.key.toLowerCase()}`;
+      const existing = byKey.get(id);
+      if (existing) {
+        // Enrich existing L0 variable with LLM bounds/note/category if missing, never overwrite explicit L0 initialValue
+        byKey.set(id, {
+          ...existing,
+          actorId: existing.actorId ?? v.actorId,
+          category: existing.category ?? v.category,
+          min: existing.min ?? v.min,
+          max: existing.max ?? v.max,
+          note: existing.note ?? v.note,
+        });
+      } else {
+        byKey.set(id, { ...v });
+      }
+    }
+    card.salvagedStateSchema = Array.from(byKey.values());
+  }
+
+  const charAliases = new Set(card.identity.aliases);
+  for (const [canonical, aliases] of Object.entries(profile.entityAliases)) {
+    if (canonical.toLowerCase() === card.identity.name.toLowerCase()) {
+      for (const a of aliases) charAliases.add(a);
+    }
     for (const entry of card.loreBook.entries) {
-      const mentionsCanon =
-        entry.entities.some((e) => e.toLowerCase() === canonLower) ||
-        entry.title.toLowerCase().includes(canonLower) ||
-        entry.content.toLowerCase().includes(canonLower);
-      if (mentionsCanon) {
-        entry.entities = Array.from(new Set([...entry.entities, canon, ...aliases]));
+      const hasCanonical =
+        entry.entities.some((e) => e.toLowerCase() === canonical.toLowerCase()) ||
+        entry.title.toLowerCase().includes(canonical.toLowerCase());
+      if (hasCanonical) {
+        const merged = new Set(entry.entities);
+        merged.add(canonical);
+        for (const a of aliases) merged.add(a);
+        entry.entities = Array.from(merged);
       }
     }
   }
+  card.identity.aliases = Array.from(charAliases);
 
-  if (applyGates) {
-    const loreById = new Map(card.loreBook.entries.map((e) => [e.id, e]));
-    for (const sg of profile.suggestedLoreGates) {
-      const entry = loreById.get(sg.entryId);
-      if (!entry) continue;
-      entry.gate = { ...(entry.gate ?? {}), ...sg.gate };
+  if (applySpoilerGates) {
+    const byId = new Map(card.loreBook.entries.map((e) => [e.id, e]));
+    for (const g of profile.suggestedLoreGates) {
+      const entry = byId.get(g.entryId);
+      if (entry && !entry.gate) {
+        entry.gate = { ...g.gate };
+      }
     }
   }
 }
 
-/** Execute one-click LLM analysis of a compiled card via Pi's `ctx.modelRegistry.complete`. */
+/** Run the L1 LLM deep analysis using Pi's official ModelRegistry (preferring `sidecarModel` if configured). */
 export async function analyzeCardWithModel(
   ctx: PiExtensionContext,
   card: CompiledCard,
+  sidecarModelKey?: string,
 ): Promise<AnalyzeCardResult | null> {
-  if (!canCompleteWithRegistry(ctx)) return null;
+  const model = resolveSidecarModel(ctx, sidecarModelKey);
   const { systemPrompt, userPrompt } = buildAnalyzePrompt(card);
-  const rawText = await completeWithRegistry(ctx, ctx.model, {
+  const raw = await completeWithRegistry(ctx, model, {
     systemPrompt,
     userPrompt,
-    maxTokens: 1200,
+    maxTokens: 2800,
     signal: ctx.signal,
   });
-  if (!rawText) return null;
-  return parseAnalyzeResponse(rawText, card);
+  return parseAnalyzeResponse(raw, card);
 }

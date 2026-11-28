@@ -14,7 +14,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { PiExtensionContext } from "../types.js";
+import type { PiExtensionContext, QuickReplyItem } from "../types.js";
 import { getGlobalLibraryDir } from "../storage/workspace-store.js";
 import { inspectImportFileQuick } from "../parser/unpack.js";
 
@@ -31,7 +31,16 @@ export interface CandidateFile {
 interface UiPrefs {
   lastImportDir?: string;
   lastPersonaId?: string;
+  quickReplies?: QuickReplyItem[];
 }
+
+export const DEFAULT_QUICK_REPLIES: QuickReplyItem[] = [
+  { id: "qr_observe", label: "👀 环顾四周与细察神情", text: "*我放慢呼吸，仔细打量周围的环境细节与对方细微的神情变化。*", mode: "send" },
+  { id: "qr_silent", label: "🤫 沉默注视等待反应", text: "*我没有立刻开口，只是安静地看着对方，等待接下来的反应。*", mode: "send" },
+  { id: "qr_tension", label: "⚡ 导演指令：升温冲突", text: "本回合提高戏剧张力，让潜藏的矛盾或意外细节浮出水面。", mode: "steer" },
+  { id: "qr_slow", label: "🌙 导演指令：放缓节奏细腻描写", text: "本回合放缓叙事节奏，多用感官细节、微表情与留白来刻画氛围。", mode: "steer" },
+  { id: "qr_dialogue", label: "💬 预填动作+对白模板", text: "*（动作与神态）* 「……」", mode: "editor" },
+];
 
 const VALID_EXTS = new Set([".png", ".charx", ".json"]);
 const SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", ".cache"]);
@@ -69,6 +78,16 @@ export function saveUiPrefs(patch: Partial<UiPrefs>): void {
   } catch {
     // Non-fatal
   }
+}
+
+export function loadQuickReplies(): QuickReplyItem[] {
+  const saved = loadUiPrefs().quickReplies;
+  if (Array.isArray(saved) && saved.length > 0) return saved;
+  return DEFAULT_QUICK_REPLIES.map((item) => ({ ...item }));
+}
+
+export function saveQuickReplies(items: QuickReplyItem[]): void {
+  saveUiPrefs({ quickReplies: items });
 }
 
 /** Normalize user-pasted or dragged-and-dropped file paths (strip quotes, ~, escaped spaces). */

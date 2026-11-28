@@ -1,5 +1,5 @@
 /**
- * Core types for pi-rp-engine v2.
+ * Core types for pi-rp-engine v3.
  * Zero third-party runtime dependencies: structural types match the official
  * @earendil-works/pi-coding-agent (1.6.1+) ExtensionAPI so the extension compiles
  * cleanly standalone and loads directly via Pi VIRTUAL_MODULES.
@@ -63,6 +63,14 @@ export interface PiSessionManager {
   getCwd?(): string;
 }
 
+export interface PiTuiLike {
+  requestRender?: () => void;
+}
+
+export interface PiKeybindingsLike {
+  matches?: (data: string, action: string) => boolean;
+}
+
 export interface PiUiContext {
   notify(message: string, level?: "info" | "warning" | "error"): void;
   setStatus(key: string, text: string | undefined): void;
@@ -81,14 +89,28 @@ export interface PiUiContext {
   editor(title: string, initialText?: string): Promise<string | undefined>;
   setEditorText(text: string): void;
   custom?<T = unknown>(
-    factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result?: T) => void) => unknown,
-    options?: { overlay?: boolean },
+    factory: (
+      tui: PiTuiLike,
+      theme: unknown,
+      keybindings: PiKeybindingsLike,
+      done: (result?: T) => void,
+    ) => unknown,
+    options?: { overlay?: boolean; overlayOptions?: Record<string, unknown> },
   ): Promise<T | undefined>;
 }
 
+export interface PiModelDescriptor {
+  provider?: string;
+  id?: string;
+  name?: string;
+  contextWindow?: number;
+  [key: string]: unknown;
+}
+
 export interface PiModelRegistry {
-  getAvailable?(): unknown[];
-  find?(provider: string, modelId: string): unknown;
+  getAvailable?(): PiModelDescriptor[];
+  getAll?(): PiModelDescriptor[];
+  find?(provider: string, modelId: string): PiModelDescriptor | undefined;
   streamSimple?(
     model: unknown,
     context: { systemPrompt?: string; messages: Array<{ role: string; content: string | PiContentBlock[]; timestamp?: number }> },
@@ -205,7 +227,11 @@ export type CardSpecOrigin = "v1" | "v2" | "v3" | "charx";
 export interface SalvagedVariable {
   key: string;
   initialValue: number | string | boolean;
-  source: "mvu" | "macro" | "first_mes" | "constant_lore";
+  source: "mvu" | "macro" | "first_mes" | "constant_lore" | "init_var" | "html_table" | "llm_analyze";
+  /** Owner namespace: "player" | "world" | specific NPC/character name (defaults to card character if omitted) */
+  actorId?: string;
+  /** Semantic routing category so bind hydrates stats, inventory, flags, clocks & anchors into the right subsystem */
+  category?: "stat" | "inventory" | "clock" | "flag" | "anchor";
   min?: number;
   max?: number;
   note?: string;
@@ -264,9 +290,49 @@ export interface CardWorldProfile {
   initialLocation?: string;
   initialTime?: string;
   initialStage?: string;
+  initialObjective?: string;
   initialPresentNpcs: string[];
-  initialInventory: Array<{ item: string; count: number }>;
-  suggestedCfsmAxes: CfsmAxisDef[];
+  initialInventory: Array<{ actorId?: string; item: string; count: number }>;
+  /** Permanently cached LLM-extracted or salvaged multi-actor initial stats */
+  initialStats?: SalvagedVariable[];
+  /** Multi-actor CFSM axes (`actorId` defaults to primary card if omitted) */
+  suggestedCfsmAxes: Array<CfsmAxisDef & { actorId?: string }>;
+  /** Initial RoleMemo DualMem character beliefs & emotional subtext */
+  initialBeliefs?: Array<{
+    actorId: string;
+    target: string;
+    activatingEvent: string;
+    belief: string;
+    subjectiveInsight?: string;
+    emotionalTone?: string;
+  }>;
+  /** Initial world facts & hidden character secrets (FANToM witness boundaries) */
+  initialFacts?: Array<{
+    statement: string;
+    entities: string[];
+    witnessIds: string[] | "public";
+  }>;
+  /** Initial planted Chekhov's guns / foreshadowing hooks */
+  initialForesights?: Array<{
+    summary: string;
+    triggerHint: string;
+    entities: string[];
+  }>;
+  /** Initial condition-gated plot twists & dynamic storylets (QBN) */
+  initialStorylets?: Array<{
+    title: string;
+    triggerPrompt: string;
+    gate?: GateCondition;
+    postEffects?: StoryletEntry["postEffects"];
+    oneTime?: boolean;
+  }>;
+  /** Initial countdown / tension clocks */
+  initialClocks?: Array<{
+    clockId: string;
+    label: string;
+    value: number;
+    max: number;
+  }>;
   entityAliases: Record<string, string[]>;
   suggestedLoreGates: Array<{ entryId: string; title: string; gate: GateCondition; reason: string }>;
   source: "heuristic" | "llm-analyzed";
@@ -330,6 +396,8 @@ export interface GateCondition {
   requiredFlags?: string[];
   requiredLocations?: string[];
   requiredNpcPresent?: string[];
+  /** Optional numeric stat threshold checks (e.g. affection >= 60 or sanity <= 30) */
+  statChecks?: Array<{ actorId?: string; key: string; gte?: number; lte?: number }>;
 }
 
 export type SelectiveLogic = "AND_ANY" | "NOT_ALL" | "NOT_ANY" | "AND_ALL";
@@ -422,13 +490,21 @@ export interface CompiledPreset {
 }
 
 // ---------------------------------------------------------------------------
-// 3. L1 Deterministic World Engine & Session-Only Event Sourcing
+// 3. L1 Deterministic World Engine, Memory Books, DualMem, Storylets & X-Ray
 // ---------------------------------------------------------------------------
 
 export interface PersonaProfile {
   id: string;
   name: string;
   description: string;
+}
+
+export interface QuickReplyItem {
+  id: string;
+  label: string;
+  text: string;
+  /** "send" = submit immediately, "editor" = prefill input editor, "steer" = add 1-turn director note */
+  mode: "send" | "editor" | "steer";
 }
 
 export interface CfsmAxisDef {
@@ -458,20 +534,60 @@ export interface BiTemporalFact {
   id: string;
   statement: string;
   entities: string[];
+  /** World validity axis (valid time): turn when this fact became true in-world */
   validFromTurn: number;
+  /** World validity axis: turn when superseded/invalidated (null = currently true) */
   validUntilTurn: number | null;
+  /** Transaction axis (ingestion time): turn when the ledger learned/recorded this fact */
+  ingestedAtTurn?: number;
+  /** Optional in-world calendar/clock label when the event occurred */
+  eventTimeLabel?: string;
   supersededBy?: string;
   witnessIds: string[] | "public";
   gate?: GateCondition;
   causeEvent?: string;
 }
 
+/** RoleMemo / DualMem: separates objective event from character's persona-conditioned subjective insight. */
 export interface DreamBelief {
+  id?: string;
   actorId: string;
   target: string;
   activatingEvent: string;
   belief: string;
+  /** Optional persona-conditioned emotional/psychological subtext (DualMem insight stream) */
+  subjectiveInsight?: string;
+  emotionalTone?: string;
   turn: number;
+}
+
+/** Memory Books: keyword/entity-recalled scene chapter archive that scales past 200+ turns without eviction. */
+export interface MemoryBookEntry {
+  id: string;
+  title: string;
+  summary: string;
+  entities: string[];
+  keywords: string[];
+  turnRange: [number, number];
+  enabled: boolean;
+  pinned?: boolean;
+  createdTurn: number;
+}
+
+/** Dynamic Storylet: condition-gated plot beat / tension trigger that activates when world state matches. */
+export interface StoryletEntry {
+  id: string;
+  title: string;
+  triggerPrompt: string;
+  gate?: GateCondition;
+  /** Optional postconditions automatically applied when the storylet completes */
+  postEffects?: {
+    setFlags?: Record<string, boolean>;
+    nextObjective?: string;
+  };
+  oneTime?: boolean;
+  status: "armed" | "triggered" | "completed";
+  createdTurn: number;
 }
 
 export interface ForesightHook {
@@ -493,6 +609,50 @@ export interface DirectorNote {
 export interface HiddenFloorTarget {
   entryId: string;
   fingerprint?: string;
+}
+
+export interface TxAuditRecord {
+  id: string;
+  turn: number;
+  summary: string;
+  source: "user" | "tool" | "sidecar" | "system";
+  undoTx?: RpTxEntry;
+}
+
+export interface LoreRecallTraceItem {
+  id: string;
+  title: string;
+  source: "lore" | "memory_book";
+  reason: "sticky" | "direct_key" | "ppr_2hop" | "bm25" | "static" | "pinned";
+  matchedKey?: string;
+  score: number;
+  tokens: number;
+}
+
+export interface ContextXRaySnapshot {
+  turn: number;
+  timestamp: number;
+  toolsHash?: string;
+  zone1Hash: string;
+  zone2PrefixMatch?: boolean;
+  cacheInvalidationReason?: "first_turn" | "prefix_hit" | "tools_changed" | "zone1_changed" | "history_mutated";
+  cacheHitStreak: number;
+  zone1Tokens: number;
+  zone2Tokens: number;
+  zone3Tokens: number;
+  loreTokens: number;
+  loreBudget: number;
+  recalled: LoreRecallTraceItem[];
+  gatedOut: Array<{ id: string; title: string }>;
+  budgetDropped: Array<{ id: string; title: string; tokens: number }>;
+  activeFactCount: number;
+  blindSpotCount: number;
+  activeStoryletTitles: string[];
+  hiddenFloorCount: number;
+  /** Real lexical repetition overlap (0..1) across recent assistant replies */
+  repetitionScore?: number;
+  /** Turns elapsed since last meaningful world-state mutation */
+  stagnantTurns?: number;
 }
 
 export type SettlementMode = "off" | "tool-assisted" | "sidecar-light";
@@ -521,7 +681,9 @@ export type RpTxEntry =
       pacingMode?: PacingMode;
       rawPassthrough?: boolean;
       loreTokenBudget?: number;
-      sidecarModel?: string;
+      sidecarModel?: string | null;
+      innerMonologue?: boolean;
+      applyPresetSampling?: boolean;
     }
   | { kind: "persona_set"; persona: PersonaProfile }
   | { kind: "note_set"; note: DirectorNote }
@@ -531,6 +693,7 @@ export type RpTxEntry =
   | { kind: "lore_toggle"; entryId: string; enabled: boolean }
   | { kind: "clock_tick"; beatDelta: number; worldTimeLabel?: string; dayDelta?: number; phase?: string }
   | { kind: "location_set"; location: string; presentNpcs: string[] }
+  | { kind: "scene_objective_set"; objective: string }
   | { kind: "flag_set"; flag: string; value: boolean }
   | { kind: "cfsm_define"; actorId: string; def: CfsmAxisDef }
   | { kind: "cfsm_transition"; actorId: string; axis: string; from: string; to: string; reason: string; turn: number }
@@ -547,8 +710,24 @@ export type RpTxEntry =
   | { kind: "inventory_patch"; actorId: string; item: string; delta: number; note?: string }
   | { kind: "progress_clock"; clockId: string; label: string; delta: number; max: number; completed?: boolean }
   | { kind: "fact_add"; fact: BiTemporalFact }
+  | { kind: "fact_update"; factId: string; statement?: string; witnessIds?: string[] | "public"; entities?: string[] }
   | { kind: "fact_invalidate"; factId: string; validUntilTurn: number; supersededBy?: string; reason: string }
-  | { kind: "belief_update"; actorId: string; target: string; activatingEvent: string; belief: string; turn: number }
+  | {
+      kind: "belief_update";
+      id?: string;
+      actorId: string;
+      target: string;
+      activatingEvent: string;
+      belief: string;
+      subjectiveInsight?: string;
+      emotionalTone?: string;
+      turn: number;
+    }
+  | { kind: "belief_remove"; index?: number; id?: string }
+  | { kind: "memory_book_upsert"; entry: MemoryBookEntry }
+  | { kind: "memory_book_delete"; entryId: string }
+  | { kind: "storylet_upsert"; storylet: StoryletEntry }
+  | { kind: "storylet_delete"; storyletId: string }
   | { kind: "foresight_upsert"; hook: ForesightHook }
   | {
       kind: "era_advance";
@@ -582,6 +761,8 @@ export interface SessionRpState {
   pacingMode: PacingMode;
   loreTokenBudget: number;
   sidecarModel?: string;
+  innerMonologue: boolean;
+  applyPresetSampling: boolean;
   initialPersona: PersonaProfile | null;
   currentPersona: PersonaProfile;
   personaChangedMidSession: boolean;
@@ -593,6 +774,7 @@ export interface SessionRpState {
   worldTimeLabel: string;
   phase: string;
   era: string;
+  sceneObjective: string;
   milestones: Set<string>;
   flags: Record<string, boolean>;
   location: string;
@@ -605,6 +787,8 @@ export interface SessionRpState {
   clocks: Record<string, ProgressClock>;
   facts: Map<string, BiTemporalFact>;
   beliefs: DreamBelief[];
+  memoryBooks: Map<string, MemoryBookEntry>;
+  storylets: Map<string, StoryletEntry>;
   foresights: Map<string, ForesightHook>;
   notes: DirectorNote[];
   hiddenEntryIds: Set<string>;
@@ -613,4 +797,7 @@ export interface SessionRpState {
   loreSticky: Record<string, number>;
   loreCooldown: Record<string, number>;
   loreConsumedOneShots: Set<string>;
+  /** Turn index of last meaningful world mutation (used by real stagnation detector) */
+  lastMeaningfulProgressTurn: number;
+  auditLog: TxAuditRecord[];
 }
