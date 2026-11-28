@@ -122,7 +122,7 @@ export function parseAndValidateInlineDelta(
       if (dayDelta === 0 && /(?:次日|翌日|第二天|隔日)/.test(val)) dayDelta = 1;
       let nextLabel = val;
       if (span.years >= 1 && state.worldTimeLabel) {
-        const anchor = computeCalendarAnchor(state.worldTimeLabel, span.years);
+        const anchor = computeCalendarAnchor(state.worldTimeLabel, span.years, span.dayDelta);
         if (anchor && !val.includes(String(anchor.targetYear))) {
           nextLabel = anchor.targetEraLabel ? `${anchor.targetEraLabel}（${val}）` : `${val}（约 ${anchor.targetYear} 年）`;
         }
@@ -670,7 +670,7 @@ export function parseAndValidateInlineDelta(
           }
         }
         txs.push({
-          kind: "npc_agenda_upsert",
+          kind: "agenda_upsert",
           agenda: { actorId: actor, goal, currentActivity, etaTurns, updatedTurn: state.turn },
         });
         applied.push(`agenda:${actor}`);
