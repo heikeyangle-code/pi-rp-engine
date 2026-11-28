@@ -1206,19 +1206,28 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         const offset = Math.max(0, Math.floor(Number(params.offset) || 0));
         const limit = Math.min(100, Math.max(1, Math.floor(Number(params.limit) || 30)));
         const slice = visibleLore.slice(offset, offset + limit);
-        const lines = slice.map((e, i) => `${offset + i + 1}. [${e.constant ? "常驻" : "动态"}] ${e.title}${e.keys.length ? ` (${e.keys.slice(0, 4).join("/")})` : ""}`);
-        const nextOffset = offset + limit < visibleLore.length ? offset + limit : null;
+        const combinedItems: Array<{ label: string }> = [
+          ...visibleLore.map((e) => ({
+            label: `[${e.constant ? "常驻" : "动态"}] ${e.title}${e.keys.length ? ` (${e.keys.slice(0, 4).join("/")})` : ""}`,
+          })),
+          ...((card.knowledgeIndex?.dualTrackActive ? card.knowledgeIndex.chapters : []).map((ch) => ({
+            label: `[卡体章节] ${ch.path} (~${ch.tokens}t)`,
+          }))),
+        ];
+        const sliceCombined = combinedItems.slice(offset, offset + limit);
+        const lines = sliceCombined.map((item, i) => `${offset + i + 1}. ${item.label}`);
+        const nextOffset = offset + limit < combinedItems.length ? offset + limit : null;
         return {
           content: [
             {
               type: "text",
               text:
-                `Worldbook Directory (${offset + 1}-${offset + slice.length} / ${visibleLore.length}):\n` +
+                `Worldbook & Card Knowledge Directory (${offset + 1}-${offset + sliceCombined.length} / ${combinedItems.length}):\n` +
                 lines.join("\n") +
                 (nextOffset !== null ? `\n(More entries available: pass offset=${nextOffset})` : ""),
             },
           ],
-          details: { mode: "list", total: visibleLore.length, offset, nextOffset },
+          details: { mode: "list", total: combinedItems.length, offset, nextOffset },
         };
       }
 
@@ -1252,8 +1261,41 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         if (matches.length === 0) {
           matches = visibleLore.filter((e) => norm(e.content).includes(qNorm));
         }
+        if (matches.length === 0 && card.knowledgeIndex?.chapters.length) {
+          const chMatches = card.knowledgeIndex.chapters.filter(
+            (ch) => norm(ch.path).includes(qNorm) || norm(ch.title).includes(qNorm),
+          );
+          if (chMatches.length === 1) {
+            const ch = chMatches[0]!;
+            const fullChText = card.knowledgeIndex.passages
+              .filter((p) => p.chapterId === ch.id)
+              .map((p) => p.text)
+              .join("\n\n");
+            const offset = Math.max(0, Math.floor(Number(params.offset) || 0));
+            const chars = Array.from(fullChText);
+            const end = Math.min(offset + 12000, chars.length);
+            const text = chars.slice(offset, end).join("");
+            const nextOffset = end < chars.length ? end : null;
+            return {
+              content: [
+                {
+                  type: "text",
+                  text: `### 卡体章节：${ch.path}\n${text}${nextOffset !== null ? `\n\n[Truncated: call with offset=${nextOffset} to continue]` : ""}`,
+                },
+              ],
+              details: { mode: "read", loreCount: 1, title: ch.path, nextOffset },
+            };
+          }
+          if (chMatches.length > 1) {
+            const cands = chMatches.slice(0, 10).map((c, i) => `${i + 1}. ${c.path}`).join("\n");
+            return {
+              content: [{ type: "text", text: `Multiple card chapters matched "${query}" (${chMatches.length} total). Call rp_recall(action="read", query="<exact chapter path>") with one of:\n${cands}` }],
+              details: { mode: "read", loreCount: chMatches.length },
+            };
+          }
+        }
         if (matches.length === 0) {
-          return { content: [{ type: "text", text: `No worldbook entry matched "${query}".` }], details: { mode: "read", loreCount: 0 } };
+          return { content: [{ type: "text", text: `No worldbook entry or card chapter matched "${query}".` }], details: { mode: "read", loreCount: 0 } };
         }
         if (matches.length > 1) {
           const cands = matches.slice(0, 10).map((e, i) => `${i + 1}. ${e.title}`).join("\n");

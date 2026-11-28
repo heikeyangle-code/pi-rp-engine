@@ -471,12 +471,19 @@ export function recallCardKnowledge(options: {
       }
     }
 
-    // Direct title/chapter match boost
-    const chapterHit = p.chapterPath.length >= 2 && qLower.includes(p.chapterPath.toLowerCase());
-    if (hitEnts.length === 0 && !chapterHit && bScore < bm25Floor) continue;
+    // Direct title/chapter match & homonym context-cue disambiguation boost
+    const pathLow = p.chapterPath.toLowerCase();
+    const chapterHit = pathLow.length >= 2 && qLower.includes(pathLow);
+    const pathTokens = Array.from(new Set(tokenizeBigram(p.chapterPath)));
+    let pathCueHits = 0;
+    const qTokSet = new Set(queryTokens);
+    for (const pt of pathTokens) {
+      if (pt.length >= 2 && qTokSet.has(pt)) pathCueHits++;
+    }
+    if (hitEnts.length === 0 && !chapterHit && pathCueHits < 2 && bScore < bm25Floor) continue;
 
-    // Contextual disambiguation: if homonym exists, BM25 overlap with surrounding chapter context breaks ties cleanly
-    const totalScore = hitEnts.length * 14 + (chapterHit ? 10 : 0) + bScore * 1.8;
+    // Contextual disambiguation: chapter-path & epithet cue overlap decisively separates homonyms
+    const totalScore = hitEnts.length * 14 + (chapterHit ? 12 : 0) + pathCueHits * 4.5 + bScore * 1.8;
     const reason: LoreRecallTraceItem["reason"] =
       hitEnts.length > 0 ? "direct_key" : chapterHit ? "static" : "bm25";
 

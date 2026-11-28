@@ -371,3 +371,23 @@ export function stripDisplayResiduals(markdown: string): string {
   out = stripBalancedStyledHtmlContainers(out, "display", dummy);
   return out.replace(/\n{3,}/g, "\n\n").trim();
 }
+
+/**
+ * Apply SillyTavern prompt-scoped regex rules (placement 1=USER_INPUT, 5=WORLD_INFO, or promptOnly)
+ * transiently on outbound prompt text without mutating stored JSONL history.
+ */
+export function applyPromptRegexRules(
+  text: string,
+  rules: CompiledRegexRule[] | undefined,
+  placement: 1 | 5,
+  macroCtx?: MacroContext,
+): string {
+  if (!text || !rules || rules.length === 0) return text;
+  const filtered = rules.filter(
+    (r) => (r.promptOnly || r.placements.includes(placement)) && !r.markdownOnly,
+  );
+  if (filtered.length === 0) return text;
+  // Reuse the same safe single-pass regex engine by temporarily projecting rules as applicable
+  const adapted = filtered.map((r) => ({ ...r, promptOnly: false, placements: [2] }));
+  return applyDisplayRegexRules(text, adapted, macroCtx);
+}

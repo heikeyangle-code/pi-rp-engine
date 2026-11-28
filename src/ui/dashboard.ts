@@ -33,6 +33,10 @@ import { evaluateGate, partitionEpistemicFacts } from "../engine/gates.js";
 import { canonicalizeActorName, isNonCharacterEntity } from "../engine/entity-hygiene.js";
 import { evaluateActiveStorylets } from "../context/zone-builder.js";
 import { compileLoreBook, extractEntryEntities } from "../parser/lore-compiler.js";
+import { exportCardToCcv3Json } from "../parser/card-compiler.js";
+import { loadRawCardJson } from "../storage/workspace-store.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { recallCardKnowledge } from "../parser/card-knowledge.js";
 import { buildEntityRegistry } from "../memory/entity-registry.js";
 import { saveUpdatedCard } from "../storage/workspace-store.js";
@@ -1688,6 +1692,7 @@ export async function openCardKnowledgeInspector(rt: DashboardRuntime, ctx: PiEx
         `📑 按章节目录浏览全文（共 ${ki.chapters.length} 章）`,
         `🔍 全卡原文检索（测试别名与父子块召回）`,
         `🕸 实体与别名表（共 ${ki.entities.length} 组）`,
+        "💾 导出无损 CCV3 角色卡 JSON",
         ...(ki.dualTrackActive
           ? [card.forceFullZone1 ? "🔄 切回自动双轨模式（推荐大卡）" : "📌 切换为强制全文常驻 Zone 1"]
           : []),
@@ -1748,6 +1753,19 @@ export async function openCardKnowledgeInspector(rt: DashboardRuntime, ctx: PiEx
           (p, i) => `${i + 1}. [${p.chapterPath}] (分:${p.score}) ${p.text.replace(/\s+/g, " ").slice(0, 120)}…`,
         );
         ctx.ui.notify(`命中 ${res.passages.length} 个原文片段 (~${res.usedTokens}t)：\n${lines.join("\n")}`, "info");
+      }
+      continue;
+    }
+
+    if (pick.startsWith("💾")) {
+      const rawJson = s.worldDir ? loadRawCardJson(s.worldDir, card.slug) : null;
+      const ccv3 = exportCardToCcv3Json(rawJson, card);
+      const outPath = path.join(ctx.cwd, `${card.slug}.ccv3.json`);
+      try {
+        fs.writeFileSync(outPath, JSON.stringify(ccv3, null, 2), "utf8");
+        ctx.ui.notify(`✅ 已无损导出 CCV3 角色卡至：${path.basename(outPath)}`, "info");
+      } catch (err) {
+        ctx.ui.notify(`导出失败：${(err as Error).message}`, "error");
       }
       continue;
     }

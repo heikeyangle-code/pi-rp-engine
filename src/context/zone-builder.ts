@@ -46,6 +46,7 @@ import { selectRelevantBeliefs } from "../memory/graph-ppr.js";
 import { detectRepeatedCliches, detectRuntimeSlop, type NarrativeHealthReport } from "../engine/stagnation.js";
 import { estimateTokens } from "./token-budget.js";
 import { extractHeuristicVoiceAnchor } from "../parser/analyzer.js";
+import { applyPromptRegexRules } from "../parser/sanitizer.js";
 import type { EntityRegistry } from "../memory/entity-registry.js";
 import type { CardKnowledgeRecallResult } from "../parser/card-knowledge.js";
 
@@ -136,6 +137,8 @@ function buildEngineProtocol(
             "`stat: 角色.键 +N`",
             "`cfsm: 角色.轴 -> 状态`",
             "`bond: A<->B | 立场 | ±N`",
+            "`agenda: 角色 | 目标 | 行动 | eta:3`",
+            "`storylet_add: 标题 | 触发剧情`",
             "`hook: 伏笔 | 提示`",
           ];
     lines.push(
@@ -579,6 +582,7 @@ export function buildZone3TransientTailWithStats(options: Zone3BuildOptions): { 
       if (st.gate?.minTurn !== undefined && state.turn < st.gate.minTurn) continue;
       if (st.gate?.forbiddenFlags?.some((f) => Boolean(state.flags[f]))) continue;
       if (st.gate?.requiredLocations?.length && !st.gate.requiredLocations.some((rl) => locLow.includes(rl.toLowerCase()))) continue;
+      if (st.gate?.statChecks?.length && !evaluateGate({ statChecks: st.gate.statChecks }, state, registry)) continue;
       let score = 0;
       if (state.turn >= 18) score += 25;
       else if (state.turn >= 12) score += 18;
@@ -692,7 +696,8 @@ export function buildZone3TransientTailWithStats(options: Zone3BuildOptions): { 
     const wiFmt = preset?.utilityPrompts.wiFormat;
     const loreText = normalRecalledLore
       .map((e) => {
-        const body = evaluateMacros(e.content, macroCtx).trim();
+        const rawBody = evaluateMacros(e.content, macroCtx).trim();
+        const body = applyPromptRegexRules(rawBody, card.promptRegexRules, 5, macroCtx);
         if (!body) return "";
         if (wiFmt && wiFmt.includes("{0}")) {
           return wiFmt.replace(/\{0\}/g, () => `[${e.title}] ${body}`);

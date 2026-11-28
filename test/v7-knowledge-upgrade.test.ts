@@ -213,3 +213,73 @@ test("v7-3: Inline-delta phys outfit/pose, storylet_done postEffects, auto-super
   assert.equal(exported.spec, "chara_card_v3");
   assert.equal((exported.data as any).extensions.custom, 1);
 });
+
+import { applyPromptRegexRules } from "../src/parser/sanitizer.js";
+
+test("v7-4: Close all remaining gaps — agenda, storylet_add, temporal calendar guard, statChecks soft-gate, promptRegexRules & homonym disambiguation", () => {
+  const state = createInitialRpState();
+  state.active = true;
+  state.turn = 20;
+  state.worldTimeLabel = "崇祯七年深秋";
+  state.stats = { player: { 敏捷: 8 } };
+  applyRpTx(state, {
+    kind: "storylet_upsert",
+    storylet: {
+      id: "st_stat_gated",
+      title: "飞檐潜入",
+      triggerPrompt: "飞檐潜入总督府秘阁",
+      gate: { statChecks: [{ actorId: "player", key: "敏捷", gte: 15 }] },
+      status: "armed",
+      createdTurn: 1,
+    },
+  });
+
+  // 1. agenda:, storylet_add:, and temporal.ts multi-year calendar anchor via inline delta
+  const delta = parseAndValidateInlineDelta(
+    `agenda: 陆沉舟 | 转移账本 | 暗中调船至白马渡 | eta:3\nstorylet_add: 码头暗算 | 盐帮暗哨在夜色中合围 | flag:dock_alert\ntime: 三年后深冬`,
+    state,
+  );
+  for (const tx of delta.txs) applyRpTx(state, tx);
+
+  assert.equal(state.npcAgendas["陆沉舟"]?.goal, "转移账本");
+  assert.equal(state.npcAgendas["陆沉舟"]?.etaTurns, 3);
+  assert.ok(Array.from(state.storylets.values()).some((st) => st.title === "码头暗算"));
+  assert.ok(state.day >= 1000, `3-year skip should advance dayDelta via temporal.ts, got day=${state.day}`);
+  assert.ok(state.worldTimeLabel.includes("十年") || state.worldTimeLabel.includes("1637"), `expected calendar anchor, got ${state.worldTimeLabel}`);
+
+  // 2. Soft storylet must respect statChecks (player 敏捷=8 < 15 -> must NOT fire!)
+  const card = compileCharacterCard(
+    {
+      spec: "chara_card_v3",
+      spec_version: "3.0",
+      data: {
+        name: "沈青璃",
+        description: "简介",
+        extensions: {
+          regex_scripts: [
+            {
+              scriptName: "prompt-tag-clean",
+              findRegex: "/\\[DEBUG\\]/g",
+              replaceString: "",
+              placement: [1, 5],
+              promptOnly: true,
+            },
+          ],
+        },
+      },
+    },
+    "v3",
+  );
+  const z3 = buildZone3TransientTailWithStats({
+    card,
+    state,
+    recalledLore: [],
+    recentText: "今晚准备飞檐潜入总督府秘阁。",
+  });
+  assert.ok(!z3.text.includes("st_stat_gated"), "statChecks-gated storylet must not soft-trigger when stat is too low");
+
+  // 3. promptRegexRules apply cleanly to USER_INPUT (1) and WORLD_INFO (5)
+  assert.equal(card.promptRegexRules?.length, 1);
+  assert.equal(applyPromptRegexRules("测试[DEBUG]正文", card.promptRegexRules, 1), "测试正文");
+  assert.equal(applyPromptRegexRules("世界书[DEBUG]条目", card.promptRegexRules, 5), "世界书条目");
+});

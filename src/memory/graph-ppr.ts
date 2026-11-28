@@ -833,8 +833,10 @@ export function recallLoreWithGraphPpr(options: {
       tokens: estimateTokens(`[${a.entry.title}]\n${a.entry.content}`),
     }));
 
+  const effDepth = (e: CompiledLoreEntry) =>
+    e.reverseDepth !== undefined ? Math.max(0, 100 - e.reverseDepth) : e.depthHint;
   const selected = [...budgeted.selected].sort(
-    (a, b) => b.depthHint - a.depthHint || b.priority - a.priority || a.id.localeCompare(b.id),
+    (a, b) => effDepth(b) - effDepth(a) || b.priority - a.priority || a.id.localeCompare(b.id),
   );
 
   const traces: LoreRecallTraceItem[] = selected.map((e) => {

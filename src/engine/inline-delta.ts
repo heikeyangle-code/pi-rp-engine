@@ -18,6 +18,7 @@ import { canonicalizeActorName, isNonCharacterEntity, sanitizeNpcList } from "./
 import { makeRouteId, normalizePlaceName } from "./world-sim.js";
 import { findSupersededFactsForStatement } from "../memory/bitemporal.js";
 import { validateCfsmTransition } from "./cfsm.js";
+import { computeCalendarAnchor, parseTimeSpan } from "./temporal.js";
 import type { EntityRegistry } from "../memory/entity-registry.js";
 
 const DELTA_OPEN_RE = /\[\[RP_DELTA\]\]/i;
@@ -116,17 +117,18 @@ export function parseAndValidateInlineDelta(
     }
 
     if (key === "time" || key === "world_time") {
-      let dayDelta = 0;
-      const dMatch = /(?:次日|翌日|第二天|隔日)/.exec(val);
-      const numDayMatch = /(\d+)\s*(?:日后|天后|days?\s*later)/i.exec(val);
-      const numMonthMatch = /(\d+)\s*(?:个月后|月后|months?\s*later)/i.exec(val);
-      const numYearMatch = /(\d+)\s*(?:年后|years?\s*later)/i.exec(val);
-      if (numYearMatch) dayDelta = Math.min(36500, Number(numYearMatch[1]) * 365);
-      else if (numMonthMatch) dayDelta = Math.min(3650, Number(numMonthMatch[1]) * 30);
-      else if (numDayMatch) dayDelta = Math.min(3650, Number(numDayMatch[1]));
-      else if (dMatch) dayDelta = 1;
-      txs.push({ kind: "clock_tick", beatDelta: 0, dayDelta, worldTimeLabel: val });
-      applied.push(`time=${val}`);
+      const span = parseTimeSpan(val);
+      let dayDelta = span.dayDelta;
+      if (dayDelta === 0 && /(?:次日|翌日|第二天|隔日)/.test(val)) dayDelta = 1;
+      let nextLabel = val;
+      if (span.years >= 1 && state.worldTimeLabel) {
+        const anchor = computeCalendarAnchor(state.worldTimeLabel, span.years);
+        if (anchor && !val.includes(String(anchor.targetYear))) {
+          nextLabel = anchor.targetEraLabel ? `${anchor.targetEraLabel}（${val}）` : `${val}（约 ${anchor.targetYear} 年）`;
+        }
+      }
+      txs.push({ kind: "clock_tick", beatDelta: 0, dayDelta, worldTimeLabel: nextLabel });
+      applied.push(`time=${nextLabel}`);
       continue;
     }
 
@@ -619,6 +621,59 @@ export function parseAndValidateInlineDelta(
           bond: { id, actorA, actorB, stance, tension, note: parts[3] || prev?.note || "", updatedTurn: state.turn },
         });
         applied.push(`bond:${actorA}↔${actorB}`);
+      }
+      continue;
+    }
+
+    if (key === "storylet_add") {
+      // e.g. `storylet_add: 码头暗算 | 盐帮暗哨在夜色中合围 | flag:dock_alert`
+      const parts = val.split("|").map((x) => x.trim()).filter(Boolean);
+      const title = parts[0];
+      const triggerPrompt = parts[1];
+      if (title && triggerPrompt) {
+        const reqFlags: string[] = [];
+        for (const pSeg of parts.slice(2)) {
+          const fm = /^flag[:：=]\s*(.+)$/i.exec(pSeg);
+          if (fm) reqFlags.push(fm[1]!.trim());
+        }
+        const id = `st_t${state.turn}_d${txs.length}`;
+        txs.push({
+          kind: "storylet_upsert",
+          storylet: {
+            id,
+            title,
+            triggerPrompt,
+            gate: reqFlags.length > 0 ? { requiredFlags: reqFlags } : undefined,
+            status: "armed",
+            createdTurn: state.turn,
+            oneTime: true,
+          },
+        });
+        applied.push(`storylet_add:${title}`);
+      }
+      continue;
+    }
+
+    if (key === "agenda") {
+      // e.g. `agenda: 陆沉舟 | 转移私盐账本 | 暗中调船至白马渡 | eta:3`
+      const parts = val.split("|").map((x) => x.trim()).filter(Boolean);
+      if (parts.length >= 2) {
+        const actor = canonicalizeActorName(parts[0]!, hctx) || parts[0]!;
+        const goal = parts[1]!;
+        let currentActivity = parts[2] || goal;
+        let etaTurns: number | null = null;
+        for (const seg of parts.slice(2)) {
+          const em = /^eta[:：=]\s*(\d+)$/i.exec(seg);
+          if (em) {
+            etaTurns = Number(em[1]);
+            if (seg === currentActivity) currentActivity = goal;
+          }
+        }
+        txs.push({
+          kind: "npc_agenda_upsert",
+          agenda: { actorId: actor, goal, currentActivity, etaTurns, updatedTurn: state.turn },
+        });
+        applied.push(`agenda:${actor}`);
       }
       continue;
     }

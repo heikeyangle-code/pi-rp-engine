@@ -250,3 +250,9 @@ export async function rankBySemanticSimilarity(
   scored.sort((a, b) => b.similarity - a.similarity);
   return scored;
 }
+
+/** Fire-and-forget background pre-warming so automatic per-turn RRF has warm vectors with 0 TTFT penalty. */
+export function prewarmEmbeddingCache(config: EmbeddingConfig | undefined, texts: string[]): void {
+  if (!config?.enabled || texts.length === 0) return;
+  void embedTexts(config, texts.slice(0, 128), 6000).catch(() => {});
+}

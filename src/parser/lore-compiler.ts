@@ -627,9 +627,38 @@ export function compileLoreBook(
       if (raw.matchCharacterDepthPrompt ?? ext.match_character_depth_prompt)
         scanPool.push(options.staticScan.depthPrompt ?? "");
       if (raw.matchCreatorNotes ?? ext.match_creator_notes) scanPool.push(options.staticScan.creatorNotes ?? "");
-      const joined = scanPool.join("\n").toLowerCase();
-      if (joined && keys.some((k) => joined.includes(k.toLowerCase()))) {
-        staticPrebound = true;
+      const joined = scanPool.join("\n");
+      if (joined) {
+        const matchKeyStatic = (k: string): boolean => {
+          const inline = parseInlineRegexKey(k);
+          if (inline && isSafeRegexPattern(k)) {
+            try { return new RegExp(inline.pattern, inline.flags || (caseSensitive ? "" : "i")).test(joined); } catch {}
+          } else if (useRegex && isSafeRegexPattern(k)) {
+            try { return new RegExp(k, caseSensitive ? "" : "i").test(joined); } catch {}
+          }
+          if (matchWholeWords && /^[\p{L}\p{N}_\-'\s]+$/u.test(k) && !/[\u3400-\u9fff\u3040-\u30ff\uac00-\ud7af]/u.test(k)) {
+            const esc = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            return new RegExp(`(?<![\\p{L}\\p{N}_])${esc}(?![\\p{L}\\p{N}_])`, caseSensitive ? "u" : "iu").test(joined);
+          }
+          return caseSensitive ? joined.includes(k) : joined.toLowerCase().includes(k.toLowerCase());
+        };
+        const excluded = excludeKeys.length > 0 && excludeKeys.some(matchKeyStatic);
+        const primaryOk = !excluded && keys.some(matchKeyStatic);
+        if (primaryOk) {
+          if (!selective || secondaryKeys.length === 0) {
+            staticPrebound = true;
+          } else {
+            const hits = secondaryKeys.map(matchKeyStatic);
+            if (
+              (selectiveLogic === "AND_ANY" && hits.some(Boolean)) ||
+              (selectiveLogic === "AND_ALL" && hits.every(Boolean)) ||
+              (selectiveLogic === "NOT_ANY" && !hits.some(Boolean)) ||
+              (selectiveLogic === "NOT_ALL" && !hits.every(Boolean))
+            ) {
+              staticPrebound = true;
+            }
+          }
+        }
       }
     }
 

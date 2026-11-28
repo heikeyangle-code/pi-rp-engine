@@ -61,7 +61,8 @@ import {
   runDeterministicTurnSettlement,
   runSidecarLightSettlement,
 } from "./engine/settlement.js";
-import { applyDisplayRegexRules, stripDisplayResiduals } from "./parser/sanitizer.js";
+import { applyDisplayRegexRules, applyPromptRegexRules, stripDisplayResiduals } from "./parser/sanitizer.js";
+import { prewarmEmbeddingCache } from "./memory/embedding.js";
 import { RP_TOOL_NAMES, registerRpTools } from "./tools/rp-tools.js";
 import { clearRpHud, renderRpHud } from "./ui/hud.js";
 import { formatThoughtBlocks, registerRpMessageRenderers } from "./ui/renderers.js";
@@ -386,6 +387,10 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     activePreset = state.presetId ? loadCompiledPreset(ctx.cwd, state.presetId) : null;
 
     activateRpTools();
+    const prewarmCfg = loadUiPrefs().embeddingConfig;
+    if (prewarmCfg?.enabled && activeCard.loreBook.entries.length > 0) {
+      prewarmEmbeddingCache(prewarmCfg, activeCard.loreBook.entries.slice(0, 128).map((e) => `${e.title}: ${e.content.slice(0, 1200)}`));
+    }
     ctx.ui.setTitle?.(`◆ ${activeCard.identity.name} · Pi RP`);
     rpTitleSet = true;
     renderRpHud(ctx, state, activeCard, lastXRay);
@@ -731,7 +736,19 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       registry,
     });
 
+    const userPromptRules = activeCard.promptRegexRules ?? [];
+    const promptMacroCtx = {
+      charName: activeCard.identity.nickname || activeCard.identity.name,
+      userName: state.currentPersona.name,
+    };
     const cleanedMessages: PiMessage[] = messages.map((m) => {
+      if (m.role === "user" && userPromptRules.length > 0) {
+        if (typeof m.content === "string") {
+          const transformed = applyPromptRegexRules(m.content, userPromptRules, 1, promptMacroCtx);
+          return transformed === m.content ? m : { ...m, content: transformed };
+        }
+        return m;
+      }
       if (m.role !== "assistant") return m;
       if (typeof m.content === "string") {
         const stripped = stripInlineDelta(m.content);
