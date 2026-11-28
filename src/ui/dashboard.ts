@@ -58,6 +58,12 @@ export interface DashboardRuntime {
   openQuickReplies(ctx: PiExtensionContext): Promise<void>;
   pickSidecarModel(ctx: PiExtensionContext): Promise<void>;
   manageLibrary(ctx: PiExtensionContext): Promise<void>;
+  rewriteLast?(ctx: PiExtensionContext): Promise<void>;
+  styleControl?(ctx: PiExtensionContext): Promise<void>;
+  banPhrases?(ctx: PiExtensionContext): Promise<void>;
+  spotlightNpc?(ctx: PiExtensionContext): Promise<void>;
+  interludeScene?(ctx: PiExtensionContext): Promise<void>;
+  exportNovel?(ctx: PiExtensionContext): Promise<void>;
 }
 
 function getAllLore(rt: DashboardRuntime): CompiledLoreEntry[] {
@@ -194,7 +200,9 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
           ]
         : []),
       ...(healthRow ? [healthRow] : []),
-      "⏳ 切场景 / 跳时间（触发过渡剧情 · Alt+T）",
+      "⏳ 幕间世界推演 / 切场景（推演时钟与暗流 · Alt+T）",
+      "🔦 群像镜头切换：指定下一轮主导 NPC (/rp spotlight)",
+      "🎞 零污染幕后插叙 / 小剧场 (/rp interlude)",
       "← 返回主面板",
     ]);
     if (!pick || pick.startsWith("←")) return;
@@ -233,6 +241,12 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
     } else if (pick.startsWith("⏳")) {
       await rt.skipScene(ctx);
       return;
+    } else if (pick.startsWith("🔦")) {
+      await rt.spotlightNpc?.(ctx);
+      return;
+    } else if (pick.startsWith("🎞")) {
+      await rt.interludeScene?.(ctx);
+      continue;
     }
   }
 }
@@ -1001,6 +1015,9 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
     const s = rt.getState();
     const options = [
       `🎚 切换叙事节奏（当前：${s.pacingMode} · Alt+P）`,
+      `✒️ 回复篇幅与叙事视角（${s.responseLength} · ${s.narrativePov} · /rp style）`,
+      `🚫 反 AI 套话禁词表（${s.bannedPhrases.length} 词 · /rp ban）`,
+      "✂️ 局部定向改写上一条回复 (/rp rewrite)",
       `💭 角色内心独白 (<thought>)：${s.innerMonologue ? "● 已开启（点击关闭）" : "○ 已关闭（点击开启）"}`,
       "⚡ 管理与触发快捷回复 / 动作宏 (Alt+E)",
       `✨ 一键 AI 深度建档 (/rp analyze · ${rt.getCard()?.worldProfile?.source === "llm-analyzed" ? "已建档" : "启发式"})`,
@@ -1014,7 +1031,16 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
     const pick = await ctx.ui.select(sheetHeader(ctx, "🎬 导演台与快捷动作"), options);
     if (!pick || pick.startsWith("←")) return;
 
-    if (pick.startsWith("🎚")) {
+    if (pick.startsWith("✒️")) {
+      await rt.styleControl?.(ctx);
+      continue;
+    } else if (pick.startsWith("🚫")) {
+      await rt.banPhrases?.(ctx);
+      continue;
+    } else if (pick.startsWith("✂️")) {
+      await rt.rewriteLast?.(ctx);
+      return;
+    } else if (pick.startsWith("🎚")) {
       const p = await ctx.ui.select("选择叙事节奏", [
         "relaxed — 舒缓细腻，注重氛围与日常互动",
         "balanced — 均衡自然（默认）",

@@ -394,3 +394,38 @@ test("Forum workflows: actionImpersonate prefills editor via setEditorText witho
   assert.equal(txCount, 0);
   assert.equal(sentCount, 0);
 });
+
+test("DeepSeek DSML / malformed <rp_state_patch\"> leak detector catches broken tags without false-positiving prose", async () => {
+  const { isMalformedToolLeakText } = await import("../src/index.js");
+  assert.equal(isMalformedToolLeakText('<rp_state_patch">'), true);
+  assert.equal(isMalformedToolLeakText('<｜DSML｜function_calls><｜DSML｜invoke name="rp_state_patch">'), true);
+  assert.equal(isMalformedToolLeakText("风从城门洞子里灌进来，她抬头看了你一眼。"), false);
+  assert.equal(isMalformedToolLeakText('<rp_state_patch"> 她推开门走了进来。'), false);
+});
+
+test("Hardcore workflows: Zone 3 injects length/POV/anti-slop cues only when configured or repeating", () => {
+  const card = compileCharacterCard(
+    { spec: "chara_card_v2", data: { name: "柳春娘", description: "游医", scenario: "德州城", first_mes: "进门吧。" } },
+    "v2",
+  );
+  const state = createInitialRpState();
+  state.active = true;
+
+  const cleanZ3 = buildZone3TransientTail({ card, state, recalledLore: [], recentText: "普通对话内容" });
+  assert.equal(cleanZ3.includes("Length cue"), false);
+  assert.equal(cleanZ3.includes("POV cue"), false);
+  assert.equal(cleanZ3.includes("Avoid repeating"), false);
+
+  applyRpTx(state, {
+    kind: "config_patch",
+    responseLength: "concise",
+    narrativePov: "third",
+    bannedPhrases: ["微微一笑"],
+  });
+  const noisyRecent = "她眼底闪过一丝冷意，接着转过身。片刻后她眼底闪过一丝犹豫。";
+  const styledZ3 = buildZone3TransientTail({ card, state, recalledLore: [], recentText: noisyRecent });
+  assert.ok(styledZ3.includes("Length cue"));
+  assert.ok(styledZ3.includes("POV cue"));
+  assert.ok(styledZ3.includes("微微一笑"));
+  assert.ok(styledZ3.includes("眼底闪过一丝"));
+});

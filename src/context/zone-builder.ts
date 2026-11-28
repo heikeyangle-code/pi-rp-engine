@@ -37,7 +37,7 @@ import { selectFactsForZone3 } from "../memory/bitemporal.js";
 import { evaluateGate, partitionEpistemicFacts } from "../engine/gates.js";
 import { selectActiveForesights } from "../memory/foresight.js";
 import { selectRelevantBeliefs } from "../memory/graph-ppr.js";
-import type { NarrativeHealthReport } from "../engine/stagnation.js";
+import { detectRepeatedCliches, type NarrativeHealthReport } from "../engine/stagnation.js";
 import { estimateTokens } from "./token-budget.js";
 
 function fnv1aSeed(str: string): number {
@@ -449,11 +449,34 @@ export function buildZone3TransientTail(options: {
 
   // 4. Optional Director Pacing, Active Storylets, Genuine Narrative Health Guards & Active Director Notes
   const pacingCue = PACING_HINTS[state.pacingMode];
+  const lengthCue =
+    state.responseLength === "concise"
+      ? "Length cue: Keep this reply crisp and punchy (~200-350 chars / 2-3 short paragraphs)."
+      : state.responseLength === "novel"
+        ? "Length cue: Write an immersive novel-length scene (~650-1000 chars) rich in concrete sensory detail and subtext."
+        : null;
+  const povCue =
+    state.narrativePov === "second"
+      ? "POV cue: Narrate strictly in second person (你/you) for the player's perspective."
+      : state.narrativePov === "third"
+        ? "POV cue: Narrate in literary third person."
+        : state.narrativePov === "first_char"
+          ? "POV cue: Narrate from the character's first-person perspective."
+          : null;
+  const autoSlopHits = detectRepeatedCliches(recentText);
+  const combinedBans = Array.from(new Set([...(state.bannedPhrases ?? []), ...autoSlopHits])).slice(0, 12);
+  const banCue =
+    combinedBans.length > 0
+      ? `Avoid repeating these overused phrases/clichés: ${combinedBans.join(" / ")}.`
+      : null;
   const activeStorylets = evaluateActiveStorylets(state);
   const noteLines = [
     ...(state.sceneObjective ? [`- Scene Objective: ${state.sceneObjective}`] : []),
     ...activeStorylets.map((s) => `- [Triggered Storylet · ${s.title}] ${s.triggerPrompt}`),
     ...(pacingCue ? [`- ${pacingCue}`] : []),
+    ...(lengthCue ? [`- ${lengthCue}`] : []),
+    ...(povCue ? [`- ${povCue}`] : []),
+    ...(banCue ? [`- ${banCue}`] : []),
     ...(narrativeHealth?.antiRepetitionCue ? [`- ${narrativeHealth.antiRepetitionCue}`] : []),
     ...(narrativeHealth?.antiStagnationCue ? [`- ${narrativeHealth.antiStagnationCue}`] : []),
     ...state.notes.map((n) => `- ${n.text}`),

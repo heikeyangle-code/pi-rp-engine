@@ -658,6 +658,8 @@ export interface ContextXRaySnapshot {
 export type SettlementMode = "off" | "tool-assisted" | "sidecar-light";
 export type HudMode = "minimal" | "full" | "off";
 export type PacingMode = "relaxed" | "balanced" | "dramatic";
+export type ResponseLengthMode = "concise" | "standard" | "novel";
+export type NarrativePovMode = "auto" | "second" | "third" | "first_char";
 
 export type RpTxEntry =
   | {
@@ -679,6 +681,9 @@ export type RpTxEntry =
       hudMode?: HudMode;
       settlementMode?: SettlementMode;
       pacingMode?: PacingMode;
+      responseLength?: ResponseLengthMode;
+      narrativePov?: NarrativePovMode;
+      bannedPhrases?: string[];
       rawPassthrough?: boolean;
       loreTokenBudget?: number;
       sidecarModel?: string | null;
@@ -759,6 +764,9 @@ export interface SessionRpState {
   hudMode: HudMode;
   settlementMode: SettlementMode;
   pacingMode: PacingMode;
+  responseLength: ResponseLengthMode;
+  narrativePov: NarrativePovMode;
+  bannedPhrases: string[];
   loreTokenBudget: number;
   sidecarModel?: string;
   innerMonologue: boolean;

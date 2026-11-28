@@ -18,7 +18,9 @@ import type {
   ContextXRaySnapshot,
   HudMode,
   MemoryBookEntry,
+  NarrativePovMode,
   PacingMode,
+  ResponseLengthMode,
   PersonaProfile,
   PiExtensionAPI,
   PiExtensionContext,
@@ -2776,3 +2778,401 @@ export async function actionManageLibrary(rt: RpRuntimeHandle, ctx: PiExtensionC
   }
 }
 
+
+
+/**
+ * 1. Targeted Partial Rewrite (`/rp rewrite`):
+ * Rewrites ONLY the parts of the last assistant reply specified by the user via an isolated model call,
+ * shows a preview, and non-destructively replaces the old floor (preserving original in `/rp unhide`).
+ */
+export async function actionRewriteLast(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  if (!canCompleteWithRegistry(ctx)) {
+    ctx.ui.notify("当前环境不支持模型调用，无法执行局部改写。", "warning");
+    return;
+  }
+
+  const branch = ctx.sessionManager.getBranch();
+  let lastAssistant: (typeof branch)[number] | undefined;
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const e = branch[i]!;
+    if (e.type === "message" && e.message?.role === "assistant") {
+      const fp = computeMessageFingerprint(e.message);
+      if (!state.hiddenEntryIds.has(e.id) && !state.hiddenFingerprints.has(fp)) {
+        lastAssistant = e;
+        break;
+      }
+    }
+  }
+  if (!lastAssistant?.message) {
+    ctx.ui.notify("当前分支没有可改写的回复。", "info");
+    return;
+  }
+
+  const original = extractMsgPlain(lastAssistant.message).trim();
+  if (!original) {
+    ctx.ui.notify("上一条回复内容为空。", "info");
+    return;
+  }
+
+  let instruction = argsText.trim();
+  if (!instruction) {
+    const pick = await ctx.ui.select("✂️ 局部定向改写上一条回复", [
+      "✏️ 输入具体改写要求（如：保留前两段，只改结尾让她拒绝交易）",
+      "🧹 去 AI 味润色（保留全部剧情，去掉翻译腔与陈词滥调）",
+      "📉 精简压缩篇幅（保留关键动作与对白，压到 350 字以内）",
+      "🔥 增强人物锋芒（让角色更克制、更有防备心与潜台词）",
+      "✕ 取消",
+    ]);
+    if (!pick || pick.startsWith("✕")) return;
+    if (pick.startsWith("✏️")) {
+      const entered = (await ctx.ui.input("输入局部改写要求", ""))?.trim();
+      if (!entered) return;
+      instruction = entered;
+    } else {
+      instruction = pick.replace(/^[^\s]+\s+/, "");
+    }
+  }
+
+  ctx.ui.notify("✂️ 正在按要求定向改写上一条回复…", "info");
+  let rewritten = "";
+  try {
+    rewritten = (
+      await completeWithRegistry(ctx, ctx.model, {
+        systemPrompt:
+          `You are a precision fiction editor revising the latest narrative reply for "${card.identity.name}". ` +
+          `Apply ONLY the user's requested edit while preserving unaffected paragraphs, tone, language, and continuity. ` +
+          `Output ONLY the revised prose (no explanations, no markdown wrappers).`,
+        userPrompt: `Original reply:\n${original}\n\nRequested edit:\n${instruction}`,
+        maxTokens: 1600,
+        signal: ctx.signal,
+      })
+    ).trim();
+  } catch (err) {
+    ctx.ui.notify(`改写失败：${(err as Error).message}`, "error");
+    return;
+  }
+
+  if (!rewritten) {
+    ctx.ui.notify("未生成有效改写结果。", "warning");
+    return;
+  }
+
+  const ok = await ctx.ui.confirm(
+    "确认替换为改写后的版本？（原版将非破坏性隐藏，随时可恢复）",
+    rewritten.slice(0, 600) + (rewritten.length > 600 ? "\n…（已截断预览）" : ""),
+  );
+  if (!ok) return;
+
+  const fp = computeMessageFingerprint(lastAssistant.message);
+  rt.commitTx({ kind: "hide_toggle", entryIds: [lastAssistant.id], fingerprints: [fp], hidden: true });
+  rt.pi.sendMessage(
+    {
+      customType: "rp:rewrite",
+      content: rewritten,
+      display: true,
+      details: { kind: "rewrite", instruction },
+    },
+    { triggerTurn: false },
+  );
+  ctx.ui.notify("✅ 已非破坏性替换为改写版本（原楼层已隐藏，/rp unhide 可随时找回）。", "info");
+}
+
+/**
+ * 2. Response Length & Narrative POV Control (`/rp style`):
+ * 1-tap Bottom Sheet to configure response length & POV, injected cleanly via Zone 3.
+ */
+export async function actionStyleControl(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const lenZh: Record<ResponseLengthMode, string> = {
+    concise: "精炼快节奏 (~200-350字)",
+    standard: "标准均衡 (默认)",
+    novel: "小说长篇 (~650-1000字)",
+  };
+  const povZh: Record<NarrativePovMode, string> = {
+    auto: "跟随角色卡默认",
+    second: "第二人称「你」",
+    third: "第三人称叙事",
+    first_char: "角色第一人称",
+  };
+
+  const arg = argsText.trim().toLowerCase();
+  if (arg === "concise" || arg === "standard" || arg === "novel") {
+    rt.commitTx({ kind: "config_patch", responseLength: arg });
+    ctx.ui.notify(`篇幅档位已切换：${lenZh[arg]}`, "info");
+    return;
+  }
+  if (arg === "auto" || arg === "second" || arg === "third" || arg === "first_char") {
+    rt.commitTx({ kind: "config_patch", narrativePov: arg });
+    ctx.ui.notify(`叙事视角已切换：${povZh[arg]}`, "info");
+    return;
+  }
+
+  const pick = await ctx.ui.select(
+    `✒️ 篇幅与视角控制（当前：${lenZh[state.responseLength]} · ${povZh[state.narrativePov]}）`,
+    [
+      "📏 切换回复篇幅（精炼 / 标准 / 小说长篇）",
+      "👁 切换叙事视角（默认 / 第二人称 / 第三人称 / 角色第一人称）",
+      "✕ 返回",
+    ],
+  );
+  if (!pick || pick.startsWith("✕")) return;
+
+  if (pick.startsWith("📏")) {
+    const p = await ctx.ui.select("选择回复篇幅档位", [
+      "concise — ⚡ 精炼快节奏（200-350字，适合高频对话）",
+      "standard — 📖 标准均衡（默认，不额外限制）",
+      "novel — 📚 小说长篇（650-1000字，细节与潜台词丰满）",
+    ]);
+    if (!p) return;
+    const next = p.split(" ")[0] as ResponseLengthMode;
+    rt.commitTx({ kind: "config_patch", responseLength: next });
+    ctx.ui.notify(`篇幅档位已切换：${lenZh[next]}`, "info");
+  } else {
+    const p = await ctx.ui.select("选择叙事人称视角", [
+      "auto — 跟随角色卡原设定（默认）",
+      "second — 第二人称（以「你」沉浸代入）",
+      "third — 第三人称（文学旁观/限知视角）",
+      "first_char — 角色第一人称（角色自述）",
+    ]);
+    if (!p) return;
+    const next = p.split(" ")[0] as NarrativePovMode;
+    rt.commitTx({ kind: "config_patch", narrativePov: next });
+    ctx.ui.notify(`叙事视角已切换：${povZh[next]}`, "info");
+  }
+}
+
+/**
+ * 3. Dynamic Anti-Slop Banlist Manager (`/rp ban`):
+ * Lets players curate session-specific banned clichés (paired with automatic repetition detection in Zone 3).
+ */
+export async function actionBanPhrases(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const arg = argsText.trim();
+  if (arg) {
+    const additions = arg.split(/[,，/]/).map((x) => x.trim()).filter(Boolean);
+    const next = Array.from(new Set([...state.bannedPhrases, ...additions]));
+    rt.commitTx({ kind: "config_patch", bannedPhrases: next });
+    ctx.ui.notify(`已加入本局禁词表：${additions.join("、")}`, "info");
+    return;
+  }
+
+  const CN_SLOP_PACK = ["眼底闪过一丝", "空气仿佛凝固", "喉结滚动", "嘴角勾起一抹", "指节发白", "心头一震", "不禁", "仿佛"];
+  while (true) {
+    const cur = rt.getState().bannedPhrases;
+    const pick = await ctx.ui.select(
+      `🚫 反 AI 套话禁词表（当前 ${cur.length} 词 · 另含自动复读检测）`,
+      [
+        "+ 添加自定义禁词（逗号分隔）",
+        "📦 一键导入中文常见 AI 套话包（8 词）",
+        ...cur.map((w) => `🗑 移除：${w}`),
+        ...(cur.length > 0 ? ["🧹 清空全部禁词"] : []),
+        "← 返回",
+      ],
+    );
+    if (!pick || pick.startsWith("←")) return;
+    if (pick.startsWith("+")) {
+      const entered = (await ctx.ui.input("输入要禁止的词或短语（逗号分隔）", ""))?.trim();
+      if (!entered) continue;
+      const adds = entered.split(/[,，/]/).map((x) => x.trim()).filter(Boolean);
+      rt.commitTx({ kind: "config_patch", bannedPhrases: Array.from(new Set([...cur, ...adds])) });
+    } else if (pick.startsWith("📦")) {
+      rt.commitTx({ kind: "config_patch", bannedPhrases: Array.from(new Set([...cur, ...CN_SLOP_PACK])) });
+      ctx.ui.notify("已导入中文常见 AI 套话包。", "info");
+    } else if (pick.startsWith("🧹")) {
+      rt.commitTx({ kind: "config_patch", bannedPhrases: [] });
+      ctx.ui.notify("已清空自定义禁词表。", "info");
+    } else if (pick.startsWith("🗑")) {
+      const target = pick.replace(/^🗑 移除：/, "");
+      rt.commitTx({ kind: "config_patch", bannedPhrases: cur.filter((x) => x !== target) });
+    }
+  }
+}
+
+/**
+ * 4a. Group-Cast Spotlight (`/rp spotlight`):
+ * Picks a specific NPC to take the narrative center stage on the next turn (1-turn director spotlight).
+ */
+export async function actionSpotlight(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  let target = argsText.trim();
+  if (!target) {
+    const candidates = Array.from(
+      new Set([
+        ...state.presentNpcs,
+        ...rt.getExtraCastCards().map((c) => c.identity.nickname || c.identity.name),
+      ]),
+    ).filter(Boolean);
+    const pick = await ctx.ui.select("🔦 群像镜头切换：指定下一轮主导角色 (Spotlight)", [
+      ...candidates.map((n) => `🎭 镜头聚焦：${n}`),
+      "✏️ 输入指定 NPC 名字",
+      "✕ 取消",
+    ]);
+    if (!pick || pick.startsWith("✕")) return;
+    if (pick.startsWith("✏️")) {
+      target = (await ctx.ui.input("输入下一轮重点描写的角色名", ""))?.trim() || "";
+    } else {
+      target = pick.replace(/^🎭 镜头聚焦：/, "").trim();
+    }
+  }
+  if (!target) return;
+
+  rt.commitTx({
+    kind: "note_set",
+    note: {
+      id: `spotlight_${Date.now().toString(36)}`,
+      text: `[镜头聚焦] 下一回合请将叙事重心交给「${target}」，重点刻画其立场、神态、主动发言或暗中举动。`,
+      remainingTurns: 1,
+    },
+  });
+  rt.refreshHud(ctx);
+  ctx.ui.notify(`🔦 已将下一轮镜头聚焦至「${target}」（生效 1 轮）。`, "info");
+}
+
+/**
+ * 4b. Zero-Pollution Off-Screen Interlude / Side-Scene (`/rp interlude`):
+ * Generates an isolated off-screen NPC/villain POV scene or fun parallel mini-theater WITHOUT polluting main chat!
+ */
+export async function actionInterlude(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  if (!canCompleteWithRegistry(ctx)) {
+    ctx.ui.notify("当前环境不支持模型调用，无法生成插叙小剧场。", "warning");
+    return;
+  }
+
+  let promptTopic = argsText.trim();
+  if (!promptTopic) {
+    const pick = await ctx.ui.select("🎞 零污染幕后插叙 / 小剧场（不改变主线状态与时间）", [
+      "🕵️ 此时此刻·幕后视角（不在场人物/暗流势力正在做什么）",
+      "💭 角色独白视角（刚才那场戏结束后，TA 独自一人时的真实想法）",
+      "💬 江湖/论坛体吐槽（旁观者视角议论最近发生的事）",
+      "✏️ 自定义插叙或番外主题",
+      "✕ 取消",
+    ]);
+    if (!pick || pick.startsWith("✕")) return;
+    if (pick.startsWith("✏️")) {
+      promptTopic = (await ctx.ui.input("输入想看的插叙/番外主题", ""))?.trim() || "";
+    } else {
+      promptTopic = pick.replace(/^[^\s]+\s+/, "");
+    }
+  }
+  if (!promptTopic) return;
+
+  const recent = collectRecentDialogueLines(ctx, state, 8);
+  const facts = getActiveFacts(state).slice(-6).map((f) => `- ${f.statement}`).join("\n");
+  ctx.ui.notify("🎞 正在生成零污染幕后插叙（不影响主线）…", "info");
+  let text = "";
+  try {
+    text = (
+      await completeWithRegistry(ctx, ctx.model, {
+        systemPrompt:
+          `Write an engaging, self-contained off-screen interlude / side-scene for "${card.identity.name}". ` +
+          `Stay faithful to established character voices and world tone. Match the story's language. Output ONLY the scene prose (~350-650 chars).`,
+        userPrompt:
+          `World state: ${[state.era, state.worldTimeLabel, state.location].filter(Boolean).join(" · ")}\n` +
+          (facts ? `Facts:\n${facts}\n\n` : "") +
+          (recent.length ? `Recent main scene:\n${recent.join("\n")}\n\n` : "") +
+          `Interlude request: ${promptTopic}`,
+        maxTokens: 1100,
+        signal: ctx.signal,
+      })
+    ).trim();
+  } catch (err) {
+    ctx.ui.notify(`生成失败：${(err as Error).message}`, "error");
+    return;
+  }
+  if (!text) return;
+
+  if (typeof ctx.ui.editor === "function") {
+    await ctx.ui.editor(`🎞 幕后插叙（关闭即清除，不污染主线）· ${promptTopic.slice(0, 22)}`, text);
+  } else {
+    await ctx.ui.select(`🎞 幕后插叙`, [...text.split(/\r?\n/).filter((l) => l.trim()).slice(0, 28), "✕ 关闭"]);
+  }
+}
+
+/**
+ * 5. Export Clean Novel (`/rp export`):
+ * Exports the active branch as a clean Markdown novel (excluding OOC, hidden floors, and system cards).
+ */
+export async function actionExportNovel(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const branch = ctx.sessionManager.getBranch();
+  const sections: string[] = [
+    `# ${card.identity.name}`,
+    `> 导出时间：${new Date().toISOString().slice(0, 16).replace("T", " ")} · 玩家：${state.currentPersona.name} · 共 ${state.turn} 轮`,
+    "",
+  ];
+
+  let chapterIdx = 1;
+  let msgCount = 0;
+  for (const e of branch) {
+    if (e.type === "message" && e.message) {
+      const m = e.message;
+      if (m.customType === "rp:ooc" || m.customType === "rp:event") continue;
+      const fp = computeMessageFingerprint(m);
+      if (state.hiddenEntryIds.has(e.id) || state.hiddenFingerprints.has(fp)) continue;
+      const txt = extractMsgPlain(m).trim();
+      if (!txt || txt.startsWith("[OOC")) continue;
+
+      if (m.customType === "rp:era") {
+        chapterIdx += 1;
+        sections.push(`## 第 ${chapterIdx} 节`, "", `> ${txt.split("\n")[0]}`, "");
+        continue;
+      }
+      if (m.role === "user") {
+        sections.push(`**${state.currentPersona.name}**：${txt}`, "");
+        msgCount += 1;
+      } else if (m.role === "assistant" || m.customType === "rp:greeting" || m.customType === "rp:rewrite") {
+        sections.push(txt, "");
+        msgCount += 1;
+      }
+    }
+  }
+
+  if (msgCount === 0) {
+    ctx.ui.notify("当前分支还没有可导出的正文内容。", "info");
+    return;
+  }
+
+  const exportDir = path.join(state.worldDir || getGlobalLibraryDir(), "exports");
+  fs.mkdirSync(exportDir, { recursive: true });
+  const stamp = new Date().toISOString().slice(0, 10);
+  const customName = argsText.trim().replace(/[^a-zA-Z0-9\u4e00-\u9fa5_-]+/g, "_");
+  const fileName = customName ? `${customName}.md` : `${card.slug}-${stamp}.md`;
+  const outPath = path.join(exportDir, fileName);
+  const fullText = sections.join("\n");
+  fs.writeFileSync(outPath, fullText, "utf-8");
+
+  ctx.ui.notify(`📖 已导出纯净小说（${msgCount} 段，约 ${fullText.length} 字）：${outPath}`, "info");
+}

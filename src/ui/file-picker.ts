@@ -35,11 +35,12 @@ interface UiPrefs {
 }
 
 export const DEFAULT_QUICK_REPLIES: QuickReplyItem[] = [
-  { id: "qr_observe", label: "👀 环顾四周与细察神情", text: "*我放慢呼吸，仔细打量周围的环境细节与对方细微的神情变化。*", mode: "send" },
-  { id: "qr_silent", label: "🤫 沉默注视等待反应", text: "*我没有立刻开口，只是安静地看着对方，等待接下来的反应。*", mode: "send" },
-  { id: "qr_tension", label: "⚡ 导演指令：升温冲突", text: "本回合提高戏剧张力，让潜藏的矛盾或意外细节浮出水面。", mode: "steer" },
-  { id: "qr_slow", label: "🌙 导演指令：放缓节奏细腻描写", text: "本回合放缓叙事节奏，多用感官细节、微表情与留白来刻画氛围。", mode: "steer" },
-  { id: "qr_dialogue", label: "💬 预填动作+对白模板", text: "*（动作与神态）* 「……」", mode: "editor" },
+  { id: "qr_push", label: "🎬 推进当前戏（引入自然变数）", text: "本回合用具体行动或外界突发细节自然推进场景，避免原地寒暄。", mode: "steer" },
+  { id: "qr_detail", label: "🔍 细节特写与环境白描", text: "放慢这一拍，用光线、声响、触感与微表情刻画当下气氛，不直接点破心理。", mode: "steer" },
+  { id: "qr_npc", label: "🗣 让在场配角主动开口/插话", text: "让在场的其他人物带着各自意图自然介入对话或做出反应，不要只围着主角转。", mode: "steer" },
+  { id: "qr_antislop", label: "🛡 去 AI 味 & 严禁替主角越权", text: "保持克制白描，禁止陈词滥调与总结升华，绝不替玩家说话或做决定。", mode: "steer" },
+  { id: "qr_silent", label: "🤫 沉默注视，把压力抛给对方", text: "我没有立刻接话，只是目光平静地看着对方，等对方先开口。", mode: "send" },
+  { id: "qr_dialogue", label: "💬 预填动作+对白模板", text: "（动作与神态）「……」", mode: "editor" },
 ];
 
 const VALID_EXTS = new Set([".png", ".charx", ".json"]);

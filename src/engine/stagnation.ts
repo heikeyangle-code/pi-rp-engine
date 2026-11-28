@@ -101,3 +101,33 @@ export function evaluateNarrativeHealth(
     status,
   };
 }
+
+
+const COMMON_SLOP_WATCHLIST = [
+  "眼底闪过一丝",
+  "空气仿佛凝固",
+  "喉结滚动",
+  "嘴角勾起一抹",
+  "指节发白",
+  "心头一震",
+  "莫名其妙地",
+  "shiver down",
+  "couldn't help but",
+  "a testament to",
+  "let out a breath",
+];
+
+/** Detect stock AI clichés actually repeating (>= 2 occurrences) across recent assistant replies. */
+export function detectRepeatedCliches(recentText: string): string[] {
+  if (!recentText) return [];
+  const lower = recentText.toLowerCase();
+  const hits: string[] = [];
+  for (const phrase of COMMON_SLOP_WATCHLIST) {
+    const p = phrase.toLowerCase();
+    const first = lower.indexOf(p);
+    if (first !== -1 && lower.indexOf(p, first + p.length) !== -1) {
+      hits.push(phrase);
+    }
+  }
+  return hits.slice(0, 6);
+}

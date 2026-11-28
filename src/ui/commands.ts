@@ -8,6 +8,12 @@ import { listAllCardSummaries, listPresetIds } from "../storage/workspace-store.
 import {
   type RpRuntimeHandle,
   actionAnalyzeCard,
+  actionBanPhrases,
+  actionExportNovel,
+  actionInterlude,
+  actionRewriteLast,
+  actionSpotlight,
+  actionStyleControl,
   actionBookmarkGoto,
   actionBookmarkSave,
   actionContinue,
@@ -57,6 +63,12 @@ const SUBCOMMANDS: Array<{ value: string; description: string }> = [
   { value: "library", description: "管理并清理已导入的角色卡、预设与玩家马甲" },
   { value: "imp", description: "以玩家视角帮我代写一段回复并填入输入框 (Alt+I)" },
   { value: "ask", description: "零污染场外提问 Side Prompt，不写入历史 (Alt+Q)" },
+  { value: "rewrite", description: "局部定向改写上一条回复（非破坏性替换）" },
+  { value: "style", description: "一键切换回复篇幅（精炼/标准/长篇）与叙事人称" },
+  { value: "ban", description: "管理本局反 AI 套话禁词表（另含自动复读检测）" },
+  { value: "spotlight", description: "群像镜头切换：指定下一轮主导 NPC" },
+  { value: "interlude", description: "零污染幕后插叙 / 敌方视角 / 番外小剧场" },
+  { value: "export", description: "一键导出当前分支为纯净 Markdown 小说" },
   { value: "reroll", description: "重摇上一条回复（支持定向微调预设，旧分支保留在 /tree · Alt+W）" },
   { value: "continue", description: "让角色无缝续写剧情 (Alt+K)" },
   { value: "act", description: "生成 3 个符合当下情境的行动建议 (Alt+A)" },
@@ -107,6 +119,12 @@ export function makeDashboardRuntime(rt: RpRuntimeHandle): DashboardRuntime {
     openQuickReplies: (ctx) => actionQuickReplies(rt, ctx, ""),
     pickSidecarModel: (ctx) => actionSidecarModel(rt, ctx, ""),
     manageLibrary: (ctx) => actionManageLibrary(rt, ctx),
+    rewriteLast: (ctx) => actionRewriteLast(rt, ctx, ""),
+    styleControl: (ctx) => actionStyleControl(rt, ctx, ""),
+    banPhrases: (ctx) => actionBanPhrases(rt, ctx, ""),
+    spotlightNpc: (ctx) => actionSpotlight(rt, ctx, ""),
+    interludeScene: (ctx) => actionInterlude(rt, ctx, ""),
+    exportNovel: (ctx) => actionExportNovel(rt, ctx, ""),
   };
 }
 
@@ -396,6 +414,30 @@ export function registerRpCommands(pi: PiExtensionAPI, rt: RpRuntimeHandle): voi
         case "loregen":
         case "lore-add":
           await actionGenerateLoreEntry(rt, ctx, rest);
+          return;
+        case "rewrite":
+          await actionRewriteLast(rt, ctx, rest);
+          return;
+        case "style":
+        case "pov":
+        case "len":
+          await actionStyleControl(rt, ctx, rest);
+          return;
+        case "ban":
+        case "slop":
+          await actionBanPhrases(rt, ctx, rest);
+          return;
+        case "spotlight":
+        case "focus":
+          await actionSpotlight(rt, ctx, rest);
+          return;
+        case "interlude":
+        case "theater":
+          await actionInterlude(rt, ctx, rest);
+          return;
+        case "export":
+        case "novel":
+          await actionExportNovel(rt, ctx, rest);
           return;
         case "reroll":
         case "swipe":

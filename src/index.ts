@@ -33,7 +33,7 @@ import type {
   SessionRpState,
 } from "./types.js";
 import { createHash } from "node:crypto";
-import { RP_ENTRY_TYPE, applyRpTx, createInitialRpState, replayBranchState } from "./engine/state-replay.js";
+import { RP_ENTRY_TYPE, applyRpTx, computeMessageFingerprint, createInitialRpState, replayBranchState } from "./engine/state-replay.js";
 import { loadCompiledCard, loadCompiledPreset, resolveCardBySlug } from "./storage/workspace-store.js";
 import { recallLoreWithGraphPpr, recallMemoryBooks } from "./memory/graph-ppr.js";
 import { buildSemanticMemSceneCompaction } from "./memory/compaction.js";
@@ -93,6 +93,21 @@ function extractMessageText(msg: PiMessage | undefined): string {
   return "";
 }
 
+
+/** Detect DeepSeek V4 DSML / malformed XML tool-call leak that ends with stopReason="stop" and no real story prose. */
+export function isMalformedToolLeakText(text: string): boolean {
+  const trimmed = text.trim();
+  if (!trimmed) return false;
+  if (trimmed.length > 220) return false;
+  // Strip any leaked DSML / XML tool tags & quotes; if nothing meaningful remains, it's a pure leak!
+  const stripped = trimmed
+    .replace(/<[|｜]?\s*DSML\s*[|｜]?[^>]*>?/gi, "")
+    .replace(/<\/?(?:function_calls|invoke|parameter|tool_call|rp_[a-z_]+)\b[^>]*>?/gi, "")
+    .replace(/["'`\s<>|｜\/]+/g, "")
+    .trim();
+  return stripped.length === 0;
+}
+
 export default function rpEngineExtension(pi: PiExtensionAPI): void {
   let state: SessionRpState = createInitialRpState();
   let activeCard: CompiledCard | null = null;
@@ -105,6 +120,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   let lastUserText = "";
   let lastAssistantText = "";
   let lastSidecarSettledTurn = -1;
+  let consecutiveLeakRecoveries = 0;
   let lastToolsHash = "";
   let lastZone1Hash = "";
   let lastZone1Tokens = 0;
@@ -141,6 +157,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     lastUserText = "";
     lastAssistantText = "";
     lastSidecarSettledTurn = -1;
+    consecutiveLeakRecoveries = 0;
     lastToolsHash = "";
     lastZone1Hash = "";
     lastZone1Tokens = 0;
@@ -635,6 +652,34 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
 
     if (msg) {
       lastAssistantText = extractMessageText(msg);
+      // Auto-recover from DeepSeek V4 DSML / malformed `<rp_state_patch">` stop without burning a turn or polluting history!
+      if (isMalformedToolLeakText(lastAssistantText)) {
+        const fp = computeMessageFingerprint(msg);
+        const entryId = typeof msg.entryId === "string" ? msg.entryId : typeof msg.id === "string" ? msg.id : null;
+        commitTx({
+          kind: "hide_toggle",
+          entryIds: entryId ? [entryId] : [],
+          fingerprints: [fp],
+          hidden: true,
+        });
+        if (consecutiveLeakRecoveries < 1) {
+          consecutiveLeakRecoveries += 1;
+          ctx?.ui?.notify?.("检测到模型输出残缺工具标签，已自动静默恢复生成正文…", "info");
+          pi.sendMessage(
+            {
+              customType: "rp:event",
+              content:
+                "[Auto-recovery: the previous output contained only malformed tool markup. Output the narrative prose directly now.]",
+              display: false,
+              details: { kind: "leak_recovery" },
+            },
+            { triggerTurn: true },
+          );
+          return;
+        }
+      } else if (lastAssistantText.trim().length > 0) {
+        consecutiveLeakRecoveries = 0;
+      }
     }
 
     const thisTurnOoc = isOocTurn;

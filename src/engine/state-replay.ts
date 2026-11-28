@@ -61,6 +61,9 @@ export function createInitialRpState(): SessionRpState {
     hudMode: "minimal",
     settlementMode: "tool-assisted",
     pacingMode: "balanced",
+    responseLength: "standard",
+    narrativePov: "auto",
+    bannedPhrases: [],
     loreTokenBudget: 1800,
     sidecarModel: undefined,
     innerMonologue: false,
@@ -162,6 +165,9 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       if (tx.hudMode !== undefined) state.hudMode = tx.hudMode;
       if (tx.settlementMode !== undefined) state.settlementMode = tx.settlementMode;
       if (tx.pacingMode !== undefined) state.pacingMode = tx.pacingMode;
+      if (tx.responseLength !== undefined) state.responseLength = tx.responseLength;
+      if (tx.narrativePov !== undefined) state.narrativePov = tx.narrativePov;
+      if (tx.bannedPhrases !== undefined) state.bannedPhrases = [...tx.bannedPhrases];
       if (tx.rawPassthrough !== undefined) state.rawPassthrough = tx.rawPassthrough;
       if (tx.loreTokenBudget !== undefined) state.loreTokenBudget = tx.loreTokenBudget;
       if (tx.sidecarModel !== undefined) state.sidecarModel = tx.sidecarModel || undefined;
