@@ -175,6 +175,269 @@ async function openStoryletsManager(rt: DashboardRuntime, ctx: PiExtensionContex
   }
 }
 
+
+async function openFlagsAndModulesManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const flagItems = Object.entries(s.flags).map(([k, v]) => `${v ? "● 开" : "○ 关"}  ${k}`);
+    const modLabels = [
+      `⚙ 模块[数值 stats]：${s.modules.stats ? "● 开" : "○ 关"}`,
+      `⚙ 模块[背包 inventory]：${s.modules.inventory ? "● 开" : "○ 关"}`,
+      `⚙ 模块[时钟 clocks]：${s.modules.clocks ? "● 开" : "○ 关"}`,
+      `⚙ 模块[阶段 stages]：${s.modules.stages ? "● 开" : "○ 关"}`,
+    ];
+    const sub = await ctx.ui.select(
+      `🚩 世界状态 Flags (${Object.values(s.flags).filter(Boolean).length} 激活) 与模块开关`,
+      ["+ 新增状态标记 (Flag)", ...flagItems, ...modLabels, "← 返回"],
+    );
+    if (!sub || sub.startsWith("←")) return;
+    if (sub.startsWith("+")) {
+      const name = (await ctx.ui.input("Flag 名称（如：身负通缉、已获密钥）", ""))?.trim();
+      if (name) {
+        rt.commitTx({ kind: "flag_set", flag: name, value: true });
+        ctx.ui.notify(`已启用状态标记：${name}`, "info");
+      }
+    } else if (sub.startsWith("⚙ 模块[")) {
+      const m = /模块\[[^\s]+\s+(stats|inventory|clocks|stages)\]/.exec(sub);
+      const modKey = m?.[1] as keyof SessionRpState["modules"] | undefined;
+      if (modKey) {
+        const nextMods = { ...s.modules, [modKey]: !s.modules[modKey] };
+        rt.commitTx({ kind: "profile_apply", archetype: s.archetype, modules: nextMods });
+        rt.refreshHud(ctx);
+        ctx.ui.notify(`模块 ${modKey} 已${nextMods[modKey] ? "开启" : "关闭"}`, "info");
+      }
+    } else {
+      const name = sub.replace(/^[●○]\s+[开关]\s+/, "");
+      rt.commitTx({ kind: "flag_set", flag: name, value: !Boolean(s.flags[name]) });
+    }
+  }
+}
+
+async function openClocksManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const clocks = Object.values(s.clocks);
+    const sub = await ctx.ui.select(`⏱ 进度时钟与倒计时（共 ${clocks.length} 个）`, [
+      "+ 新建进度时钟",
+      ...clocks.map(
+        (c) =>
+          `⏳ [${c.clockId}] ${c.label}  ${renderProgressBar(c.value, c.max, 6)}  ${c.value}/${c.max}${c.completed ? " (完成)" : ""}`,
+      ),
+      "← 返回",
+    ]);
+    if (!sub || sub.startsWith("←")) return;
+    if (sub.startsWith("+")) {
+      const label = (await ctx.ui.input("时钟名称（如：警觉度、任务倒计时）", ""))?.trim();
+      if (!label) continue;
+      const max = Math.max(1, Number((await ctx.ui.input("总格数（如 4 / 6 / 8）", "4"))?.trim()) || 4);
+      const clockId = label.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_").slice(0, 24) || `clk_${Date.now()}`;
+      rt.commitTx({ kind: "progress_clock", clockId, label, delta: 0, max });
+      rt.refreshHud(ctx);
+    } else if (sub.startsWith("⏳")) {
+      const clockId = /\[([^\]]+)\]/.exec(sub)?.[1];
+      const clk = clockId ? s.clocks[clockId] : undefined;
+      if (!clk) continue;
+      const op = await ctx.ui.select(`${clk.label} (${clk.value}/${clk.max})`, ["+1 推进一格", "-1 回退一格", "← 返回"]);
+      if (op?.startsWith("+1")) {
+        rt.commitTx({ kind: "progress_clock", clockId: clk.clockId, label: clk.label, delta: 1, max: clk.max });
+        rt.refreshHud(ctx);
+      } else if (op?.startsWith("-1")) {
+        rt.commitTx({ kind: "progress_clock", clockId: clk.clockId, label: clk.label, delta: -1, max: clk.max });
+        rt.refreshHud(ctx);
+      }
+    }
+  }
+}
+
+async function openBeliefsManager(rt: DashboardRuntime, ctx: PiExtensionContext, filterActor?: string): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const list = (filterActor
+      ? s.beliefs.filter((b) => b.actorId === filterActor)
+      : s.beliefs
+    )
+      .slice(-20)
+      .reverse();
+    const opts = [
+      "+ 手动记录一条人物看法/信念",
+      ...list.map(
+        (b) =>
+          `◇ [T${b.turn}] ${b.actorId} → ${b.target}${b.emotionalTone ? ` [${b.emotionalTone}]` : ""}：${b.belief.slice(0, 40)}`,
+      ),
+      "← 返回",
+    ];
+    const title = filterActor ? `◇ ${filterActor} 对他人的看法与潜台词 (${list.length} 条)` : `◇ 人物信念与潜台词（共 ${s.beliefs.length} 条）`;
+    const sub = await ctx.ui.select(title, opts);
+    if (!sub || sub.startsWith("←")) return;
+
+    if (sub.startsWith("+")) {
+      const actorId = filterActor || (await ctx.ui.input("角色名称", rt.getCard()?.identity.name ?? "角色"))?.trim();
+      if (!actorId) continue;
+      const target = (await ctx.ui.input("针对对象", s.currentPersona.name))?.trim();
+      if (!target) continue;
+      const activatingEvent = (await ctx.ui.input("因为发生了什么事件", ""))?.trim();
+      if (!activatingEvent) continue;
+      const belief = (await ctx.ui.input("形成了什么看法/信念", ""))?.trim();
+      if (!belief) continue;
+      const subjectiveInsight = (await ctx.ui.input("内心潜台词（可选）", ""))?.trim() || undefined;
+      const emotionalTone = (await ctx.ui.input("情绪基调（可选）", ""))?.trim() || undefined;
+      rt.commitTx({
+        kind: "belief_update",
+        actorId,
+        target,
+        activatingEvent,
+        belief,
+        subjectiveInsight,
+        emotionalTone,
+        turn: s.turn,
+      });
+      ctx.ui.notify(`已记录信念：${actorId} → ${target}`, "info");
+      continue;
+    }
+
+    const chosen = list[opts.indexOf(sub) - 1];
+    if (!chosen) continue;
+    const detail = [
+      `角色：${chosen.actorId} → ${chosen.target}（第 ${chosen.turn} 轮）`,
+      chosen.emotionalTone ? `情绪基调：${chosen.emotionalTone}` : null,
+      `触发事件：${chosen.activatingEvent}`,
+      `核心看法：${chosen.belief}`,
+      chosen.subjectiveInsight ? `内心潜台词：${chosen.subjectiveInsight}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+    const act = await ctx.ui.select(`信念：${chosen.actorId} → ${chosen.target}`, [
+      "📖 查看完整内容",
+      "🗑 删除此条信念",
+      "← 返回",
+    ]);
+    if (act?.startsWith("📖")) {
+      await editLongText(ctx, `人物信念 · ${chosen.actorId}`, detail);
+    } else if (act?.startsWith("🗑")) {
+      const origIdx = s.beliefs.indexOf(chosen);
+      rt.commitTx({ kind: "belief_remove", id: chosen.id, index: origIdx >= 0 ? origIdx : undefined });
+      ctx.ui.notify("已删除该条信念。", "info");
+    }
+  }
+}
+
+async function openActorProfile(rt: DashboardRuntime, ctx: PiExtensionContext, actor: string): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const cfsmEntries = Object.entries(s.cfsmStates[actor] ?? {});
+    const statEntries = Object.entries(s.stats[actor] ?? {});
+    const invEntries = Object.entries(s.inventory[actor] ?? {});
+    const phys = s.physicalState[actor];
+    const anchor = s.voiceAnchors[actor];
+    const agenda = s.npcAgendas[actor];
+    const actorBeliefs = s.beliefs.filter((b) => b.actorId === actor);
+
+    const physSummary = phys
+      ? [phys.attire, phys.condition, phys.holding, phys.position].filter(Boolean).join(" · ").slice(0, 34)
+      : "未记录";
+    const cfsmSummary = cfsmEntries.map(([ax, st]) => `${ax}:${st.state}`).join(" · ") || "暂无";
+    const statSummary = statEntries.slice(0, 3).map(([k, v]) => `${k}=${String(v)}`).join(" · ") || "暂无";
+
+    const pick = await ctx.ui.select(`👤 人物档案：${actor}`, [
+      `💭 心态与关系阶段（${cfsmSummary}）`,
+      `📊 数值变量（${statSummary}）`,
+      `🧥 着装、伤势、手持与站位（${physSummary}）`,
+      `🎙 口癖样本与防漂移底线（${anchor ? anchor.backbone.slice(0, 26) : "自动默认"}）`,
+      `◇ TA 对他人的看法与潜台词（${actorBeliefs.length} 条）`,
+      `🎒 随身物品与装备（${invEntries.length} 项）`,
+      `🕰 后台日程与去向（${agenda ? `${agenda.currentActivity.slice(0, 24)}${typeof agenda.etaTurns === "number" ? ` · 剩${agenda.etaTurns}轮` : ""}` : "无"}）`,
+      "← 返回人物列表",
+    ]);
+    if (!pick || pick.startsWith("←")) return;
+
+    if (pick.startsWith("💭")) {
+      const opts = [
+        "+ 新增心态/关系维度",
+        ...cfsmEntries.map(([axis, st]) => `${axis}：${st.state}`),
+        "← 返回",
+      ];
+      const sub = await ctx.ui.select(`${actor} 的心态阶段`, opts);
+      if (!sub || sub.startsWith("←")) continue;
+      if (sub.startsWith("+")) {
+        const axis = (await ctx.ui.input("维度名称（如：信任、警觉、好感）", "信任"))?.trim();
+        if (!axis) continue;
+        const statesStr = (await ctx.ui.input("阶段顺序（逗号分隔）", "戒备, 试探, 信任, 亲近"))?.trim();
+        const statesList = (statesStr ?? "").split(/[,，→]/).map((x) => x.trim()).filter(Boolean);
+        if (statesList.length >= 2) {
+          rt.commitTx({ kind: "cfsm_define", actorId: actor, def: { axis, states: statesList, initial: statesList[0]! } });
+          rt.refreshHud(ctx);
+        }
+      } else {
+        const pair = cfsmEntries[opts.indexOf(sub) - 1];
+        if (!pair) continue;
+        const [axis, st] = pair;
+        const def = s.cfsmDefs[actor]?.[axis];
+        const nextVal = def?.states.length
+          ? await ctx.ui.select(`切换 ${actor} · ${axis}（当前：${st.state}）`, [...def.states, "← 返回"])
+          : (await ctx.ui.input(`设置 ${actor} · ${axis}`, st.state))?.trim();
+        if (nextVal && !nextVal.startsWith("←") && nextVal !== st.state) {
+          rt.commitTx({ kind: "cfsm_transition", actorId: actor, axis, from: st.state, to: nextVal, reason: "panel_manual", turn: s.turn });
+          rt.refreshHud(ctx);
+        }
+      }
+    } else if (pick.startsWith("📊")) {
+      const opts = ["+ 新增数值", ...statEntries.map(([k, v]) => `${k} = ${String(v)}`), "← 返回"];
+      const sub = await ctx.ui.select(`${actor} 的数值变量`, opts);
+      if (!sub || sub.startsWith("←")) continue;
+      const key = sub.startsWith("+")
+        ? (await ctx.ui.input("属性名称（如：好感度、体力）", "好感度"))?.trim()
+        : statEntries[opts.indexOf(sub) - 1]?.[0];
+      if (!key) continue;
+      const valStr = (await ctx.ui.input(`修改 ${actor} · ${key}（+5/-3 增减；=10 设值）`, String(s.stats[actor]?.[key] ?? 0)))?.trim();
+      if (!valStr) continue;
+      if (valStr.startsWith("=")) {
+        const rhs = valStr.slice(1).trim();
+        const parsed = /^-?\d+(\.\d+)?$/.test(rhs) ? Number(rhs) : rhs === "true" ? true : rhs === "false" ? false : rhs;
+        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "set", value: parsed, reason: "panel" });
+      } else if (/^[+-]\d+(\.\d+)?$/.test(valStr)) {
+        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "add", value: Number(valStr), reason: "panel" });
+      } else if (/^\d+(\.\d+)?$/.test(valStr)) {
+        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "set", value: Number(valStr), reason: "panel" });
+      } else {
+        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "set", value: valStr, reason: "panel" });
+      }
+      rt.refreshHud(ctx);
+    } else if (pick.startsWith("🧥")) {
+      const attire = (await ctx.ui.input(`${actor} 当前着装/外貌（可选）`, phys?.attire ?? ""))?.trim() || undefined;
+      const condition = (await ctx.ui.input(`${actor} 身体状态/伤势（可选）`, phys?.condition ?? ""))?.trim() || undefined;
+      const holding = (await ctx.ui.input(`${actor} 当前手持物（可选）`, phys?.holding ?? ""))?.trim() || undefined;
+      const position = (await ctx.ui.input(`${actor} 当前空间站位（可选）`, phys?.position ?? ""))?.trim() || undefined;
+      rt.commitTx({ kind: "physical_patch", snapshot: { actorId: actor, attire, condition, holding, position, updatedTurn: s.turn }, reason: "panel" });
+      ctx.ui.notify(`已更新「${actor}」当前外貌与站位。`, "info");
+    } else if (pick.startsWith("🎙")) {
+      const backbone = (await ctx.ui.input(`${actor} 核心立场与防迎合底线`, anchor?.backbone ?? ""))?.trim();
+      if (!backbone) continue;
+      const samplesRaw = (await ctx.ui.input("典型说话原话（用 | 分隔 2-3 句，可选）", anchor?.speechSamples.join(" | ") ?? "")) ?? "";
+      const taboo = (await ctx.ui.input("绝对禁止的 OOC 行为（可选）", anchor?.tabooBehaviors ?? ""))?.trim() || undefined;
+      rt.commitTx({
+        kind: "voice_anchor_upsert",
+        anchor: { actorId: actor, backbone, speechSamples: samplesRaw.split("|").map((x) => x.trim()).filter(Boolean).slice(0, 3), tabooBehaviors: taboo },
+      });
+      ctx.ui.notify(`已保存「${actor}」口癖与底线。`, "info");
+    } else if (pick.startsWith("◇")) {
+      await openBeliefsManager(rt, ctx, actor);
+    } else if (pick.startsWith("🎒")) {
+      await openInventoryManager(rt, ctx);
+    } else if (pick.startsWith("🕰")) {
+      const goal = (await ctx.ui.input(`${actor} 的目的（留空删除日程）`, agenda?.goal ?? ""))?.trim();
+      if (!goal) {
+        if (agenda) rt.commitTx({ kind: "agenda_delete", actorId: actor });
+        continue;
+      }
+      const currentActivity = (await ctx.ui.input("此刻幕后正在做什么", agenda?.currentActivity ?? goal))?.trim() || goal;
+      const etaStr = (await ctx.ui.input("预计几轮后抵达/触发（留空不倒计时）", agenda?.etaTurns != null ? String(agenda.etaTurns) : ""))?.trim();
+      const etaTurns = etaStr && /^\d+$/.test(etaStr) ? Number(etaStr) : null;
+      rt.commitTx({ kind: "agenda_upsert", agenda: { actorId: actor, goal, currentActivity, etaTurns, updatedTurn: s.turn } });
+      ctx.ui.notify(`已更新「${actor}」后台日程。`, "info");
+    }
+  }
+}
+
 export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
   while (true) {
     const s = rt.getState();
@@ -196,6 +459,7 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
       `🕒 修改时间标签（当前：${s.worldTimeLabel || "未设定"}）`,
       `🎯 设定当前场景目标（当前：${s.sceneObjective || "未设定"}）`,
       `🃏 管理动态剧情卡 Storylets（共 ${s.storylets.size} 张 · 已触发 ${activeSt} 张）`,
+      `🚩 世界状态 Flags（${Object.entries(s.flags).filter(([, v]) => Boolean(v)).map(([k]) => k).slice(0, 4).join("、") || "暂无"}）`,
       ...(s.modules.clocks || clocks.length > 0
         ? [
             `⏱ 进度时钟（${clocks.length > 0 ? clocks.slice(0, 2).map((c) => `${c.label} ${c.value}/${c.max}`).join(" · ") : "暂无，点此新建"}）`,
@@ -236,8 +500,10 @@ export async function openSceneSection(rt: DashboardRuntime, ctx: PiExtensionCon
       }
     } else if (pick.startsWith("🃏")) {
       await openStoryletsManager(rt, ctx);
+    } else if (pick.startsWith("🚩")) {
+      await openFlagsAndModulesManager(rt, ctx);
     } else if (pick.startsWith("⏱")) {
-      await openRpgToolsSection(rt, ctx);
+      await openClocksManager(rt, ctx);
     } else if (pick.startsWith("⚠") || pick.startsWith("🟢")) {
       await rt.openXRay(ctx);
     } else if (pick.startsWith("⏳")) {
@@ -573,207 +839,53 @@ async function openEmbeddingConfigManager(ctx: PiExtensionContext): Promise<void
 export async function openCharactersSection(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
   while (true) {
     const s = rt.getState();
-    const statCount = Object.values(s.stats).reduce((acc, rec) => acc + Object.keys(rec).length, 0);
-    const cfsmCount = Object.values(s.cfsmStates).reduce((acc, rec) => acc + Object.keys(rec).length, 0);
-    const invCount = Object.values(s.inventory).reduce((acc, rec) => acc + Object.keys(rec).length, 0);
+    const card = rt.getCard();
+    const actorSet = new Set<string>();
+    if (card?.identity.name) actorSet.add(card.identity.name);
+    for (const n of s.presentNpcs) if (n.trim()) actorSet.add(n.trim());
+    for (const a of Object.keys(s.cfsmStates)) actorSet.add(a);
+    for (const a of Object.keys(s.stats)) actorSet.add(a);
+    for (const a of Object.keys(s.physicalState)) actorSet.add(a);
+    for (const a of Object.keys(s.voiceAnchors)) actorSet.add(a);
+    for (const a of Object.keys(s.npcAgendas)) actorSet.add(a);
+    for (const a of Object.keys(s.inventory)) actorSet.add(a);
+    for (const b of s.beliefs) if (b.actorId.trim()) actorSet.add(b.actorId.trim());
+    actorSet.add("player");
 
-    const pick = await ctx.ui.select(sheetHeader(ctx, "👥 人物与变量"), [
-      `💭 角色态度与情绪阶段 CFSM (${cfsmCount} 项)`,
-      `📊 角色数值与变量 (${statCount} 项 · 双极刻度 / =设负值 / +/-增减)`,
-      ...(s.modules.inventory || invCount > 0 ? [`🎒 随身物品与装备 (${invCount} 项)`] : []),
-      `◇ DualMem 人物信念与潜台词 (${s.beliefs.length} 条 · 可查看全文与删除)`,
-      `🎙 角色口癖与防漂移底线锚点 (${Object.keys(s.voiceAnchors).length} 角色)`,
-      `🧥 当前外貌、伤势与空间站位 (${Object.keys(s.physicalState).length} 角色)`,
-      `🕸 NPC 后台日程与人物关系网 (${Object.keys(s.npcAgendas).length} 日程 · ${Object.keys(s.pairBonds).length} 关系)`,
+    const actors = Array.from(actorSet);
+    const presentSet = new Set(s.presentNpcs);
+    const actorRows = actors.map((a) => {
+      const tag = a === "player" ? "玩家" : presentSet.has(a) ? "在场" : "场外";
+      const cfsm = Object.entries(s.cfsmStates[a] ?? {}).map(([k, v]) => `${k}:${v.state}`).slice(0, 1).join("");
+      const stat = Object.entries(s.stats[a] ?? {}).map(([k, v]) => `${k}=${String(v)}`).slice(0, 1).join("");
+      const ag = s.npcAgendas[a] ? "·有日程" : "";
+      const summary = [cfsm, stat].filter(Boolean).join(" · ") || (s.physicalState[a]?.attire ? s.physicalState[a]!.attire!.slice(0, 14) : "点此查看档案");
+      return `👤 [${tag}] ${a} — ${summary}${ag}`;
+    });
+
+    const pick = await ctx.ui.select(sheetHeader(ctx, "👥 人物与关系（点选角色一站式查看/修改）"), [
+      ...actorRows,
+      `🕸 人物关系网（NPC↔NPC ${Object.keys(s.pairBonds).length} 条 · 后台日程 ${Object.keys(s.npcAgendas).length} 个）`,
       `🧑 切换玩家马甲（当前：${s.currentPersona.name}）`,
-      `👥 同场共演管理（当前：${s.activeCharacters.length} 张卡）`,
+      `🎭 同场共演角色卡管理（当前：${s.activeCharacters.length} 张卡）`,
+      "+ 新增其他人物档案",
       "← 返回主面板",
     ]);
     if (!pick || pick.startsWith("←")) return;
 
-    if (pick.startsWith("💭")) {
-      const axes: Array<{ label: string; actor: string; axis: string; current: string }> = [];
-      for (const [actor, rec] of Object.entries(s.cfsmStates)) {
-        for (const [axis, st] of Object.entries(rec)) {
-          const def = s.cfsmDefs[actor]?.[axis];
-          const allowed = def?.transitions?.[st.state];
-          const hint = allowed?.length ? `  [可跃迁→ ${allowed.join("/")}]` : def ? `  (${def.states.join("→")})` : "";
-          axes.push({ label: `${actor} · ${axis}：${st.state}${hint}`, actor, axis, current: st.state });
-        }
-      }
-      const opts = ["+ 新增角色态度/关系阶段", ...axes.map((a) => a.label), "← 返回"];
-      const sub = await ctx.ui.select("角色态度与情绪阶段 (CFSM)", opts);
-      if (!sub || sub.startsWith("←")) continue;
-
-      if (sub.startsWith("+")) {
-        const actor = (await ctx.ui.input("角色名称", rt.getCard()?.identity.name ?? "角色"))?.trim();
-        if (!actor) continue;
-        const axis = (await ctx.ui.input("维度名称（如：信任、亲密、警觉）", "信任"))?.trim();
-        if (!axis) continue;
-        const statesStr = (await ctx.ui.input("阶段列表（按递进顺序，逗号分隔）", "陌生, 熟悉, 信任, 亲密"))?.trim();
-        const statesList = (statesStr ?? "").split(/[,，→]/).map((x) => x.trim()).filter(Boolean);
-        if (statesList.length < 2) continue;
-        rt.commitTx({ kind: "cfsm_define", actorId: actor, def: { axis, states: statesList, initial: statesList[0]! } });
-        rt.refreshHud(ctx);
-        ctx.ui.notify(`已创建：${actor} · ${axis}（自动生成相邻跃迁保护，初态：${statesList[0]}）`, "info");
-      } else {
-        const match = axes[opts.indexOf(sub) - 1];
-        if (!match) continue;
-        const def = s.cfsmDefs[match.actor]?.[match.axis];
-        let nextVal: string | undefined;
-        if (def && def.states.length > 0) {
-          const chosen = await ctx.ui.select(
-            `切换 ${match.actor} · ${match.axis}（当前：${match.current}）`,
-            [...def.states, "✏️ 自定义状态", "← 返回"],
-          );
-          if (!chosen || chosen.startsWith("←")) continue;
-          nextVal = chosen.startsWith("✏️") ? (await ctx.ui.input("输入新状态", match.current))?.trim() : chosen;
-        } else {
-          nextVal = (await ctx.ui.input(`设置 ${match.actor} · ${match.axis} 新状态`, match.current))?.trim();
-        }
-        if (nextVal && nextVal !== match.current) {
-          rt.commitTx({
-            kind: "cfsm_transition",
-            actorId: match.actor,
-            axis: match.axis,
-            from: match.current,
-            to: nextVal,
-            reason: "panel_manual",
-            turn: s.turn,
-          });
-          rt.refreshHud(ctx);
-          ctx.ui.notify(`已更新：${match.actor} · ${match.axis} → ${nextVal}`, "info");
-        }
-      }
-    } else if (pick.startsWith("🎒")) {
-      await openInventoryManager(rt, ctx);
-    } else if (pick.startsWith("📊")) {
-      const existing: Array<{ label: string; actor: string; key: string }> = [];
-      for (const [actor, rec] of Object.entries(s.stats)) {
-        for (const [k, v] of Object.entries(rec)) {
-          const b = s.statBounds[actor]?.[k];
-          const smartBar = typeof v === "number" && b ? renderSmartStatBar(v, b.min, b.max, 6) : null;
-          const gauge = smartBar ? `  ${smartBar}` : ` = ${String(v)}`;
-          existing.push({ label: `${actor} · ${k}${gauge}`, actor, key: k });
-        }
-      }
-      const opts = ["+ 新增 / 修改数值", ...existing.map((e) => e.label), "← 返回"];
-      const sub = await ctx.ui.select("好感与角色数值", opts);
-      if (!sub || sub.startsWith("←")) continue;
-
-      let actor = rt.getCard()?.identity.name ?? "player";
-      let key = "";
-      if (sub.startsWith("+")) {
-        const aIn = await ctx.ui.input("角色名称（如角色名或 player）", actor);
-        if (!aIn?.trim()) continue;
-        actor = aIn.trim();
-        const kIn = await ctx.ui.input("属性名称（如好感度、体力、金币）", "好感度");
-        if (!kIn?.trim()) continue;
-        key = kIn.trim();
-      } else {
-        const match = existing[opts.indexOf(sub) - 1];
-        if (!match) continue;
-        actor = match.actor;
-        key = match.key;
-      }
-
-      const valStr = await ctx.ui.input(
-        `修改 ${actor} · ${key}（+5/-3 为增减；=10 或 =-20 强制设为精确值；直接输数字设值）`,
-        String(s.stats[actor]?.[key] ?? 50),
-      );
-      if (valStr === undefined || !valStr.trim()) continue;
-      const trimmed = valStr.trim();
-      if (trimmed.startsWith("=")) {
-        const rhs = trimmed.slice(1).trim();
-        const parsed = /^-?\d+(\.\d+)?$/.test(rhs)
-          ? Number(rhs)
-          : rhs === "true"
-            ? true
-            : rhs === "false"
-              ? false
-              : rhs;
-        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "set", value: parsed, reason: "panel" });
-      } else if (/^[+-]\d+(\.\d+)?$/.test(trimmed)) {
-        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "add", value: Number(trimmed), reason: "panel" });
-      } else if (/^\d+(\.\d+)?$/.test(trimmed)) {
-        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "set", value: Number(trimmed), reason: "panel" });
-      } else if (trimmed === "true" || trimmed === "false") {
-        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "set", value: trimmed === "true", reason: "panel" });
-      } else {
-        rt.commitTx({ kind: "stat_patch", actorId: actor, key, op: "set", value: trimmed, reason: "panel" });
-      }
-      rt.refreshHud(ctx);
-      ctx.ui.notify(`已更新 ${actor} · ${key} = ${String(rt.getState().stats[actor]?.[key])}`, "info");
-    } else if (pick.startsWith("◇")) {
-      const recentBeliefs = s.beliefs.slice(-14).reverse();
-      const opts = [
-        "+ 手动记录一条人物信念 (DualMem)",
-        ...recentBeliefs.map(
-          (b) =>
-            `◇ [T${b.turn}] ${b.actorId} → ${b.target}${b.emotionalTone ? ` [${b.emotionalTone}]` : ""}：${b.belief.slice(0, 42)}`,
-        ),
-        "← 返回",
-      ];
-      const sub = await ctx.ui.select(`人物信念与主观潜台词（共 ${s.beliefs.length} 条）`, opts);
-      if (!sub || sub.startsWith("←")) continue;
-
-      if (sub.startsWith("+")) {
-        const actorId = (await ctx.ui.input("角色名称", rt.getCard()?.identity.name ?? "角色"))?.trim();
-        if (!actorId) continue;
-        const target = (await ctx.ui.input("针对对象", s.currentPersona.name))?.trim();
-        if (!target) continue;
-        const activatingEvent = (await ctx.ui.input("因为发生了什么客观事件", ""))?.trim();
-        if (!activatingEvent) continue;
-        const belief = (await ctx.ui.input("形成了什么看法/信念", ""))?.trim();
-        if (!belief) continue;
-        const subjectiveInsight = (await ctx.ui.input("角色主观潜台词/内心独白（可选）", ""))?.trim() || undefined;
-        const emotionalTone = (await ctx.ui.input("情绪基调（如：警惕/悸动/愧疚，可选）", ""))?.trim() || undefined;
-        rt.commitTx({
-          kind: "belief_update",
-          actorId,
-          target,
-          activatingEvent,
-          belief,
-          subjectiveInsight,
-          emotionalTone,
-          turn: s.turn,
-        });
-        ctx.ui.notify(`已记录 DualMem 信念：${actorId} → ${target}`, "info");
-      } else {
-        const chosen = recentBeliefs[opts.indexOf(sub) - 1];
-        if (!chosen) continue;
-        const detail = [
-          `角色：${chosen.actorId} → ${chosen.target}（第 ${chosen.turn} 轮）`,
-          chosen.emotionalTone ? `情绪基调：${chosen.emotionalTone}` : null,
-          `触发事件：${chosen.activatingEvent}`,
-          `核心信念：${chosen.belief}`,
-          chosen.subjectiveInsight ? `主观潜台词：${chosen.subjectiveInsight}` : null,
-        ]
-          .filter(Boolean)
-          .join("\n");
-        const act = await ctx.ui.select(`信念详情：${chosen.actorId} → ${chosen.target}`, [
-          "📖 查看完整内容",
-          "🗑 删除此条信念",
-          "← 返回",
-        ]);
-        if (act?.startsWith("📖")) {
-          await editLongText(ctx, `DualMem 信念 · ${chosen.actorId}`, detail);
-        } else if (act?.startsWith("🗑")) {
-          const origIdx = s.beliefs.indexOf(chosen);
-          rt.commitTx({ kind: "belief_remove", id: chosen.id, index: origIdx >= 0 ? origIdx : undefined });
-          ctx.ui.notify("已删除该条信念。", "info");
-        }
-      }
-    } else if (pick.startsWith("🎙")) {
-      await openVoiceAnchorsManager(rt, ctx);
-    } else if (pick.startsWith("🧥")) {
-      await openPhysicalSceneManager(rt, ctx);
-    } else if (pick.startsWith("🕸")) {
+    if (pick.startsWith("🕸")) {
       await openLivingWorldManager(rt, ctx);
     } else if (pick.startsWith("🧑")) {
       await rt.switchPersona(ctx);
-    } else if (pick.startsWith("👥")) {
+    } else if (pick.startsWith("🎭")) {
       await rt.manageCast(ctx);
+    } else if (pick.startsWith("+")) {
+      const name = (await ctx.ui.input("输入新人物名称", ""))?.trim();
+      if (name) await openActorProfile(rt, ctx, name);
+    } else {
+      const idx = actorRows.indexOf(pick);
+      const chosen = actors[idx];
+      if (chosen) await openActorProfile(rt, ctx, chosen);
     }
   }
 }
@@ -887,8 +999,10 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     const secretCount = activeFacts.filter((f) => f.witnessIds !== "public").length;
     const { blindSpots } = partitionEpistemicFacts(activeFacts, s.presentNpcs);
     const options: string[] = [
-      `📚 记忆书章节 Memory Books（${s.memoryBooks.size} 章 — 全文编辑/置顶/归档）`,
+      `🗂 世界书完整管理（${getAllLore(rt).length} 条 · 搜索 / 编辑 / 新增 / AI生成 / 删除）`,
+      `📚 记忆书归档章节（${s.memoryBooks.size} 章 — 全文编辑/置顶/归档）`,
       `🔒 秘密与认知盲区 FANToM（秘密 ${secretCount} 条 · 生效盲区 ${blindSpots.length} 处）`,
+      `◇ 人物信念与主观潜台词（${s.beliefs.length} 条${s.beliefs.length > 0 ? ` · 最新：${s.beliefs[s.beliefs.length - 1]!.actorId}→${s.beliefs[s.beliefs.length - 1]!.belief.slice(0, 18)}` : ""}）`,
       "📜 查看前情提要（0 Token 瞬时合成）",
       "📦 总结并隐藏较早的对话楼层 → 写入记忆书",
       "🙈 隐藏或恢复对话楼层（支持一键恢复）",
@@ -918,6 +1032,14 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
     }
     if (pick.startsWith("🔒")) {
       await openSecretsInspector(rt, ctx);
+      continue;
+    }
+    if (pick.startsWith("◇ 人物信念")) {
+      await openBeliefsManager(rt, ctx);
+      continue;
+    }
+    if (pick.startsWith("🗂 世界书")) {
+      await openLoreManager(rt, ctx);
       continue;
     }
     if (pick.startsWith("📜")) {
@@ -1239,6 +1361,7 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
         (n, i) => `▪ #${i + 1} ${n.text.slice(0, 52)}${n.remainingTurns !== null ? ` (${n.remainingTurns}轮)` : " (常驻)"}`,
       ),
       ...(s.notes.length > 0 ? ["🧹 清空全部导演指令"] : []),
+      "⚙ 引擎高级设置、X-Ray 透视、会话总览与资产库",
       "← 返回主面板",
     ];
     const pick = await ctx.ui.select(sheetHeader(ctx, "🎬 导演台与快捷动作"), options);
@@ -1285,6 +1408,8 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
       });
       rt.refreshHud(ctx);
       ctx.ui.notify("导演指令已生效。", "info");
+    } else if (pick.startsWith("⚙")) {
+      await openRpgToolsSection(rt, ctx);
     } else if (pick.startsWith("🧹")) {
       rt.commitTx({ kind: "note_clear" });
       rt.refreshHud(ctx);
@@ -1341,7 +1466,9 @@ async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext
     const clockCount = Object.keys(s.clocks).length;
     const flagCount = Object.keys(s.flags).length;
 
-    const pick = await ctx.ui.select(sheetHeader(ctx, "🎲 跑团机制与引擎高级设置"), [
+    const pick = await ctx.ui.select(sheetHeader(ctx, "⚙ 引擎高级设置、透视与资产库"), [
+      "🔎 上下文 X-Ray 透视 & 审计撤销",
+      "🌍 会话总览、上下文用量与导入审计",
       `🎒 背包物品 (${invCount} 项)`,
       `⏳ 进度时钟 (${clockCount} 个)`,
       "🎲 快捷掷骰检定 (/rp roll)",
@@ -1356,7 +1483,11 @@ async function openRpgToolsSection(rt: DashboardRuntime, ctx: PiExtensionContext
     ]);
     if (!pick || pick.startsWith("←")) return;
 
-    if (pick.startsWith("🎒")) {
+    if (pick.startsWith("🔎")) {
+      await openXRayAndAuditSection(rt, ctx);
+    } else if (pick.startsWith("🌍")) {
+      await openOverviewAndAudit(rt, ctx);
+    } else if (pick.startsWith("🎒")) {
       await openInventoryManager(rt, ctx);
     } else if (pick.startsWith("⏳")) {
       const clocks = Object.values(s.clocks);
@@ -1613,6 +1744,51 @@ async function dispatchOverlayAction(rt: DashboardRuntime, ctx: PiExtensionConte
   }
 }
 
+
+async function openLedgerOverview(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const s = rt.getState();
+    const activeFacts = getActiveFacts(s);
+    const openHooks = Array.from(s.foresights.values()).filter((h) => h.status === "open");
+    const activeFlags = Object.entries(s.flags).filter(([, v]) => Boolean(v)).map(([k]) => k);
+    const recentWrites = s.auditLog.slice(-6).reverse();
+
+    const opts: string[] = [
+      ...recentWrites.map((r) => `📝 [T${r.turn}] ${r.summary}`),
+      ...(activeFlags.length > 0 ? [`🚩 当前激活 Flags (${activeFlags.length})：${activeFlags.slice(0, 5).join(" · ")}`] : []),
+      `▪ 长期事实 (${activeFacts.length} 条) → 点此查看/编辑`,
+      `◇ 人物信念 (${s.beliefs.length} 条) → 点此查看/编辑`,
+      `🔖 未回收伏笔 (${openHooks.length} 条) → 点此查看/编辑`,
+      ...(Object.keys(s.physicalState).length > 0 || s.spatialNotes
+        ? [`🧥 外貌与物理状态 (${Object.keys(s.physicalState).length} 角色) → 点此编辑`]
+        : []),
+      ...(Object.keys(s.npcAgendas).length > 0 || Object.keys(s.pairBonds).length > 0
+        ? [`🕸 后台日程 (${Object.keys(s.npcAgendas).length}) / NPC 关系 (${Object.keys(s.pairBonds).length}) → 点此管理`]
+        : []),
+      "← 返回主面板",
+    ];
+
+    const pick = await ctx.ui.select(
+      `📋 本局全部账本一览（最近写入 / Flags / 事实 / 信念 / 伏笔）`,
+      opts,
+    );
+    if (!pick || pick.startsWith("←")) return;
+    if (pick.startsWith("📝")) {
+      await rt.undoLast(ctx, false);
+    } else if (pick.startsWith("🚩")) {
+      await openFlagsAndModulesManager(rt, ctx);
+    } else if (pick.startsWith("▪") || pick.startsWith("🔖")) {
+      await openMemoryBookSection(rt, ctx);
+    } else if (pick.startsWith("◇")) {
+      await openBeliefsManager(rt, ctx);
+    } else if (pick.startsWith("🧥")) {
+      await openPhysicalSceneManager(rt, ctx);
+    } else if (pick.startsWith("🕸")) {
+      await openLivingWorldManager(rt, ctx);
+    }
+  }
+}
+
 export async function openRpDashboard(
   rt: DashboardRuntime,
   ctx: PiExtensionContext,
@@ -1664,17 +1840,15 @@ export async function openRpDashboard(
       ctx,
       `◆ ${[card?.identity.name ?? s.cardSlug ?? "RP", s.era, s.worldTimeLabel, `T${s.turn}`].filter(Boolean).join(" · ")}`,
     );
+    const activeFlagsCount = Object.values(s.flags).filter(Boolean).length;
     const choice = await ctx.ui.select(title, [
-      `1. 📍 场景、目标与 Storylets（${s.location || "未设定"}${s.sceneObjective ? ` · 🎯${s.sceneObjective.slice(0, 14)}` : ""}）`,
-      `2. 👥 人物与关系（CFSM / 数值${s.modules.inventory || invCount > 0 ? ` / 背包:${invCount}` : ""} / 信念 / 马甲：${s.currentPersona.name}）`,
-      `3. 📚 记忆书、事实与秘密（书 ${s.memoryBooks.size} · 事实 ${activeFactsList.length}${secretCount > 0 ? ` · 🔒秘密 ${secretCount}` : ""} · 伏笔 ${openHooks}）`,
-      `4. 🗂 世界书完整管理（${getAllLore(rt).length} 条 · 搜索 / 全文编辑 / 新增 / AI生成 / 删除）`,
-      `5. 🎬 导演台、快捷回复与 AI建档（节奏:${s.pacingMode} · 内心戏:${s.innerMonologue ? "开" : "关"} · ${card?.worldProfile?.source === "llm-analyzed" ? "✨已建档" : "启发式"}）`,
-      `6. 🔎 上下文 X-Ray 透视 & 审计撤销（${xray ? `KV×${xray.cacheHitStreak} · 召回${xray.recalled.length}` : "待捕获"} · 审计 ${s.auditLog.length}）`,
-      `7. ⚙ 跑团机制、Sidecar 模型、预算与资产库`,
-      "8. 🌍 会话总览、上下文用量与导入审计",
+      `1. 📋 本局动态一览（近期写入 ${s.auditLog.length} · 事实 ${activeFactsList.length} · 信念 ${s.beliefs.length} · 伏笔 ${openHooks}${activeFlagsCount ? ` · Flags ${activeFlagsCount}` : ""}）`,
+      `2. 📍 场景与世界（${s.location || "未设定"}${activeFlagsCount ? ` · Flags ${activeFlagsCount}` : ""} · 时钟 ${Object.keys(s.clocks).length} · 推演/镜头）`,
+      `3. 👥 人物与关系（按角色一站式档案 · 关系网 · 马甲：${s.currentPersona.name}）`,
+      `4. 📖 记忆、伏笔与世界书（事实 ${activeFactsList.length} · 信念 ${s.beliefs.length} · 伏笔 ${openHooks} · 世界书 ${getAllLore(rt).length} · 导出小说）`,
+      `5. 🎬 导演台与设置（节奏:${s.pacingMode} · 篇幅/视角 · 禁词 · 改写 · 高级设置/X-Ray）`,
       ...(s.auditLog.length > 0 ? [`↩ 撤销上次状态变更（${s.auditLog[s.auditLog.length - 1]!.summary.slice(0, 26)}）`] : []),
-      "9. 🚪 彻底退出本会话 RP 模式",
+      "6. 🚪 彻底退出本会话 RP 模式",
       "✕ 关闭面板",
     ]);
 
@@ -1683,15 +1857,12 @@ export async function openRpDashboard(
       await rt.undoLast(ctx, true);
       continue;
     }
-    if (choice.startsWith("1.")) await openSceneSection(rt, ctx);
-    else if (choice.startsWith("2.")) await openCharactersSection(rt, ctx);
-    else if (choice.startsWith("3.")) await openMemoryBookSection(rt, ctx);
-    else if (choice.startsWith("4.")) await openLoreManager(rt, ctx);
+    if (choice.startsWith("1.")) await openLedgerOverview(rt, ctx);
+    else if (choice.startsWith("2.")) await openSceneSection(rt, ctx);
+    else if (choice.startsWith("3.")) await openCharactersSection(rt, ctx);
+    else if (choice.startsWith("4.")) await openMemoryBookSection(rt, ctx);
     else if (choice.startsWith("5.")) await openNotesAndPacing(rt, ctx);
-    else if (choice.startsWith("6.")) await openXRayAndAuditSection(rt, ctx);
-    else if (choice.startsWith("7.")) await openRpgToolsSection(rt, ctx);
-    else if (choice.startsWith("8.")) await openOverviewAndAudit(rt, ctx);
-    else if (choice.startsWith("9.")) {
+    else if (choice.startsWith("6.")) {
       await rt.exitRp(ctx, true);
       return;
     }

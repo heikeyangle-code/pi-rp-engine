@@ -519,6 +519,33 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             required: ["summary"],
           },
         },
+        agendas: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              actor: { type: "string" },
+              goal: { type: "string" },
+              currentActivity: { type: "string" },
+              etaTurns: { type: "number" },
+            },
+            required: ["actor", "currentActivity"],
+          },
+        },
+        pair_bonds: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              actorA: { type: "string" },
+              actorB: { type: "string" },
+              stance: { type: "string" },
+              tension: { type: "number" },
+              note: { type: "string" },
+            },
+            required: ["actorA", "actorB", "stance"],
+          },
+        },
       },
     },
     renderCall(args, theme) {
@@ -527,16 +554,25 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       if (Array.isArray(args.invalidate_facts) && args.invalidate_facts.length) counts.push(`失效×${args.invalidate_facts.length}`);
       if (Array.isArray(args.beliefs) && args.beliefs.length) counts.push(`信念×${args.beliefs.length}`);
       if (Array.isArray(args.foresights) && args.foresights.length) counts.push(`伏笔×${args.foresights.length}`);
+      if (Array.isArray(args.agendas) && args.agendas.length) counts.push(`日程×${args.agendas.length}`);
+      if (Array.isArray(args.pair_bonds) && args.pair_bonds.length) counts.push(`关系×${args.pair_bonds.length}`);
       return createLinesComponent(() => [
         `${styleFg(theme, "accent", "🧠 记忆归档")} ${styleDim(theme, counts.join(" · ") || "记录事件")}`,
       ]);
     },
     renderResult(result, _options, theme) {
-      const d = (result.details ?? {}) as { log?: string[] };
-      const count = d.log?.length ?? 0;
-      return createLinesComponent(() => [
-        styleFg(theme, "muted", `🧠 已写入 ${count} 条长期记忆/伏笔记录`),
-      ]);
+      const d = (result.details ?? {}) as { log?: string[]; previews?: string[] };
+      const previews = d.previews ?? [];
+      if (previews.length === 0) {
+        return createLinesComponent(() => [styleFg(theme, "muted", `🧠 已写入 ${d.log?.length ?? 0} 条记忆记录`)]);
+      }
+      return createLinesComponent((width) =>
+        previews.slice(0, 4).flatMap((line, i) =>
+          wrapDisplayLine(i === 0 ? `🧠 ${line}` : `  · ${line}`, Math.max(24, width - 2)).map((l) =>
+            styleFg(theme, "muted", l),
+          ),
+        ),
+      );
     },
     async execute(_id, params) {
       const state = rt.getState();
@@ -545,6 +581,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       }
 
       const log: string[] = [];
+      const previews: string[] = [];
       let idx = 0;
 
       if (Array.isArray(params.add_facts)) {
@@ -564,6 +601,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           };
           rt.commitTx({ kind: "fact_add", fact });
           log.push(`+fact(${fact.id})`);
+          previews.push(`事实：${statement.slice(0, 48)}`);
         }
       }
 
@@ -595,6 +633,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             turn: state.turn,
           });
           log.push(`belief(${String(b.actor)}->${String(b.target)})`);
+          previews.push(`信念 ${String(b.actor)}→${String(b.target)}：${String(b.belief ?? "").slice(0, 40)}`);
         }
       }
 
@@ -617,12 +656,41 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             },
           });
           log.push(`foresight(${id}:${status})`);
+          previews.push(`伏笔：${summary.slice(0, 44)}`);
+        }
+      }
+
+      if (Array.isArray(params.agendas)) {
+        for (const ag of params.agendas as Array<Record<string, unknown>>) {
+          const actorId = String(ag.actor ?? "").trim();
+          const currentActivity = String(ag.currentActivity ?? "").trim();
+          const goal = String(ag.goal ?? currentActivity).trim();
+          if (!actorId || !currentActivity) continue;
+          const etaTurns = typeof ag.etaTurns === "number" && Number.isFinite(ag.etaTurns) ? Math.max(0, Math.round(ag.etaTurns)) : null;
+          rt.commitTx({ kind: "agenda_upsert", agenda: { actorId, goal, currentActivity, etaTurns, updatedTurn: state.turn } });
+          log.push(`agenda(${actorId})`);
+          previews.push(`日程 ${actorId}：${currentActivity.slice(0, 40)}`);
+        }
+      }
+
+      if (Array.isArray(params.pair_bonds)) {
+        for (const pb of params.pair_bonds as Array<Record<string, unknown>>) {
+          const actorA = String(pb.actorA ?? "").trim();
+          const actorB = String(pb.actorB ?? "").trim();
+          const stance = String(pb.stance ?? "").trim();
+          if (!actorA || !actorB || actorA === actorB || !stance) continue;
+          const [a, b] = [actorA, actorB].sort();
+          const tension = typeof pb.tension === "number" && Number.isFinite(pb.tension) ? pb.tension : 0;
+          const note = String(pb.note ?? "").trim();
+          rt.commitTx({ kind: "pair_bond_upsert", bond: { id: `${a}::${b}`, actorA: a!, actorB: b!, stance, tension, note, updatedTurn: state.turn } });
+          log.push(`bond(${a}<->${b})`);
+          previews.push(`关系 ${a}↔${b}：${stance}`);
         }
       }
 
       return {
         content: [{ type: "text", text: log.length ? `Committed: ${log.join(", ")}` : "Nothing committed." }],
-        details: { log },
+        details: { log, previews },
       };
     },
   });
@@ -794,6 +862,23 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const matchedHooks = Array.from(state.foresights.values())
         .filter((h) => h.status === "open" && (h.summary.toLowerCase().includes(qLower) || h.triggerHint.toLowerCase().includes(qLower)))
         .slice(0, 4);
+
+      // Optional Hybrid Semantic Embedding boost for worldbook entries when Embedding is enabled
+      const recallEmbCfg = loadUiPrefs().embeddingConfig;
+      if (recallEmbCfg?.enabled && visibleLore.length > 0) {
+        const loreDocs = visibleLore.slice(0, 80).map((e) => `${e.title}: ${e.content.slice(0, 500)}`);
+        const semHits = await rankBySemanticSimilarity(recallEmbCfg, query, loreDocs, 0.30);
+        if (semHits && semHits.length > 0) {
+          const existingIds = new Set(loreRes.selected.map((e) => e.id));
+          for (const hit of semHits.slice(0, 3)) {
+            const entry = visibleLore[hit.index];
+            if (entry && !existingIds.has(entry.id)) {
+              loreRes.selected.push(entry);
+              existingIds.add(entry.id);
+            }
+          }
+        }
+      }
 
       const parts: string[] = [];
       if (loreRes.selected.length > 0) {
