@@ -1313,38 +1313,160 @@ export async function actionManualRoll(rt: RpRuntimeHandle, ctx: PiExtensionCont
 
 export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
   const state = rt.getState();
-  if (!state.active) {
+  const card = rt.getCard();
+  if (!state.active || !card) {
     ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
     return;
   }
+
+  let spanKind: "hours" | "days" | "long" | "scene_only" = "days";
   let desc = argsText.trim();
+  let playerPlan = "";
+
   if (!desc) {
-    const pick = await ctx.ui.select("⏳ 切场景 / 跳时间", [
-      "🌅 次日清晨",
-      "🌙 夜幕降临",
-      "⏳ 三日之后",
-      "📍 切换至新地点（自定义）",
-      "✏️ 输入自定义时间或章节跳转",
+    const pick = await ctx.ui.select("⏳ 时间推进与幕间世界推演 (Downtime)", [
+      "🌅 下一时段（几小时后 / 今晚 / 次日清晨）",
+      "⏳ 跨日休整（数日后 · 推演幕后势力与时钟进展）",
+      "🗓 长线跃迁（半月 / 换季 / 进入新阶段 · 全量幕间推演）",
+      "📍 纯切地点（不推进时间，只换当前场景）",
+      "✏️ 自定义时间与去向",
       "✕ 取消",
     ]);
     if (!pick || pick.startsWith("✕")) return;
+
     if (pick.startsWith("📍")) {
-      const loc = (await ctx.ui.input("输入要切往的新地点与简短情境", ""))?.trim();
+      spanKind = "scene_only";
+      const loc = (await ctx.ui.input("输入要切往的新地点", state.location || ""))?.trim();
       if (!loc) return;
-      rt.commitTx({ kind: "location_set", location: loc, presentNpcs: state.presentNpcs });
-      desc = `转场至：${loc}`;
-    } else if (pick.startsWith("✏️")) {
-      const entered = (await ctx.ui.input("输入时间推进或转场描述（如：半月后、入冬大雪）", "次日清晨"))?.trim();
-      if (!entered) return;
-      desc = entered;
+      const npcsRaw = (await ctx.ui.input("新地点在场人物（逗号分隔，可留空）", "")) ?? "";
+      const npcs = npcsRaw.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+      rt.commitTx({ kind: "location_set", location: loc, presentNpcs: npcs });
+      rt.refreshHud(ctx);
+      rt.pi.sendMessage(
+        {
+          customType: "rp:era",
+          content: `[场景切换：${loc}] 自然切入新地点的当下氛围与在场人物动态，将行动权交给玩家。`,
+          display: true,
+          details: { fromEra: state.era, toEra: state.era, kind: "scene_shift" },
+        },
+        { triggerTurn: true },
+      );
+      return;
+    }
+
+    if (pick.startsWith("🌅")) {
+      spanKind = "hours";
+      const sub = await ctx.ui.select("选择目标时段", ["次日清晨", "数小时后", "夜幕降临", "✏️ 自定义"]);
+      if (!sub) return;
+      desc = sub.startsWith("✏️") ? ((await ctx.ui.input("输入目标时段", "次日清晨"))?.trim() || "") : sub;
+    } else if (pick.startsWith("⏳")) {
+      spanKind = "days";
+      const sub = await ctx.ui.select("选择跨日跨度", ["3天后", "7天后", "半月后", "✏️ 自定义"]);
+      if (!sub) return;
+      desc = sub.startsWith("✏️") ? ((await ctx.ui.input("输入时间跨度", "3天后"))?.trim() || "") : sub;
+    } else if (pick.startsWith("🗓")) {
+      spanKind = "long";
+      desc = (await ctx.ui.input("输入长线时间或新阶段名称（如：入冬大雪、半年后、进入第二幕）", "一月后"))?.trim() || "";
     } else {
-      desc = pick.replace(/^[^\s]+\s+/, "");
+      desc = (await ctx.ui.input("输入时间推进或场景描述", "次日清晨"))?.trim() || "";
+    }
+    if (!desc) return;
+
+    if (spanKind === "days" || spanKind === "long") {
+      playerPlan =
+        (await ctx.ui.input("这段时间主角主要做什么？（可选，如：养伤/打听消息/赶路，留空自动推演）", ""))?.trim() ?? "";
     }
   }
+
   const dayMatch = /(\d+)\s*(天|日|days?)/i.exec(desc);
-  const dayDelta = dayMatch ? Number(dayMatch[1]) : /次日|明天|隔日|翌/i.test(desc) ? 1 : 0;
+  const weekMatch = /(\d+)\s*(周|星期|weeks?)/i.exec(desc);
+  const monthMatch = /(\d+)\s*(个?月|months?)/i.exec(desc);
+  const dayDelta = dayMatch
+    ? Number(dayMatch[1])
+    : weekMatch
+      ? Number(weekMatch[1]) * 7
+      : monthMatch
+        ? Number(monthMatch[1]) * 30
+        : /次日|明天|隔日|翌/i.test(desc)
+          ? 1
+          : /半月/i.test(desc)
+            ? 15
+            : 0;
   const isStageChange = /(?:第[一二三四五六七八九十0-9]+[幕章篇卷]|纪元|Act\s+[IVX0-9]+|Chapter)/i.test(desc);
   const nextEra = isStageChange ? desc : state.era;
+
+  interface DowntimeSimResult {
+    worldTimeLabel?: string;
+    location?: string;
+    presentNpcs?: string[];
+    clockDeltas?: Array<{ clockId: string; delta: number; reason?: string }>;
+    offscreenEvents?: Array<{ statement: string; public?: boolean; entities?: string[] }>;
+    openingBeat?: string;
+  }
+
+  let sim: DowntimeSimResult | null = null;
+  if (canCompleteWithRegistry(ctx)) {
+    const activeClocks = Object.values(state.clocks)
+      .filter((c) => !c.completed)
+      .map((c) => `${c.clockId} (${c.label}: ${c.value}/${c.max})`);
+    const openHooks = Array.from(state.foresights.values())
+      .filter((h) => h.status === "open")
+      .slice(0, 4)
+      .map((h) => h.summary);
+    const recentFacts = getActiveFacts(state)
+      .slice(-6)
+      .map((f) => f.statement);
+
+    const simPrompt =
+      `You are an off-screen world simulator for "${card.identity.name}". ` +
+      `Given a time jump ("${desc}") and the player's downtime intent, simulate what realistically happens off-screen across factions, clocks, and open threads. ` +
+      `Return ONLY strict JSON:\n` +
+      `{"worldTimeLabel":"new in-world time string","location":"new or same location","presentNpcs":["names"],"clockDeltas":[{"clockId":"existing_id","delta":1,"reason":"why"}],"offscreenEvents":[{"statement":"concise event","public":true,"entities":["name"]}],"openingBeat":"1-2 sentence concrete opening sensory hook for the new scene"}\n` +
+      `Rules: Keep clockDeltas grounded to existing clockIds (0-2 entries, delta 1-2). OffscreenEvents: 1-2 realistic developments (mark secret faction moves public:false). Match the story's language.`;
+
+    const simInput =
+      `Current time: ${state.worldTimeLabel || "unset"} | Location: ${state.location || "unset"} | Present: ${state.presentNpcs.join(", ") || "none"}\n` +
+      `Time jump: ${desc}\n` +
+      (playerPlan ? `Player downtime activity: ${playerPlan}\n` : "") +
+      (activeClocks.length ? `Active clocks: ${activeClocks.join("; ")}\n` : "") +
+      (openHooks.length ? `Open foresights: ${openHooks.join("; ")}\n` : "") +
+      (recentFacts.length ? `Recent facts: ${recentFacts.join(" | ")}\n` : "");
+
+    ctx.ui.notify(`⏳ 正在推演「${desc}」期间的幕后世界变化…`, "info");
+    try {
+      const targetModel = resolveSidecarModel(ctx, state.sidecarModel) ?? ctx.model;
+      const raw = await completeWithRegistry(ctx, targetModel, {
+        systemPrompt: simPrompt,
+        userPrompt: simInput,
+        maxTokens: 600,
+        signal: ctx.signal,
+      });
+      const m = /\{[\s\S]*\}/.exec(raw.replace(/<think>[\s\S]*?<\/think>/gi, ""));
+      if (m) {
+        sim = JSON.parse(m[0]!) as DowntimeSimResult;
+      }
+    } catch {
+      sim = null;
+    }
+  }
+
+  if (sim) {
+    const previewLines = [
+      `🕒 新时间：${sim.worldTimeLabel || desc}`,
+      sim.location ? `📍 新地点：${sim.location}${sim.presentNpcs?.length ? `（在场：${sim.presentNpcs.join("、")}）` : ""}` : null,
+      sim.clockDeltas?.length
+        ? `⏳ 时钟推进：${sim.clockDeltas.map((c) => `${c.clockId} +${c.delta}${c.reason ? `（${c.reason}）` : ""}`).join("；")}`
+        : null,
+      ...(sim.offscreenEvents ?? []).map((e) => `${e.public === false ? "🔒 幕后暗流" : "📰 世界变动"}：${e.statement}`),
+      sim.openingBeat ? `🎬 切入镜头：${sim.openingBeat}` : null,
+    ].filter(Boolean);
+
+    const ok = await ctx.ui.confirm("确认应用幕间世界推演结果？", previewLines.join("\n"));
+    if (!ok) {
+      ctx.ui.notify("已取消本次时间推进。", "info");
+      return;
+    }
+  }
 
   if (isStageChange && nextEra !== state.era) {
     rt.commitTx({
@@ -1356,20 +1478,78 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
       turn: state.turn,
     });
   }
-  const nextTimeLabel = dayDelta > 0 && !/第\s*\d+\s*天/.test(desc) ? `第 ${state.day + dayDelta} 天 · ${desc}` : desc;
+
+  const nextTimeLabel =
+    sim?.worldTimeLabel?.trim() ||
+    (dayDelta > 0 && !/第\s*\d+\s*天/.test(desc) ? `第 ${state.day + dayDelta} 天 · ${desc}` : desc);
   rt.commitTx({
     kind: "clock_tick",
     beatDelta: 0,
     dayDelta,
     worldTimeLabel: nextTimeLabel,
   });
+
+  if (sim?.location && sim.location.trim()) {
+    rt.commitTx({
+      kind: "location_set",
+      location: sim.location.trim(),
+      presentNpcs: Array.isArray(sim.presentNpcs) ? sim.presentNpcs.filter(Boolean) : state.presentNpcs,
+    });
+  }
+
+  if (sim?.clockDeltas) {
+    for (const cd of sim.clockDeltas) {
+      const existing = state.clocks[cd.clockId];
+      if (!existing || !Number.isFinite(cd.delta) || cd.delta === 0) continue;
+      rt.commitTx({
+        kind: "progress_clock",
+        clockId: existing.clockId,
+        label: existing.label,
+        delta: Math.max(-2, Math.min(3, Math.round(cd.delta))),
+        max: existing.max,
+      });
+    }
+  }
+
+  if (sim?.offscreenEvents) {
+    for (const ev of sim.offscreenEvents.slice(0, 3)) {
+      if (!ev?.statement?.trim()) continue;
+      rt.commitTx({
+        kind: "fact_add",
+        fact: {
+          id: `downtime_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 5)}`,
+          statement: ev.statement.trim(),
+          entities: Array.isArray(ev.entities) ? ev.entities.filter(Boolean) : [],
+          validFromTurn: state.turn,
+          validUntilTurn: null,
+          witnessIds: ev.public === false ? ["narrator"] : "public",
+        },
+      });
+    }
+  }
+
   rt.refreshHud(ctx);
+
+  const publicNotes = (sim?.offscreenEvents ?? [])
+    .filter((e) => e.public !== false && e.statement)
+    .map((e) => `- ${e.statement}`)
+    .join("\n");
+  const transitionContent = [
+    `[时间推进：${nextTimeLabel}${sim?.location ? ` · ${sim.location}` : ""}]`,
+    playerPlan ? `期间主角去向：${playerPlan}` : null,
+    publicNotes ? `期间外界已知变化：\n${publicNotes}` : null,
+    sim?.openingBeat ? `开场切入点：${sim.openingBeat}` : null,
+    `请用克制具体的细节自然切入新时间点后的第一场戏（不要泄露标记为盲区的幕后暗流），将主动权交给玩家。`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
   rt.pi.sendMessage(
     {
       customType: "rp:era",
-      content: `[场景/时间过渡：${desc}] 请用克制具体的画面感交代这段时间内的自然变化（避免空泛总结），直接切入新时间点与当下场景的开场细节，将主动权交给玩家。`,
+      content: transitionContent,
       display: true,
-      details: { fromEra: state.era, toEra: nextEra, kind: "montage" },
+      details: { fromEra: state.era, toEra: nextEra, kind: "downtime" },
     },
     { triggerTurn: true },
   );

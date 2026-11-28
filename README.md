@@ -6,7 +6,7 @@
 
 <p>
   兼容 SillyTavern 存量 V1 / V2 / V3 / .charx 角色卡、世界书与预设。<br>
-  清洗前端壳、代码管状态与记忆、隔离上下文与认知边界，让模型专注写正文。
+  清洗前端壳、代码管状态与记忆、计算与叙事上下文彻底隔离，专为手机端与终端长篇文游打磨。
 </p>
 
 <p>
@@ -18,10 +18,10 @@
 
 <p>
   <a href="#怎么开始玩"><b>怎么开始玩</b></a> ·
-  <a href="#专注于纯文字导入角色卡会发生什么">纯文字与变量说明</a> ·
-  <a href="#对比传统酒馆sillytavern做了哪些改变">对比传统酒馆</a> ·
-  <a href="#日常高频玩法">日常玩法</a> ·
-  <a href="#底层机制拆解">硬核机制拆解</a>
+  <a href="#纯文字变量与上下文隔离说明">纯文字与上下文隔离</a> ·
+  <a href="#对比传统酒馆与其他新架构">架构对比</a> ·
+  <a href="#核心游玩功能">游玩功能</a> ·
+  <a href="#硬核机制拆解">硬核机制拆解</a>
 </p>
 
 </div>
@@ -30,134 +30,110 @@
 
 <h3 align="center">怎么开始玩</h3>
 
-<p align="center">不用折腾本地服务器，也不需要懂底层环境。手机装一个客户端，把本仓库链接发给 AI 就能用。</p>
+<p align="center">不用折腾本地服务器，也不需要配环境。整个面板、状态栏与所有交互流程均已针对手机触控进行专门优化。</p>
 
 ### 方式一：手机端直接玩（推荐）
 
-1. 下载并安装配套的 Android 客户端：**[Pi for Android (`heikeyangle-code/pi-android`)](https://github.com/heikeyangle-code/pi-android)**（免 Root、免 Termux，本机直接运行）。
-2. 打开 App，把本仓库地址发给 AI，让它自己装好并启用：
-   > 帮我安装并启用这个角色扮演扩展：`https://github.com/heikeyangle-code/tavern-next`
-3. 装好后输入 `/rp` 或 `/rp import`，内置文件浏览器会自动扫描手机下载目录里的 `.png`、`.charx`、`.json`，直接选卡开玩。
+1. 下载并安装配套 Android 客户端：**[Pi for Android (`heikeyangle-code/pi-android`)](https://github.com/heikeyangle-code/pi-android)**（免 Root、免 Termux，本机直接运行）。
+2. 打开 App，把本仓库链接发给 AI，让它自动安装并启用：
+   > 请帮我安装并启用这个角色扮演扩展：`https://github.com/heikeyangle-code/tavern-next`
+3. 装好后输入 `/rp` 或 `/rp import`，内置文件浏览器会自动扫描手机下载目录里的 `.png`、`.charx`、`.json`，选卡即可开玩。所有面板均采用手机原生可搜索底部弹窗与一键点选交互，不弹迷你虚拟终端，支持一键撤销状态误操作。
 
 ### 方式二：电脑端使用
 
-如果你已经在电脑上安装了 [Pi CLI](https://github.com/badlogic/pi-mono)，克隆到扩展目录并 `/reload` 即可：
+如果已在电脑上安装 [Pi CLI](https://github.com/badlogic/pi-mono)，克隆到扩展目录并 `/reload` 即可：
 
 ```bash
 git clone https://github.com/heikeyangle-code/tavern-next.git ~/.pi/agent/extensions/tavern-next
 ```
 
-在终端输入 `/rp` 打开启动器，或用 `pi --rp-card <card-slug>` 直接在当前会话加载指定角色卡。
+输入 `/rp` 打开启动器，或用 `pi --rp-card <card-slug>` 单会话直启指定角色卡。
 
 <br>
 
 ---
 
-<h3 align="center">专注于纯文字：导入角色卡会发生什么？</h3>
+<h3 align="center">纯文字、变量与上下文隔离说明</h3>
 
-<p align="center">这里把实际代码会做什么、不会做什么，老老实实一次讲清。</p>
+<p align="center">把实际代码会做什么、不会做什么，老老实实一次讲清。</p>
 
 - **所有前端美化与脚本壳，默认清洗为纯文字**
-  - 导入 SillyTavern / RisuAI / Chub 角色卡时，编译器会用平衡标签扫描器剥离 `<script>`、`<style>`、`<iframe>`、带内联样式的 HTML 状态栏壳、`<UpdateVariable>`、纯前端美化正则以及 `live2d`/`vrm` 等 Web 资产。
-  - **绝不删改叙事正文与灵魂字段**：`description`、`personality`、`scenario`、`mes_example`（对话示例）、`system_prompt`、`post_history_instructions`、`depth_prompt` 与有效世界书正文均原样保留；如果你不想做清洗，也随时可以通过 `/rp raw` 切换原味直通。
-  - **明确的能力边界**：如果某张卡的核心玩法本身是一段浏览器 Canvas / Vue / React 互动网页小游戏，本引擎不运行浏览器 DOM，无法照原样运行其前端点击玩法。
+  - 导入 SillyTavern / RisuAI / Chub 角色卡时，平衡标签扫描器会剥离 `<script>`、`<style>`、`<iframe>`、内联样式 HTML 状态栏壳、`<UpdateVariable>`、纯前端美化正则及 `live2d`/`vrm` 等 Web 资产。
+  - **100% 原样保留灵魂字段**：`description`、`personality`、`scenario`、`mes_example`（对话示例）、`system_prompt`、`post_history_instructions`、`depth_prompt` 与有效世界书正文绝不删改；随时可通过 `/rp raw` 切换原味直通。
+  - **能力边界**：如果某张卡的核心玩法本身是内嵌浏览器 Canvas / Vue / React 点击小游戏，本引擎不运行浏览器 DOM，无法照原样运行其网页交互。
 
-- **会自动提取变量吗？没有变量的纯文字卡也会提取吗？**
-  - **卡里本身写了变量（MVU / `InitVar` / YAML / 宏变量，或纯文本里明确写着 `体力：80/100`、`好感度：20`、Markdown 属性表）**：导入时（0 Token，纯本地规则）会在清洗前端壳**之前**自动把这些变量打捞出来，开局直接写入状态引擎。
-  - **完全没有写变量的纯文字卡**：导入时**不会**凭空捏造数值变量，保持纯粹的文字对话体验。如果你希望引擎额外追踪物品、角色心态阶段、实体别名或防剧透门禁，可以手动执行一次 `/rp analyze`（调用当前模型分析 1 次并永久缓存），或在游玩时开启后台可选结算（`/rp mode sidecar-light`），也可以直接在 `/rp panel` 里手动记。
+- **变量怎么提取？没有变量的纯文字卡也会提取吗？**
+  - **带变量的卡（MVU `_.set`/`_.add`/`_.assign`、JSONPatch、禁用状态的 `[InitVar]` 嵌套 YAML、HTML 属性表，或纯文本里明确写着 `体力：80/100` 等属性）**：导入时（L0，0 Token，纯本地）会在清洗前端壳**之前**无损打捞变量与上下界（支持负值与双极属性），开局直接写入状态引擎。
+  - **完全没有写变量的纯文字卡**：导入时**不会**凭空捏造变量。如果你希望为纯文字卡建立完整世界档案，可执行一次 `/rp analyze`（L1，7 维度深度提取并永久缓存到编译卡中，后续新开局 0 Token 复用），或在游玩中开启可选后台边车（`/rp mode sidecar-light`）与面板手动管理。
 
 - **提取到的变量会自动展示在状态栏吗？**
-  - **默认极简状态栏（`minimal`）**：只显示一行干净的 `◆ 角色名 · 时间 · 地点 · T轮数`（外加未收伏笔数与指令数），不会把一堆数值挤在单行里。
-  - **完整状态栏（`/rp hud full`）**：在输入框上方展开多行原生状态条，自动把提取到的有界数值条（`▓▓▓░░ 80/100`）、角色心态阶段、背包物品、进度时钟与导演指令全部展示出来（桌面端与手机端通用）。
-  - **世界面板（`/rp panel`）**：任何时候都可以打开面板，查看和直接修改全部数值、物品、心态、场景与记忆本。
+  - **默认极简状态栏（`minimal`）**：底部单行只显示干净的 `◆ 角色名 · 阶段 · 时间 · 地点 · T轮数`（及未收伏笔数与导演指令数），不堆叠杂乱数值。
+  - **完整状态栏（`/rp hud full`）**：在输入框上方展开多行原生状态条，自动展示有界数值条（含双向正负条）、角色心态阶段、背包物品、进度时钟与当前指令。
+  - **世界面板（`/rp panel`）**：随时以原生底部弹窗查看、搜索、编辑全部状态，并支持一键撤销上次变更。
 
-- **变量计算、状态更新和聊天上下文彻底隔离（不会因为模型算错数而错乱）**
-  - **传统酒馆是怎么做的**：在传统酒馆里，变量加减、`<UpdateVariable>` 补丁、HTML 状态栏代码全部混在主对话上下文里——每轮都要主模型一边写小说、一边在结尾自己算账吐代码；算错数、漏字段、格式崩坏是常态，而且几十轮过期的状态代码会永远堆在聊天历史里，严重污染上下文并拖垮文笔。
-  - **我们的真实隔离机制**：
-    1. **运算全部归代码，不让模型当算盘**：数值加减与上下界裁剪（`min`/`max`）、背包数量增减、进度时钟推进、真随机掷骰（`node:crypto`）、门禁校验全部由 TypeScript 代码确定性执行，模型只负责写正文或在需要时提交结构化意图，**不会因为模型算错数导致数值错乱**。
-    2. **动态状态不进聊天历史（发完即丢）**：每轮最新世界状态（`<rp_state_frame>`）和召回的世界书/记忆，只通过 `context` 钩子**临时挂在本次请求的尾部（Zone 3）**，绝不落盘写入聊天记录。聊到第 100 轮时，主对话历史里依然只有干干净净的纯文字剧情，没有一坨过期状态栏垃圾。
-    3. **后台抽取与辅助功能走独立隔离上下文**：开启 `sidecar-light` 后，事实/场景/变量提炼是在回复结束后另起一次**独立轻量模型请求**（校验后落账，不阻塞首字、不污染主对话流）；`/rp analyze` 建档、`/rp ask` 场外提问、`/rp imp` 代写主角同样走独立隔离请求，结果绝不塞进主剧情历史。
-    4. **会话与剧情认知双隔离**：角色库纯静态存放，绝不污染其他普通会话（`/rp exit` 一键清零）；未解锁世界书在代码层物理拦截，私密事件按知情者列表标注认知盲区，防止提前剧透与 NPC 全知穿帮。
+- **变量计算、状态更新与叙事上下文彻底隔离（不会因为模型算错数而错乱）**
+  - **运算归代码，不让模型当算盘**：数值加减与上下界裁剪、背包数量校验（禁止扣成负数）、进度时钟推进、真随机掷骰、条件门禁校验全部由 TypeScript 代码确定性执行。
+  - **动态状态发完即丢，永不写进聊天历史**：每轮 `<rp_state_frame>` 与召回记忆仅通过 `context` 钩子临时附在当次请求尾部（Zone 3），绝不落盘进历史记录。聊到第 100 轮时，主对话历史里依然只有干净纯文字剧情，没有堆积的过期状态代码。
+  - **后台结算与辅助功能走独立隔离上下文**：开启 `sidecar-light` 时，事实、信念与状态提炼在回复结束后另起独立轻量模型请求（且自动从主叙事模型撤下状态写入工具，减少工具调用干扰）；`/rp analyze`、`/rp ask`、`/rp imp`、`/rp act` 全部走独立隔离请求，不污染主剧情上下文。
+  - **会话与剧情认知双隔离**：角色库纯静态存放，绝不污染普通编程会话（`/rp exit` 一键清零）；未解锁世界书物理拦截，私密事件按知情者列表标注认知盲区。
 
 <br>
 
 ---
 
-<h3 align="center">对比传统酒馆（SillyTavern），做了哪些改变？</h3>
+<h3 align="center">对比传统酒馆与其他新架构</h3>
 
-<p align="center">两者底层架构不同：传统酒馆以浏览器前端 + 单体文本拼接为核心，本项目以纯文字叙事 + 确定性代码状态引擎为核心。</p>
-
-| 对比项 | 传统酒馆（SillyTavern） | Tavern Next |
-| :--- | :--- | :--- |
-| **前端美化与状态栏** | 依赖模型在正文里输出 HTML/状态块，再用前端脚本与正则渲染 | 清洗前端壳，正文永远纯文字；状态由代码维护，通过原生状态栏与 `/rp panel` 展示 |
-| **上下文组织** | 系统提示、世界书、`@D` 注入与聊天历史拼接在一起，中段插队易打断前缀缓存 | **三区架构**：冻结前缀 + 纯追加历史 + 仅附于当次请求尾部的瞬态状态帧 |
-| **数值与背包追踪** | 靠 Prompt 约束模型自己算账，长对话容易算错或格式漂移 | 代码侧确定性校验（上下界裁剪、背包增减、真随机掷骰），状态与正文彻底解耦 |
-| **世界书与长程记忆** | 关键词子串/正则扫描近期消息，旧设定与新事实容易并存冲突 | 本地 BM25 + 2 跳实体图谱（PPR）联想召回 + 双时态事实账本（旧事实非破坏性失效）+ 伏笔队列 |
-| **重摇与回溯一致性** | 聊天记录与外置变量脚本分开存储，回退楼层后数值易错位 | 所有状态变更作为事务日志寄生在原生会话树（DAG）中，回溯/分叉分支时精确重放还原 |
-
-<br>
-
-### 对比其他「新时代 RP 架构」（多 Agent / 外置向量库）
-
-除了传统酒馆，社区里还出现过两类常见的新路线——**全量多 Agent 编排**（导演 + 每个 NPC 独立一个 Agent + 裁判）和 **外置向量数据库 RAG**（独立跑向量库 + Embedding API）。我们没有走这两条路，原因很直接：
-
-| 路线 | 典型做法 | 实际游玩时的痛点 | Tavern Next 的取舍与优点 |
+| 路线 | 典型做法 | 实际游玩时的痛点 | Tavern Next 的取舍与机制 |
 | :--- | :--- | :--- | :--- |
-| **全量多 Agent** | 导演、旁白、角色 A/B 各自独立上下文串行调用 | 串行多轮调用导致**首字等待慢**；每个 Agent 各算一份上下文，**Token 翻倍且前缀缓存几乎失效**；跨 Agent 交接摘要容易丢失情绪铺垫与文风连贯 | **单主脑统一执笔 + 代码管状态**：90% 日常与群戏只调 1 次主模型流式直出，文风统一、前缀缓存完整；仅在强信息不对称博弈时按需调用视角隔离视图 |
-| **外置向量 RAG** | 依赖外部向量库与云端 Embedding 接口检索聊天记录 | 手机端本机部署麻烦、依赖额外 API；纯语义相似度不擅长处理**时间线更新**，旧事实与新事实经常同时被召回互相打架 | **本地纯代码零依赖召回**：纯 TypeScript 本地 BM25 + 2 跳实体图谱（PPR）毫秒级运行，配合**双时态事实失效**，旧事实作废后不再干扰当前回合 |
-| **重度前端状态卡** | 用 HTML/CSS/JS 脚本把聊天框改造成网页游戏界面 | 提示词被大量前端格式指令挤占，容易崩格式、污染上下文 | **专注纯文字叙事**：剥离前端壳，正文永远干净，数值/背包/记忆全部交由代码引擎与原生面板维护 |
+| **传统酒馆 1.0（SillyTavern）** | 单体文本拼接 + Prompt 逼模型吐 `<status>` / HTML 状态栏 + 关键词子串扫世界书 | 聊久了状态栏崩格式、历史堆满过期代码、前缀缓存频繁碎裂、回溯后变量与剧情错位 | **三区零碎裂缓存 + 代码管真值 + 会话树事件溯源**：正文永远纯文字，回溯/分叉时所有状态 100% 同步还原 |
+| **全量多 Agent 编排** | 导演、旁白、每个 NPC 各自独立上下文串行调用 | 首字等待慢、Token 翻倍且前缀缓存几乎失效、跨 Agent 交接摘要易丢失文风连贯性 | **单主脑统一执笔 + 代码引擎 + 按需隔离**：日常与群戏只调 1 次主模型流式直出，仅在强信息不对称博弈时按需调用视角隔离视图 |
+| **外置向量 RAG** | 依赖独立向量库与云端 Embedding API 检索旧聊天 | 手机本机难部署、依赖额外服务；纯语义相似度不擅长处理时间线更新，新旧事实易并存打架 | **本地纯代码零依赖召回**：纯 TypeScript 本地 BM25 + 统一 2 跳 PPR 实体图谱毫秒级运行 + 双时态事实非破坏性失效 |
 
 <br>
 
 ---
 
-<h3 align="center">日常高频玩法</h3>
+<h3 align="center">核心游玩功能</h3>
 
-<p align="center">围绕真实长篇纯文字游玩习惯整理，日常卡清爽简洁，复杂卡按需展开。</p>
-
-- **通用 5+1 世界面板（`/rp panel`）**
-  - **当前场景与时间**：修改地点、在场人物、时间标签，或一键切场景/跳时间（`/rp skip`）。
-  - **人物与关系**：查看或调整角色态度阶段、好感与数值、人物印象，切换玩家马甲（`/rp persona`）与同场共演（`/rp cast`）。
-  - **剧情记忆本**：0 Token 瞬时生成前情提要（`/rp recap`）、记录公开/私密事件与伏笔，支持**一键「总结并隐藏较早的对话楼层」**（`/rp summarize`，把旧楼层压成记忆条目并对模型非破坏性隐藏，原记录随时可 `/rp unhide` 恢复）。
-  - **世界书管理**：支持 300+ 条目关键词搜索、按状态/门禁筛选、分页开关，并可**从最近对话一键为新人物或新地点生成世界书条目**（`/rp loregen`）。
-  - **导演台（Author's Note）**：调整叙事节奏（`/rp pace`），用多行编辑器写临时或常驻导演指令（`/rp note`）。
-  - **跑团与世界机制**：背包、进度时钟、真随机掷骰（`/rp roll`）、剧情阶段与模块开关，按卡型自动展开或折叠。
-- **高频创作辅助**
-  - **帮我代写主角回复（`/rp imp`）**：以玩家人设视角起草一段回复并直接填入输入框，改两句就能发。
-  - **零污染场外提问（`/rp ask`）**：随时查角色真实心理、核对前文线索或要剧情灵感，弹窗看完即关，**不写入聊天历史、不推进回合**。
-  - **行内 `((OOC))` 讨论**：在输入框直接打 `((内容))` 或 `（（内容））`，自动识别为场外讨论，不推进剧情与时钟。
-  - **分叉重摇与书签（`/rp reroll`、`/rp save`、`/rp goto`）**：重摇上一条回复时支持附带 1 轮微调方向，旧版本保留在原生 `/tree` 会话树里，随时切回。
+- **原生触控世界面板（`/rp panel`）**：
+  - **场景、目标与动态剧情卡（Storylets）**：管理地点、在场人物、当前场景目标、带属性/门禁条件的 Storylets（完成后自动触发后续效果），以及**幕间世界推演（`/rp skip`）**——跳时间时在后台推演时钟进展、幕后势力暗流与新场景切入镜头，确认后再落盘。
+  - **人物与关系**：管理角色心态阶段（CFSM）、好感与多角色数值、背包物品、人物印象与信念，随时切换玩家马甲（`/rp persona`）与同场共演（`/rp cast`）。
+  - **记忆书、事实与秘密**：支持把较早的对话楼层一键总结归档为「记忆书章节」并隐藏旧楼层（`/rp summarize`），管理公开/私密事实与未收伏笔，0 Token 查看前情提要（`/rp recap`）。
+  - **世界书完整管理**：支持 300+ 条目搜索、筛选、全文编辑、新增/删除、实时开关，以及从最近对话一键生成新世界书条目（`/rp loregen`）。
+  - **导演台、快捷回复与 X-Ray 透视**：切换叙事节奏、管理内心戏开关、常用快捷回复宏（`/rp qr`）、查看真实 3 层上下文与 KV-Cache 命中连击（`/rp xray`）、一键撤销误操作。
+- **零污染创作辅助**：
+  - **帮我代写主角回复（`/rp imp`）**：以玩家人设起草一段回复直接填入输入框，改两字就能发；
+  - **一键行动建议（`/rp act`）**：隔离生成 3 条贴合当下情境的直接可发选项，点选即填入输入框，不污染聊天记录；
+  - **零污染场外提问（`/rp ask`）**：随时查角色心理、核对线索或构思走向，看完即关，不写入历史；
+  - **行内 `((OOC))` 语法**：直接输入 `((内容))` 或 `（（内容））` 自动识别为场外讨论，不推进剧情与时钟；
+  - **分叉重摇与书签（`/rp reroll`、`/rp save`、`/rp goto`）**：支持定向微调重摇，旧分支完整保留在原生 `/tree` 中。
 
 <br>
 
 ---
 
-<h3 align="center">底层机制拆解</h3>
+<h3 align="center">硬核机制拆解</h3>
 
-<p align="center">以下内容全部对应仓库内实际实现的代码模块，面向关心底层工程设计与长程一致性的玩家与开发者。</p>
+<p align="center">以下全部对应仓库内实际代码与 46 项自动化单元测试，无外部数据库、无第三方运行时依赖。</p>
 
-### 1. 三区 KV-Cache 上下文装配（`src/context/zone-builder.ts`）
-- **Zone 1（冻结前缀，`before_agent_start`）**：按 SillyTavern 位置规范组装引擎极简协议、预设前段、`system_prompt`、`before_char`/`after_char`/`before_example`/`after_example` 常驻世界书、静态 `outlet`、角色核心设定、**100% 原样 `mes_example`** 与初始玩家人设。不包含回合数、时间戳或动态数值，跨回合字节级不变；中途更换玩家马甲时仅在 Zone 3 声明，不击穿前缀缓存。
-- **Zone 2（Append-Only 历史流）**：永不修改历史消息对象。隐藏楼层同时记录 `entryId` 与基于 `role|timestamp|head` 的 SHA-1 指纹，在 `context` 钩子中做非破坏性过滤，不破坏原始 JSONL 会话文件。
-- **Zone 3（瞬态尾部帧，`context`）**：仅挂接在发往模型的消息副本末尾，绝不落盘。按确定性键序序列化 `<rp_state_frame>`，依次附带召回世界书、现行有效事实、列表优先认知盲区（`- [HIDDEN FROM: NPC] ...`）、在场角色优先的信念边、开放伏笔、节奏与轻量防停滞提示、导演指令、`depth_prompt` 与 `post_history_instructions`。
+### 1. 三区 KV-Cache 上下文装配与 X-Ray 透视（`src/context/zone-builder.ts`）
+- **Zone 1（冻结前缀，`before_agent_start`）**：按 SillyTavern 位置规范组装引擎极简协议、预设前段、`system_prompt`、常驻世界书、静态 `outlet`、角色设定、**100% 原样 `mes_example`** 与初始玩家人设；所有宏采用确定性种子求值，跨回合通过 SHA-256 哈希校验保证字节级一致。
+- **Zone 2（Append-Only 历史流）**：绝不篡改历史消息对象；隐藏楼层同时记录 `entryId` 与消息指纹做非破坏性过滤。
+- **Zone 3（瞬态尾部帧，`context`）**：仅挂接在当次请求末尾，不落盘。包含确定性键序 `<rp_state_frame>`、召回世界书、实体匹配的双时态事实、列表优先认知盲区（`- [HIDDEN FROM: NPC] ...`）、RoleMemo DualMem 信念、开放伏笔、激活 Storylets、真实叙事健康度防停滞提示（`stagnation.ts` 基于复读率与世界推进检测，而非机械按轮数触发）、导演指令、`depth_prompt` 与 `post_history_instructions`。
 
-### 2. 确定性状态机与会话树事件溯源（`src/engine/`）
-- **事件溯源重放（`state-replay.ts`）**：所有状态变更（`bind`、`unbind`、`stat_patch`、`inventory_patch`、`location_set`、`cfsm_define`、`cfsm_transition`、`progress_clock`、`fact_add`、`fact_invalidate`、`belief_update`、`foresight_upsert`、`era_advance`、`clock_tick`、`lore_toggle`、`hide_toggle`、`profile_apply`）全部作为 `rp:tx` 事务写入原生会话树。每次会话启动、重连或切换分支（`session_start` / `session_tree`）时，沿当前分支从零确定性重放。
-- **严谨回合边界（`settlement.ts`、`state-replay.ts`）**：`turn_end` 自动跳过工具调用中间步，且 `clock_tick` 仅在 `beatDelta > 0` 时递增回合与扣减临时导演指令 TTL，避免同回合多次结算。
-- **代码侧规则校验（`cfsm.ts`、`dice.ts`、`gates.ts`）**：数值变更强制上下界裁剪；掷骰基于 `node:crypto` 真随机（支持 `NdM`、`kh`/`kl`、修正值与 DC）；门禁统一校验 `minTurn`、`requiredEra`、`requiredMilestones`、`requiredFlags`、`forbiddenFlags`、`requiredLocations`。
+### 2. 无损 7 维抽取与 L0 / L1 / L2 闭环管道（`src/parser/`、`src/engine/settlement.ts`）
+- **L0 本地无损打捞（`mvu-salvage.ts`、`world-profile.ts`）**：支持禁用态 `[InitVar]` 嵌套 YAML、官方 MVU `_.set`/`_.add`/`_.assign`、JSONPatch、HTML 表格与纯文本有界数值，多角色隔离且保留负值边界。
+- **L1 一键 7 维建档（`analyzer.ts`）**：`/rp analyze` 一次性提取卡型、模块、时空初态、初始物品、数值、CFSM 建议轴、实体别名表（反哺世界书召回）与防剧透门禁，永久缓存至 `card.compiled.json`。
+- **L2 异步边车闭环（`settlement.ts`、`llm-helper.ts`）**：支持在 `/rp sidecar` 指定独立的廉价极速模型，挂载于 `agent_settled`/`agent_end`（零首字延迟），输出双时态失效（`invalidatedFactIds`）、RoleMemo 主观洞见与情绪基调、场景/时钟/数值更新；兼容推理模型思考标签剥离与平衡括号 JSON 提取。
 
-### 3. L0 / L1 / L2 三层通用抽取管道（`src/parser/`、`src/engine/settlement.ts`）
-- **L0（导入时，0 Token，纯本地）**：解析 PNG `tEXt`/`iTXt`/`zTXt`（`ccv3` 优先于 `chara`）、`.charx`（Zip-Slip 安全校验与 `embeded://` 兼容）与 V1/V2/V3 JSON；清洗前打捞 MVU/YAML/宏及纯文本显式有界数值与时空锚点，推断卡型（`CardArchetype`）与模块开关（`WorldProfileModules`）。
-- **L1（`/rp analyze`，按需 1 次调用永久缓存）**：通过统一的 `llm-helper.ts`（`ctx.modelRegistry.streamSimple().result()`）提取完整世界画像、初始物品、CFSM 建议轴、实体别名表（写回世界书条目提升召回率）与建议防剧透门禁，用户确认后持久化到 `card.compiled.json`，后续新开局 0 Token 复用。
-- **L2（可选 `sidecar-light` 后台边车）**：挂载在 `agent_settled`/`agent_end`（每回合幂等保护、不阻塞首字输出），将现行事实 ID 传入边车模型，支持非破坏性旧事实失效（`invalidatedFactIds`）、场景/时间更新与按模块门控的数值/物品/时钟更新。
+### 3. 统一 HippoRAG 2 图谱召回与双时态记忆（`src/memory/`）
+- **统一 2 跳 PPR（`graph-ppr.ts`）**：将世界书条目、双时态事实与记忆书章节桥接在同一本地实体共现图上执行 2 轮幂迭代 Personalized PageRank（本地毫秒级），消除长对话到 100 轮时的早期记忆盲区。
+- **语义幕间压缩（`compaction.ts`）**：`session_before_compact` 支持异步语义 MemScene 归并并具备安全回退机制，严格遵循官方 `CompactionResult` 契约。
 
-### 4. 本地无向量召回、认知隔离与长程压缩（`src/memory/`）
-- **BM25 + 2 跳 PPR 实体图谱（`graph-ppr.ts`）**：完整支持 SillyTavern 关键词、次关键词、`@@exclude_keys`、内联 `/regex/flags`、概率、`sticky`/`cooldown`/`useOnce` 与 CCV3 装饰器；基于实体共现邻接表执行 2 轮幂迭代 Personalized PageRank（本地毫秒级），按 Token 预算截断送入 Zone 3。
-- **双时态事实、伏笔与幕间压缩（`bitemporal.ts`、`foresight.ts`、`compaction.ts`）**：事实携带 `validFromTurn` / `validUntilTurn` / `witnessIds`；伏笔每轮按相关性筛选 Top 3；触发长对话压缩（`session_before_compact`）时将当前状态、有效事实、人物信念与开放伏笔归并为结构化幕级摘要。
-
-### 5. 运行时隔离与底层扩展边界（`src/index.ts`、`src/ui/`）
-- **默认休眠**：注册的 6 个内部工具均设 `defaultActive: false`，未开启 RP 时 0 工具 Token、0 UI 占用、0 Hook 开销；`rp:tx` 状态事务在对话流中完全静默不渲染，不打断正文阅读沉浸感；展示层通过 `registerMarkdownTransformer({ messageTypes: ["assistant", "custom"] })` 清理残留标签并执行酒馆 `AI_OUTPUT` 展示正则。
-- **双端一致**：状态栏采用纯文本数组 Widget，输入框预填与多行编辑采用标准 UI 接口，在桌面端终端与移动端 [Pi for Android](https://github.com/heikeyangle-code/pi-android)（RPC 模式）下均可直接工作。
+### 4. 确定性事件溯源、可逆审计与零污染生命周期（`src/engine/state-replay.ts`、`src/index.ts`）
+- 所有状态变更以 `rp:tx` 事务写入原生会话树并维护可逆审计日志（`auditLog`），支持一键撤销与分支重放；
+- 6 个内部工具均设 `defaultActive: false`；在 `sidecar-light` / `off` 模式下自动向主模型隐藏状态写入工具以节省 Schema Token 并减少工具格式干扰；
+- 所有内部模型调用统一走 Pi 官方 `ctx.modelRegistry.streamSimple().result()`（附带 `timestamp` 与 `ctx.signal`），并严格遵循 Pi 官方 UI 契约，保证桌面端与 [Pi for Android](https://github.com/heikeyangle-code/pi-android) 行为一致。
 
 <br>
 
@@ -173,7 +149,7 @@ git clone https://github.com/heikeyangle-code/tavern-next.git ~/.pi/agent/extens
 
 ```bash
 npm run typecheck   # TypeScript 严格类型检查
-npm test            # 运行全部单元测试
+npm test            # 运行全部 46 项引擎、解析器、图谱召回与交互单元测试
 ```
 
 </details>
