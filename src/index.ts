@@ -138,26 +138,36 @@ export const TOOL_ASSISTED_CORE_TOOLS = [
 ] as const;
 
 /**
- * Prose-First Dual-Track Tool Exposure:
- * - "off": 0 tools (pure literary prose, max KV-cache & zero TTFT overhead)
- * - "sidecar-light": 0 tools for companion/slice-of-life without explicit RPG modules;
- *   otherwise 3 lean read/dice tools (rp_roll_check, rp_recall, rp_history_recall)
- * - "tool-assisted": 5 core tools (excludes rp_npc_deliberate & rp_era_advance by default)
+ * Unified Strongest-Default Tool Exposure (Zero Ghost Tools):
+ * - "off": 0 tools (pure chat)
+ * - "sidecar-light": always keeps lean read + dice tools (rp_roll_check, rp_recall, rp_history_recall)
+ *   so dice checks NEVER silently disappear on any card!
+ * - "tool-assisted" (DEFAULT — strongest all-in-one mode): 5 core tools + contextual
+ *   `rp_era_advance` (when stages/era active) & `rp_npc_deliberate` (when multi-NPC/living-world active).
  */
 export function getDesiredRpTools(state: SessionRpState, card: CompiledCard | null): string[] {
   if (state.settlementMode === "off") {
     return [];
   }
   if (state.settlementMode === "sidecar-light") {
-    const archetype = state.archetype || card?.worldProfile?.archetype || "companion";
-    const modules = state.modules ?? card?.worldProfile?.modules;
-    const hasRpgModules = Boolean(modules?.stats || modules?.inventory || modules?.clocks);
-    if ((archetype === "companion" || archetype === "slice-of-life") && !hasRpgModules) {
-      return [];
-    }
     return [...SIDECAR_READ_TOOLS];
   }
-  return [...TOOL_ASSISTED_CORE_TOOLS];
+  const tools: string[] = [...TOOL_ASSISTED_CORE_TOOLS];
+  const modules = state.modules ?? card?.worldProfile?.modules;
+  const archetype = state.archetype || card?.worldProfile?.archetype || "companion";
+  if (modules?.stages || Boolean(state.era?.trim())) {
+    tools.push("rp_era_advance");
+  }
+  if (
+    state.presentNpcs.length >= 2 ||
+    Object.keys(state.npcAgendas).length > 0 ||
+    archetype === "ensemble" ||
+    archetype === "mystery" ||
+    archetype === "epic-saga"
+  ) {
+    tools.push("rp_npc_deliberate");
+  }
+  return tools;
 }
 
 export default function rpEngineExtension(pi: PiExtensionAPI): void {
@@ -238,7 +248,11 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     if (savedCodingTools === null && hasNonRpTools) {
       savedCodingTools = current.filter((t) => !rpToolSet.has(t));
     }
-    pi.setActiveTools(desired);
+    const currentSorted = [...current].sort().join(",");
+    const desiredSorted = [...desired].sort().join(",");
+    if (currentSorted !== desiredSorted) {
+      pi.setActiveTools(desired);
+    }
   }
 
   function restoreCodingTools(): void {
@@ -555,6 +569,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       }
     }
 
+    activateRpTools();
     const initialPersona = state.initialPersona ?? state.currentPersona;
     const activeToolNames = pi.getActiveTools();
     const zone1Options = {

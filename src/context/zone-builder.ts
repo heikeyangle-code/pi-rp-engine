@@ -50,16 +50,60 @@ function fnv1aSeed(str: string): number {
   return h >>> 0;
 }
 
-const ENGINE_PROTOCOL_COMPACT = `[RP Engine Protocol]
-- You are the sole narrative writer for this interactive world. Maintain consistent literary voice, given-circumstance character psychology, and organic pacing.
-- Authoritative world state (stats, inventory, clocks, era gates, flags, bi-temporal facts, character beliefs) is maintained deterministically by code and provided in <rp_state_frame> & <rp_recalled_context> at the end of the turn. Never fabricate impossible stat/item changes or print legacy HTML status bars.
-- Regular dialogue/emotional turns require ZERO tool calls — write the narrative directly.
-- Invoke tools ONLY when genuinely needed: \`rp_roll_check\` for uncertain checks, \`rp_state_patch\` when items/stats/location/clocks/CFSM materially change, \`rp_fact_commit\` for major new/invalidated facts, DREAM belief shifts, or foresights, \`rp_recall\` for deep archive lookups, \`rp_era_advance\` for major act transitions, and \`rp_npc_deliberate\` only for strict hidden-information NPC plotting.`;
+function buildEngineProtocol(activeToolNames?: string[]): string {
+  const active = activeToolNames ? new Set(activeToolNames) : null;
+  const has = (name: string) => (active ? active.has(name) : true);
+  const hasWriteTools = has("rp_state_patch") || has("rp_fact_commit");
+  const hasRoll = has("rp_roll_check");
+  const hasRecall = has("rp_recall") || has("rp_history_recall");
 
-const ENGINE_PROTOCOL_PROSE_FIRST = `[RP Engine Protocol · Prose-First]
+  if (!hasWriteTools && !hasRoll && !hasRecall) {
+    return `[RP Engine Protocol · Pure Chat]
 - You are the sole narrative writer for this interactive world. Write pure, immersive literary prose with consistent character psychology, concrete sensory grounding, and organic pacing.
-- Authoritative world state (location, time, stats, inventory, clocks, facts, character beliefs) is maintained automatically in the background and provided in <rp_state_frame> & <rp_recalled_context> at the end of the turn.
 - NEVER output raw XML/JSON state tags, markdown status bars, HTML widgets, or meta commentary in your narrative reply.`;
+  }
+
+  const lines: string[] = [
+    hasWriteTools ? "[RP Engine Protocol]" : "[RP Engine Protocol · Prose-First]",
+    "- You are the sole narrative writer for this interactive world. Maintain consistent literary voice, given-circumstance character psychology, and organic pacing.",
+    "- Authoritative world state (stats, inventory, clocks, flags, conditions, storylets, bi-temporal facts, character beliefs, and latest dice roll) is maintained deterministically by code and provided in <rp_state_frame> & <rp_recalled_context> at the end of the turn. Never fabricate impossible stat/item changes or print legacy HTML status bars.",
+  ];
+
+  if (hasRoll) {
+    lines.push(
+      "- **Dice Check Rule**: Whenever the player attempts a risky, uncertain, contested, stealth, persuasion, deception, perception, lockpicking, crafting, or combat action where failure is meaningfully possible, ALWAYS call `rp_roll_check` FIRST (passing `stat_key` if a matching stat exists, plus `dc` and `reason`) before narrating the outcome. Honor the exact returned roll & critical result — never invent dice rolls in prose.",
+    );
+  }
+
+  const toolHints: string[] = [];
+  if (has("rp_state_patch")) {
+    toolHints.push(
+      "`rp_state_patch` when location/NPCs/stats/inventory/flags/clocks/conditions/CFSM change or an active Storylet finishes (`completed_storylets`)",
+    );
+  }
+  if (has("rp_fact_commit")) {
+    toolHints.push("`rp_fact_commit` for major new/invalidated facts, character belief shifts, or planted/resolved foresights");
+  }
+  if (has("rp_recall")) {
+    toolHints.push("`rp_recall` to search/read worldbook or archived facts");
+  }
+  if (has("rp_history_recall")) {
+    toolHints.push("`rp_history_recall` to recall exact earlier dialogue turns");
+  }
+  if (has("rp_era_advance")) {
+    toolHints.push("`rp_era_advance` for major chapter/act/time-skip transitions");
+  }
+  if (has("rp_npc_deliberate")) {
+    toolHints.push("`rp_npc_deliberate` only for strict hidden-information multi-NPC plotting");
+  }
+  if (toolHints.length > 0) {
+    lines.push(`- Active tools (skip on pure casual chat, invoke promptly when triggered): ${toolHints.join("; ")}.`);
+  }
+  if (!hasWriteTools) {
+    lines.push("- World state bookkeeping runs silently in the background; NEVER output raw XML/JSON state tags or status widgets.");
+  }
+  return lines.join("\n");
+}
 
 const PACING_HINTS: Record<PacingMode, string | null> = {
   relaxed: "Pacing cue: Keep scenes gentle, atmospheric, and character-driven; let quiet moments breathe without forcing artificial conflict.",
@@ -197,12 +241,8 @@ export function buildZone1FrozenPrefix(options: {
 
   const sections: string[] = [];
 
-  // 1. Compact engine protocol (synced with active tools: Prose-First when write tools are hidden)
-  const hasWriteTools =
-    !activeToolNames ||
-    activeToolNames.includes("rp_state_patch") ||
-    activeToolNames.includes("rp_fact_commit");
-  sections.push(hasWriteTools ? ENGINE_PROTOCOL_COMPACT : ENGINE_PROTOCOL_PROSE_FIRST);
+  // 1. Dynamic engine protocol synced 1:1 with active tools (zero ghost tools, crystal-clear dice trigger rule)
+  sections.push(buildEngineProtocol(activeToolNames));
 
   // 2. Preset Zone 1 prompts (before chatHistory)
   if (preset && preset.zone1Prompts.length > 0) {
@@ -411,6 +451,19 @@ export function buildZone3TransientTail(options: {
               ]),
           )
         : undefined,
+    conditions:
+      Object.keys(state.conditions).length > 0
+        ? Object.values(state.conditions)
+            .sort((a, b) => a.id.localeCompare(b.id))
+            .map(
+              (c) =>
+                `${c.actorId}:${c.label}${c.remainingTurns !== null ? `(${c.remainingTurns}t)` : ""}${c.effect ? `[${c.effect}]` : ""}`,
+            )
+        : undefined,
+    lastRoll:
+      state.lastRoll && state.turn - state.lastRoll.turn <= 1
+        ? `${state.lastRoll.actor ? `${state.lastRoll.actor} ` : ""}${state.lastRoll.expression}=${state.lastRoll.total}${state.lastRoll.dc !== undefined ? `/DC${state.lastRoll.dc}` : ""}${state.lastRoll.critical === "nat_max" ? " CRITICAL_SUCCESS" : state.lastRoll.critical === "nat_min" ? " CRITICAL_FAILURE" : state.lastRoll.success === true ? " SUCCESS" : state.lastRoll.success === false ? " FAILURE" : ""}${state.lastRoll.reason ? ` (${state.lastRoll.reason})` : ""}`
+        : undefined,
   };
   pushSection(`<rp_state_frame>\n${stableStringify(compactState)}\n</rp_state_frame>`, 1);
 
@@ -424,6 +477,52 @@ export function buildZone3TransientTail(options: {
         .map((a) => `- [T${a.turn}] ${a.summary}`)
         .join("\n")}\n</rp_recent_changes>`,
       3,
+    );
+  }
+
+  // 1c. Unified Drama Director (<rp_drama_beat>): converges active Storylets, filled Clocks,
+  //     matured NPC Agendas, due Foresights, critical Dice Rolls, and extreme Bond tension
+  //     into ONE high-salience narrative beat so every subsystem visibly drives the story.
+  const dramaBeats: string[] = [];
+  const activeStoryletsForBeat = evaluateActiveStorylets(state);
+  for (const st of activeStoryletsForBeat.slice(0, 2)) {
+    dramaBeats.push(
+      `[STORYLET id="${st.id}"] ${st.title}: ${st.triggerPrompt} (Once played out, pass completed_storylets: ["${st.id}"] in rp_state_patch)`,
+    );
+  }
+  for (const clk of Object.values(state.clocks)) {
+    if (clk.completed) {
+      dramaBeats.push(`[CLOCK FULL] "${clk.label}" (${clk.value}/${clk.max}) has reached fruition — depict its consequence!`);
+    }
+  }
+  for (const ag of Object.values(state.npcAgendas)) {
+    if (ag.etaTurns === 0) {
+      dramaBeats.push(`[OFF-SCREEN AGENDA MATURED] ${ag.actorId} has completed "${ag.goal}" (${ag.currentActivity}) — let the ripple surface in-scene!`);
+    }
+  }
+  for (const hook of state.foresights.values()) {
+    if (hook.status !== "open") continue;
+    const clockDue = Boolean(hook.dueClockId && state.clocks[hook.dueClockId]?.completed);
+    const longOverdue = state.turn - hook.plantedTurn >= 10;
+    if (clockDue || longOverdue) {
+      dramaBeats.push(`[FORESIGHT DUE id="${hook.id}"] "${hook.summary}"${hook.triggerHint ? ` (hint: ${hook.triggerHint})` : ""} — weave a payoff or escalation naturally.`);
+    }
+  }
+  if (state.lastRoll && state.turn - state.lastRoll.turn <= 1 && state.lastRoll.critical) {
+    const critLabel = state.lastRoll.critical === "nat_max" ? "CRITICAL SUCCESS" : "CRITICAL FAILURE";
+    dramaBeats.push(`[DICE ${critLabel}] ${state.lastRoll.expression}=${state.lastRoll.total}${state.lastRoll.reason ? ` (${state.lastRoll.reason})` : ""} — make this dramatic swing unmistakable!`);
+  }
+  for (const pb of Object.values(state.pairBonds)) {
+    if (pb.tension <= -60) {
+      dramaBeats.push(`[RELATIONSHIP RIFT] ${pb.actorA} ↔ ${pb.actorB} (${pb.stance}, tension ${pb.tension}) is at breaking point.`);
+    } else if (pb.tension >= 60) {
+      dramaBeats.push(`[DEEP BOND] ${pb.actorA} ↔ ${pb.actorB} (${pb.stance}, tension +${pb.tension}) strongly influences their loyalties.`);
+    }
+  }
+  if (dramaBeats.length > 0) {
+    pushSection(
+      `<rp_drama_beat>\nActive world-state triggers to weave naturally into this turn:\n${dramaBeats.slice(0, 5).map((b) => `- ${b}`).join("\n")}\n</rp_drama_beat>`,
+      1,
     );
   }
 

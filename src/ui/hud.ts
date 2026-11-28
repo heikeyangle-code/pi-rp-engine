@@ -68,6 +68,9 @@ export function formatRpStatusLine(
   if (state.worldTimeLabel) optionalSegs.push(clampSeg(state.worldTimeLabel, 10));
   else if (state.era) optionalSegs.push(clampSeg(state.era, 10));
 
+  const condCount = Object.keys(state.conditions).length;
+  if (condCount > 0) optionalSegs.push(`⚡${condCount}`);
+
   const activeFlags = Object.values(state.flags).filter(Boolean).length;
   if (activeFlags > 0) optionalSegs.push(`🚩${activeFlags}`);
 
@@ -155,6 +158,32 @@ function buildHudRawLines(
 
   if (state.sceneObjective) {
     lines.push(`│ 🎯 目标  ${state.sceneObjective}`);
+  }
+
+  // Active timed/persistent Conditions (Buff/Debuff)
+  const condList = Object.values(state.conditions);
+  if (condList.length > 0) {
+    const condText = condList
+      .slice(0, 4)
+      .map((c) => `${c.actorId}:${c.label}${c.remainingTurns !== null ? `(${c.remainingTurns}轮)` : ""}`)
+      .join(" · ");
+    lines.push(`│ ⚡ 状态  ${condText}${condList.length > 4 ? ` (+${condList.length - 4})` : ""}`);
+  }
+
+  // Recent dice roll result (shown for current/last turn)
+  if (state.lastRoll && state.turn - state.lastRoll.turn <= 1) {
+    const r = state.lastRoll;
+    const badge =
+      r.critical === "nat_max"
+        ? "大成功★"
+        : r.critical === "nat_min"
+          ? "大失败✖"
+          : r.success === true
+            ? "成功✓"
+            : r.success === false
+              ? "失败✗"
+              : "";
+    lines.push(`│ 🎲 检定  ${r.expression} → ${r.total}${r.dc !== undefined ? `/DC${r.dc}` : ""}${badge ? ` · ${badge}` : ""}`);
   }
 
   // Triggered Storylets (smart adaptive: only shown when at least 1 storylet is live)

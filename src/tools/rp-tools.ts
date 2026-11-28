@@ -150,6 +150,8 @@ function cloneStagingState(state: SessionRpState): SessionRpState {
     ...state,
     presentNpcs: [...state.presentNpcs],
     flags: { ...state.flags },
+    conditions: { ...state.conditions },
+    storylets: new Map(state.storylets),
     stats,
     statBounds,
     inventory,
@@ -176,17 +178,18 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
   registerExtendedTool(pi, {
     name: "rp_roll_check",
     label: "RP 掷骰检定",
-    description: "Deterministic dice/skill check ('1d20+3', '2d20kh1', '2d6', '1d100'). Use only when uncertain.",
-    promptSnippet: "Roll dice for uncertain skill/combat checks.",
+    description:
+      "Deterministic dice/skill check ('1d20', '1d20+3', '2d20kh1', '2d6', '1d100'). Call BEFORE narrating risky/uncertain/contested actions; optionally pass stat_key to auto-add character stat bonus.",
+    promptSnippet: "Roll dice for risky/uncertain skill, stealth, persuasion, or combat checks.",
     defaultActive: false,
-    annotations: { readOnlyHint: true },
     parameters: {
       type: "object",
       properties: {
-        expression: { type: "string", description: "Dice formula, e.g. '1d20+3', '2d20kh1'" },
+        expression: { type: "string", description: "Dice formula, e.g. '1d20', '1d20+3', '2d20kh1', '1d100'" },
         dc: { type: "number", description: "Optional target DC" },
         reason: { type: "string", description: "Action attempted" },
         actor: { type: "string", description: "Actor name" },
+        stat_key: { type: "string", description: "Optional stat name to auto-lookup bonus from ledger (e.g. '敏捷', '魅力')" },
       },
       required: ["expression"],
     },
@@ -231,12 +234,36 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         (badge ? ` · ${styleFg(theme, badge.color, badge.label)}` : "");
       return createLinesComponent(() => [summary]);
     },
-    async execute(_id, rawParams) {
+    async execute(_id, rawParams, _sig, _onUpdate, ctx) {
       const params = unwrapNestedArgs(rawParams);
-      const expr = String(params.expression ?? "1d20");
+      let expr = String(params.expression ?? "1d20").trim();
       const dc = typeof params.dc === "number" ? params.dc : undefined;
       const reason = typeof params.reason === "string" ? params.reason : undefined;
       const actor = typeof params.actor === "string" ? params.actor : undefined;
+      const statKey = typeof params.stat_key === "string" && params.stat_key.trim() ? params.stat_key.trim() : undefined;
+      let statBonus: number | undefined;
+
+      const curState = rt.getState();
+      if (statKey && curState.active) {
+        const targetKey = statKey.toLowerCase();
+        const actorPools = actor
+          ? Object.entries(curState.stats).filter(([a]) => a.toLowerCase() === actor.toLowerCase())
+          : Object.entries(curState.stats);
+        for (const [, statsMap] of actorPools.length > 0 ? actorPools : Object.entries(curState.stats)) {
+          for (const [k, v] of Object.entries(statsMap)) {
+            if (k.toLowerCase() === targetKey && typeof v === "number" && Number.isFinite(v)) {
+              statBonus = Math.trunc(v);
+              break;
+            }
+          }
+          if (statBonus !== undefined) break;
+        }
+        // Append stat bonus automatically when formula does not already carry an explicit +/- modifier
+        if (statBonus !== undefined && statBonus !== 0 && !/[+-]\s*\d+\s*$/.test(expr)) {
+          expr = `${expr}${statBonus > 0 ? "+" : ""}${statBonus}`;
+        }
+      }
+
       try {
         const res = rollDiceCheck({ expression: expr, dc });
         const outcomeLabel =
@@ -249,13 +276,36 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
                 : res.success === false
                   ? "FAILURE"
                   : null;
-        const outcomeText = outcomeLabel ? ` -> ${outcomeLabel} (DC ${dc})` : "";
+        if (curState.active) {
+          rt.commitTx({
+            kind: "roll_record",
+            roll: {
+              turn: curState.turn,
+              actor,
+              expression: res.expression,
+              statKey,
+              statBonus,
+              rolls: res.rolls,
+              keptRolls: res.keptRolls,
+              modifier: res.modifier,
+              total: res.total,
+              dc,
+              success: res.success,
+              critical: res.critical ?? null,
+              reason,
+              source: "tool",
+            },
+          });
+          rt.refreshHud(ctx);
+        }
+        const outcomeText = outcomeLabel ? ` -> ${outcomeLabel}${dc !== undefined ? ` (DC ${dc})` : ""}` : "";
         const keptInfo =
           res.keptRolls.length !== res.rolls.length ? ` kept [${res.keptRolls.join(", ")}]` : "";
-        const summary = `Roll ${res.expression}${actor ? ` [${actor}]` : ""}${reason ? ` (${reason})` : ""}: rolls [${res.rolls.join(", ")}]${keptInfo}${res.modifier ? ` ${res.modifier >= 0 ? "+" : ""}${res.modifier}` : ""} = ${res.total}${outcomeText}`;
+        const statInfo = statKey && statBonus !== undefined ? ` [stat ${statKey} ${statBonus >= 0 ? "+" : ""}${statBonus}]` : "";
+        const summary = `Roll ${res.expression}${statInfo}${actor ? ` [${actor}]` : ""}${reason ? ` (${reason})` : ""}: rolls [${res.rolls.join(", ")}]${keptInfo}${res.modifier ? ` ${res.modifier >= 0 ? "+" : ""}${res.modifier}` : ""} = ${res.total}${outcomeText}`;
         return {
           content: [{ type: "text", text: summary }],
-          details: { ...res, actor, reason },
+          details: { ...res, actor, reason, statKey, statBonus },
         };
       } catch (err) {
         return {
@@ -323,9 +373,55 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               label: { type: "string" },
               delta: { type: "number" },
               max: { type: "number" },
+              on_complete_flags: {
+                type: "object",
+                additionalProperties: { type: "boolean" },
+                description: "Optional flags auto-set when this clock fills",
+              },
+              on_complete_storylet: {
+                type: "string",
+                description: "Optional storylet ID auto-triggered when this clock fills",
+              },
             },
             required: ["clockId", "delta"],
           },
+        },
+        conditions: {
+          type: "array",
+          description: "Add or remove timed/persistent Buff/Debuff conditions (e.g. poisoned, bleeding, disguised)",
+          items: {
+            type: "object",
+            properties: {
+              actor: { type: "string" },
+              label: { type: "string" },
+              action: { type: "string", enum: ["add", "remove"] },
+              effect: { type: "string" },
+              duration_turns: { type: "number", description: "Omit or null for persistent until cured" },
+            },
+            required: ["actor", "label"],
+          },
+        },
+        storylets: {
+          type: "array",
+          description: "Create or update condition-gated Storylets (deferred plot beats / quests / confrontations)",
+          items: {
+            type: "object",
+            properties: {
+              id: { type: "string" },
+              title: { type: "string" },
+              trigger_prompt: { type: "string", description: "What happens when this Storylet triggers" },
+              required_flags: { type: "array", items: { type: "string" } },
+              min_turn: { type: "number" },
+              post_flags: { type: "object", additionalProperties: { type: "boolean" } },
+              next_objective: { type: "string" },
+            },
+            required: ["title", "trigger_prompt"],
+          },
+        },
+        completed_storylets: {
+          type: "array",
+          items: { type: "string" },
+          description: "IDs of active Storylets that were resolved/completed this turn (auto-applies postEffects)",
         },
         define_cfsm: {
           type: "array",
@@ -497,11 +593,113 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
           const max = typeof c.max === "number" ? c.max : staging.clocks[clockId]?.max ?? 4;
           const label = typeof c.label === "string" ? c.label : staging.clocks[clockId]?.label ?? clockId;
           if (!clockId || !Number.isFinite(delta)) continue;
-          const tx: RpTxEntry = { kind: "progress_clock", clockId, label, delta, max };
+          const setFlags =
+            c.on_complete_flags && typeof c.on_complete_flags === "object" && !Array.isArray(c.on_complete_flags)
+              ? Object.fromEntries(
+                  Object.entries(c.on_complete_flags as Record<string, unknown>).map(([k, v]) => [k, Boolean(v)]),
+                )
+              : undefined;
+          const triggerStoryletId =
+            typeof c.on_complete_storylet === "string" && c.on_complete_storylet.trim()
+              ? c.on_complete_storylet.trim()
+              : undefined;
+          const onComplete = setFlags || triggerStoryletId ? { setFlags, triggerStoryletId } : undefined;
+          const tx: RpTxEntry = { kind: "progress_clock", clockId, label, delta, max, ...(onComplete ? { onComplete } : {}) };
           applyRpTx(staging, tx);
           pendingTxs.push(tx);
           const now = staging.clocks[clockId];
           applied.push(`clock[${label}]=${now?.value ?? 0}/${now?.max ?? max}`);
+        }
+      }
+
+      if (Array.isArray(params.conditions)) {
+        for (const cond of params.conditions as Array<Record<string, unknown>>) {
+          const actorId = String(cond.actor ?? "").trim();
+          const label = String(cond.label ?? "").trim();
+          if (!actorId || !label) continue;
+          const condId = `${actorId.toLowerCase()}::${label.toLowerCase()}`;
+          if (cond.action === "remove") {
+            if (staging.conditions[condId]) {
+              stageTx({ kind: "condition_remove", id: condId, reason: "tool" }, `condition-${actorId}.${label}`);
+            }
+          } else {
+            const rem =
+              typeof cond.duration_turns === "number" && Number.isFinite(cond.duration_turns) && cond.duration_turns > 0
+                ? Math.trunc(cond.duration_turns)
+                : null;
+            stageTx(
+              {
+                kind: "condition_upsert",
+                condition: {
+                  id: condId,
+                  actorId,
+                  label,
+                  effect: typeof cond.effect === "string" && cond.effect.trim() ? cond.effect.trim() : undefined,
+                  remainingTurns: rem,
+                  appliedTurn: staging.turn,
+                },
+              },
+              `condition+${actorId}.${label}${rem !== null ? `(${rem}t)` : ""}`,
+            );
+          }
+        }
+      }
+
+      if (Array.isArray(params.storylets)) {
+        for (const ns of params.storylets as Array<Record<string, unknown>>) {
+          const title = String(ns.title ?? "").trim();
+          const triggerPrompt = String(ns.trigger_prompt ?? "").trim();
+          if (!title || !triggerPrompt) continue;
+          const sid =
+            typeof ns.id === "string" && ns.id.trim()
+              ? ns.id.trim()
+              : allocateUniqueId("st", staging.turn, staging.storylets);
+          const gate: Record<string, unknown> = {};
+          if (Array.isArray(ns.required_flags)) {
+            const rf = ns.required_flags.map((x) => String(x).trim()).filter(Boolean);
+            if (rf.length > 0) gate.requiredFlags = rf;
+          }
+          if (typeof ns.min_turn === "number" && Number.isFinite(ns.min_turn) && ns.min_turn > 0) {
+            gate.minTurn = Math.trunc(ns.min_turn);
+          }
+          const postFlags =
+            ns.post_flags && typeof ns.post_flags === "object" && !Array.isArray(ns.post_flags)
+              ? Object.fromEntries(
+                  Object.entries(ns.post_flags as Record<string, unknown>).map(([k, v]) => [k, Boolean(v)]),
+                )
+              : undefined;
+          const nextObjective =
+            typeof ns.next_objective === "string" && ns.next_objective.trim() ? ns.next_objective.trim() : undefined;
+          stageTx(
+            {
+              kind: "storylet_upsert",
+              storylet: {
+                id: sid,
+                title,
+                triggerPrompt,
+                gate: Object.keys(gate).length > 0 ? (gate as any) : undefined,
+                postEffects: postFlags || nextObjective ? { setFlags: postFlags, nextObjective } : undefined,
+                oneTime: true,
+                status: Object.keys(gate).length > 0 ? "armed" : "triggered",
+                createdTurn: staging.turn,
+              },
+            },
+            `storylet+${title}`,
+          );
+        }
+      }
+
+      if (Array.isArray(params.completed_storylets)) {
+        for (const rawId of params.completed_storylets) {
+          const sid = String(rawId ?? "").trim();
+          if (!sid) continue;
+          const existing = staging.storylets.get(sid);
+          if (existing && existing.status !== "completed") {
+            stageTx(
+              { kind: "storylet_upsert", storylet: { ...existing, status: "completed" } },
+              `storylet.done(${existing.title})`,
+            );
+          }
         }
       }
 

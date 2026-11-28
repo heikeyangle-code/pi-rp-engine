@@ -21,7 +21,7 @@ export function evaluateGate(gate: GateCondition | undefined, state: SessionRpSt
   }
   if (gate.requiredMilestones && gate.requiredMilestones.length > 0) {
     for (const m of gate.requiredMilestones) {
-      if (!state.milestones.has(m)) return false;
+      if (!state.milestones.has(m) && !state.flags[m]) return false;
     }
   }
   if (gate.requiredFlags && gate.requiredFlags.length > 0) {

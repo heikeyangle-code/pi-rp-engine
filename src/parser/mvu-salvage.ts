@@ -26,7 +26,7 @@ export interface RawLoreVariableSource {
 
 const INVENTORY_SECTION_RE = /(?:背包|物品栏?|道具栏?|持有物|装备栏?|行囊|包裹|inventory|backpack|items?|bag|equipment)/i;
 const PLAYER_NAMESPACE_RE = /^(?:player|user|主角|玩家|我|自身|个人|hero|protagonist|mc)$/i;
-const WORLD_NAMESPACE_RE = /^(?:world|global|env|environment|scene|system|世界|全局|环境|场景|当前|系统|天气|时空)$/i;
+const WORLD_NAMESPACE_RE = /^(?:world|global|env|environment|scene|system|meta|info|status|stats|state|data|quest|quests|mission|event|events|story|plot|time|date|weather|economy|money|gold|faction|factions|guild|party|team|rules|settings|progress|世界|全局|环境|场景|当前|系统|天气|时空|信息|状态|状态栏|属性|数值|变量|任务|主线|支线|事件|剧情|世界观|时间|日期|地点|位置|地图|经济|金钱|金币|货币|资源|阵营|势力|派系|组织|公会|团队|队伍|规则|设置|进度|关系|关系网|技能|魔法|法术)$/i;
 const ANCHOR_KEY_RE = /^(?:地点|位置|当前地点|当前位置|场景|location|place|时间|当前时间|日期|时刻|time|date|阶段|纪元|章节|stage|era|chapter)$/i;
 const CLOCK_KEY_RE = /(?:倒计时|进度条|警戒度?|警觉度?|时钟|期限|countdown|clock|alert|tension)/i;
 const BIPOLAR_KEY_RE = /(?:好感|关系|声望|信任|阵营|善恶|倾向|态度|亲密|情绪|affection|trust|reputation|karma|alignment|affinity)/i;

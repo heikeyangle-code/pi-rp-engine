@@ -1474,20 +1474,74 @@ export async function actionManualRoll(rt: RpRuntimeHandle, ctx: PiExtensionCont
       `骰面：[${res.rolls.join(", ")}]${keptText}${res.modifier ? `  修正 ${res.modifier >= 0 ? "+" : ""}${res.modifier}` : ""}`,
       `总计：${res.total}${dc !== undefined ? `  /  DC ${dc}` : ""}${outcomeText ? `  →  ${outcomeText}` : ""}`,
     ];
-    rt.pi.sendMessage(
-      {
-        customType: "rp:event",
-        content: lines.join("\n"),
-        display: true,
-        details: {
-          kind: "roll",
-          title: `掷骰 ${res.expression}`,
-          subtitle: outcomeText ?? `结果 ${res.total}`,
-          ...res,
+    const curState = rt.getState();
+    if (curState.active) {
+      rt.commitTx({
+        kind: "roll_record",
+        roll: {
+          turn: curState.turn,
+          actor: curState.currentPersona.name,
+          expression: res.expression,
+          rolls: res.rolls,
+          keptRolls: res.keptRolls,
+          modifier: res.modifier,
+          total: res.total,
+          dc,
+          success: res.success,
+          critical: res.critical ?? null,
+          reason: reason || undefined,
+          source: "manual",
         },
-      },
-      { triggerTurn: false },
-    );
+      });
+      rt.refreshHud(ctx);
+    }
+
+    let sendToAi = false;
+    if (curState.active && !trimmed) {
+      const follow = await ctx.ui.select(
+        `🎲 ${res.expression} → ${res.total}${outcomeText ? ` · ${outcomeText}` : ""}`,
+        [
+          "🚀 将本次检定结果发给 AI 续写剧情（推荐）",
+          "👀 仅记录点数，不触发 AI 回复",
+        ],
+      );
+      sendToAi = Boolean(follow && follow.startsWith("🚀"));
+    }
+
+    if (sendToAi) {
+      const busy = ctx.isIdle?.() === false;
+      const rollPrompt = `[玩家掷骰检定] 公式：${res.expression}${reason ? `（事由：${reason}）` : ""}，结果：${res.total}${dc !== undefined ? ` / DC ${dc}` : ""}${outcomeText ? ` → ${outcomeText}` : ""}。请严格依据此判定结果继续演绎剧情。`;
+      rt.pi.sendMessage(
+        {
+          customType: "rp:event",
+          content: lines.join("\n"),
+          display: true,
+          details: {
+            kind: "roll",
+            title: `掷骰 ${res.expression}`,
+            subtitle: outcomeText ?? `结果 ${res.total}`,
+            ...res,
+          },
+        },
+        { triggerTurn: false },
+      );
+      rt.pi.sendUserMessage?.(rollPrompt, busy ? { deliverAs: "followUp" } : undefined);
+    } else {
+      rt.pi.sendMessage(
+        {
+          customType: "rp:event",
+          content: lines.join("\n"),
+          display: true,
+          details: {
+            kind: "roll",
+            title: `掷骰 ${res.expression}`,
+            subtitle: outcomeText ?? `结果 ${res.total}`,
+            ...res,
+          },
+        },
+        { triggerTurn: false },
+      );
+    }
   } catch (err) {
     ctx.ui.notify(`无效掷骰公式：${(err as Error).message}`, "error");
   }
@@ -1928,10 +1982,10 @@ export async function actionSetSettlementMode(
   if (arg === "off" || arg === "tool-assisted" || arg === "sidecar-light") {
     next = arg;
   } else {
-    const pick = await ctx.ui.select(`⚙ 游玩与记账模式（当前：${state.settlementMode === "tool-assisted" ? "工具实时控账" : state.settlementMode === "sidecar-light" ? "纯文学·后台记账" : "纯聊天"}）`, [
-      "tool-assisted — 工具实时控账（单模型推荐，0 额外后台调用）",
-      "sidecar-light — 纯文学优先·后台记账（配小模型最佳，文笔最放得开）",
-      "off — 纯聊天（0 工具、不自动记账）",
+    const pick = await ctx.ui.select(`⚙ 引擎运行模式（当前：${state.settlementMode === "tool-assisted" ? "全能模式" : state.settlementMode === "sidecar-light" ? "纯文学后台" : "纯聊天"}）`, [
+      "tool-assisted — 全能模式（默认 · 最强，单模型实时掷骰/控账/联动）",
+      "sidecar-light — 纯文学后台（独立小模型静默记账，仍保留掷骰）",
+      "off — 纯聊天（关闭自动工具与记账）",
     ]);
     if (!pick) return;
     next = pick.split(" ")[0] as SettlementMode;

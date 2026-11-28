@@ -145,6 +145,8 @@ export async function runSidecarLightSettlement(options: {
     `"beliefs": [{"actorId":"...","target":"...","activatingEvent":"...","belief":"...","subjectiveInsight":"how this character emotionally interprets it","emotionalTone":"..."}]`,
     `"cfsm": [{"actorId":"...","axis":"...","to":"...","reason":"..."}]`,
     `"physical": [{"actorId":"...","attire":"...","condition":"...","holding":"...","position":"..."}]`,
+    `"flags": {"<flag_name>": boolean}`,
+    `"conditions": [{"actorId":"...","label":"...","action":"add"|"remove","effect":"...","durationTurns":number|null}]`,
   ];
   if (includeExtendedFields || state.sceneObjective.trim()) {
     schemaFields.push(`"sceneObjective": string|null`);
@@ -276,6 +278,8 @@ export async function runSidecarLightSettlement(options: {
       inventory?: Array<{ actorId?: string; item?: string; delta?: number; note?: string }>;
       clocks?: Array<{ clockId?: string; label?: string; delta?: number; max?: number }>;
       physical?: Array<{ actorId?: string; attire?: string; condition?: string; holding?: string; position?: string }>;
+      flags?: Record<string, boolean>;
+      conditions?: Array<{ actorId?: string; label?: string; action?: "add" | "remove"; effect?: string; durationTurns?: number | null }>;
       spatialNotes?: string | null;
       agendas?: Array<{ actorId?: string; goal?: string; currentActivity?: string; etaTurns?: number | null }>;
       pairBonds?: Array<{ actorA?: string; actorB?: string; stance?: string; tension?: number; note?: string }>;
@@ -416,6 +420,44 @@ export async function runSidecarLightSettlement(options: {
       const existing = typeof hookId === "string" ? state.foresights.get(hookId.trim()) : undefined;
       if (existing && existing.status === "open") {
         commit({ kind: "foresight_upsert", hook: { ...existing, status: "paid_off" } });
+      }
+    }
+
+    // 5a. Flags & active conditions (Buff/Debuff)
+    if (parsed.flags && typeof parsed.flags === "object" && !Array.isArray(parsed.flags)) {
+      for (const [fKey, fVal] of Object.entries(parsed.flags)) {
+        const cleanKey = fKey.trim();
+        if (!cleanKey || typeof fVal !== "boolean") continue;
+        if (state.flags[cleanKey] !== fVal) {
+          commit({ kind: "flag_set", flag: cleanKey, value: fVal });
+        }
+      }
+    }
+    for (const cond of parsed.conditions ?? []) {
+      const actorId = cond.actorId?.trim();
+      const label = cond.label?.trim();
+      if (!actorId || !label) continue;
+      const condId = `${actorId.toLowerCase()}::${label.toLowerCase()}`;
+      if (cond.action === "remove") {
+        if (state.conditions[condId]) {
+          commit({ kind: "condition_remove", id: condId, reason: "sidecar" });
+        }
+      } else {
+        const rem =
+          typeof cond.durationTurns === "number" && Number.isFinite(cond.durationTurns) && cond.durationTurns > 0
+            ? Math.trunc(cond.durationTurns)
+            : null;
+        commit({
+          kind: "condition_upsert",
+          condition: {
+            id: condId,
+            actorId,
+            label,
+            effect: cond.effect?.trim() || undefined,
+            remainingTurns: rem,
+            appliedTurn: state.turn,
+          },
+        });
       }
     }
 

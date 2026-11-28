@@ -22,6 +22,8 @@ import type {
   TxAuditRecord,
 } from "../types.js";
 import { computeCheckedStatValue, normalizeCfsmAxisDef } from "./cfsm.js";
+import { evaluateGate } from "./gates.js";
+import { canonicalizeActorName, canonicalizePairBondActors, sanitizeNpcList } from "./entity-hygiene.js";
 
 export const RP_ENTRY_TYPE = "rp:tx";
 const MAX_AUDIT_LOG = 24;
@@ -32,6 +34,40 @@ function nextAuditSeq(state: SessionRpState): number {
   const next = (auditSeqMap.get(state) ?? 0) + 1;
   auditSeqMap.set(state, next);
   return next;
+}
+
+
+/**
+ * Deterministic Cascade Engine:
+ * Automatically promotes armed Storylets whose gate conditions just became satisfied
+ * without spending any extra LLM tokens.
+ */
+function getHygieneCtx(state: SessionRpState) {
+  const known = new Set<string>();
+  for (const c of state.activeCharacters) if (c.trim()) known.add(c.trim());
+  for (const a of Object.keys(state.voiceAnchors)) if (a.trim()) known.add(a.trim());
+  for (const a of Object.keys(state.cfsmDefs)) if (a.trim()) known.add(a.trim());
+  for (const a of Object.keys(state.cfsmStates)) if (a.trim()) known.add(a.trim());
+  return {
+    knownCharacterNames: known,
+    personaName: state.currentPersona?.name,
+  };
+}
+
+function runStoryletCascade(state: SessionRpState, recordAudit: boolean): void {
+  for (const [id, st] of state.storylets.entries()) {
+    if (st.status !== "armed") continue;
+    if (!st.gate) continue;
+    if (evaluateGate(st.gate, state)) {
+      state.storylets.set(id, { ...st, status: "triggered" });
+      if (recordAudit) {
+        pushAudit(state, {
+          summary: `🎬 剧情解锁: ${st.title}`,
+          source: "system",
+        });
+      }
+    }
+  }
 }
 
 function isUndoTx(tx: RpTxEntry): boolean {
@@ -127,6 +163,8 @@ export function createInitialRpState(): SessionRpState {
     antiGodmoding: true,
     sceneTension: 3,
     slopCounts: {},
+    conditions: {},
+    lastRoll: null,
   };
 }
 
@@ -267,6 +305,28 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         for (const ag of Object.values(state.npcAgendas)) {
           if (typeof ag.etaTurns === "number" && ag.etaTurns > 0) {
             ag.etaTurns = Math.max(0, ag.etaTurns - 1);
+            if (ag.etaTurns === 0) {
+              state.lastMeaningfulProgressTurn = state.turn;
+              pushAudit(state, {
+                summary: `🕸 幕后日程达成: ${ag.actorId}「${ag.goal.slice(0, 22)}」`,
+                source: "system",
+              });
+            }
+          }
+        }
+        // Auto-tick & expire timed conditions (Buff/Debuff)
+        for (const [cid, cond] of Object.entries(state.conditions)) {
+          if (cond.remainingTurns !== null) {
+            const nextRem = cond.remainingTurns - 1;
+            if (nextRem <= 0) {
+              delete state.conditions[cid];
+              pushAudit(state, {
+                summary: `✨ 状态解除: ${cond.actorId}·${cond.label}`,
+                source: "system",
+              });
+            } else {
+              state.conditions[cid] = { ...cond, remainingTurns: nextRem };
+            }
           }
         }
       }
@@ -274,6 +334,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       if (tx.worldTimeLabel !== undefined) state.worldTimeLabel = tx.worldTimeLabel;
       else if (tx.dayDelta) state.worldTimeLabel = `第 ${state.day} 天`;
       if (tx.phase !== undefined) state.phase = tx.phase;
+      if (tx.beatDelta > 0) runStoryletCascade(state, true);
       break;
 
     case "location_set": {
@@ -283,7 +344,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         state.initialLocation = tx.location.trim();
       }
       state.location = tx.location;
-      state.presentNpcs = [...tx.presentNpcs];
+      state.presentNpcs = sanitizeNpcList(tx.presentNpcs, getHygieneCtx(state));
       if (!isUndoTx(tx) && (prevLoc !== tx.location || prevNpcs.join("|") !== tx.presentNpcs.join("|"))) {
         const isInitialHydration = state.turn === 0 && !prevLoc && prevNpcs.length === 0;
         if (!isInitialHydration) {
@@ -293,6 +354,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
             source: "tool",
             undoTx: { kind: "location_set", location: prevLoc, presentNpcs: prevNpcs, reason: "undo" } as RpTxEntry,
           });
+          runStoryletCascade(state, true);
         }
       }
       break;
@@ -317,6 +379,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
             source: "tool",
             undoTx: { kind: "flag_set", flag: tx.flag, value: prev, reason: "undo" } as RpTxEntry,
           });
+          runStoryletCascade(state, true);
         }
       }
       break;
@@ -393,6 +456,32 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
               ? { kind: "stat_patch", actorId: tx.actorId, key: tx.key, op: "set", value: prevVal!, reason: "undo" }
               : undefined,
           });
+          // Vital threshold auto-condition cascade (HP/SAN <= 20% max -> auto-attach condition; > 30% -> auto-clear)
+          const bounds = state.statBounds[tx.actorId]?.[tx.key];
+          if (typeof checked.clampedValue === "number" && bounds?.max && bounds.max > 0) {
+            const isHp = /^(?:hp|生命|生命值|血量|体力|体力值)$/i.test(tx.key);
+            const isSan = /^(?:san|理智|理智值|精神|精神值)$/i.test(tx.key);
+            if (isHp || isSan) {
+              const condLabel = isHp ? "重伤濒危" : "理智动摇";
+              const condId = `${tx.actorId.toLowerCase()}::${condLabel}`;
+              const ratio = checked.clampedValue / bounds.max;
+              if (ratio <= 0.2 && !state.conditions[condId]) {
+                state.conditions[condId] = {
+                  id: condId,
+                  actorId: tx.actorId,
+                  label: condLabel,
+                  effect: `${tx.key} 跌破警戒线 (${checked.clampedValue}/${bounds.max})`,
+                  remainingTurns: null,
+                  appliedTurn: state.turn,
+                };
+                pushAudit(state, { summary: `⚡ 危机触发: ${tx.actorId}·${condLabel}`, source: "system" });
+              } else if (ratio > 0.3 && state.conditions[condId]) {
+                delete state.conditions[condId];
+                pushAudit(state, { summary: `✨ 危机解除: ${tx.actorId}·${condLabel}`, source: "system" });
+              }
+            }
+          }
+          runStoryletCascade(state, true);
         }
       }
       break;
@@ -423,30 +512,65 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     case "progress_clock": {
       const prev = state.clocks[tx.clockId];
       const prevVal = prev?.value ?? 0;
+      const wasCompleted = Boolean(prev?.completed);
       const max = tx.max > 0 ? tx.max : prev?.max ?? 4;
       const val = Math.min(max, Math.max(0, prevVal + tx.delta));
       const appliedDelta = val - prevVal;
+      const nowCompleted = tx.completed ?? val >= max;
+      const onComplete = tx.onComplete ?? prev?.onComplete;
+      const label = tx.label || prev?.label || tx.clockId;
       state.clocks[tx.clockId] = {
         clockId: tx.clockId,
-        label: tx.label || prev?.label || tx.clockId,
+        label,
         value: val,
         max,
-        completed: tx.completed ?? val >= max,
+        completed: nowCompleted,
+        ...(onComplete ? { onComplete } : {}),
       };
       if (!isUndoTx(tx) && appliedDelta !== 0 && !(state.turn === 0 && !prev)) {
         state.lastMeaningfulProgressTurn = state.turn;
+        const cascadeNotes: string[] = [];
+        if (!wasCompleted && nowCompleted) {
+          if (onComplete?.setFlags) {
+            for (const [fKey, fVal] of Object.entries(onComplete.setFlags)) {
+              state.flags[fKey] = Boolean(fVal);
+              cascadeNotes.push(`🚩${fKey}=${fVal ? "开" : "关"}`);
+            }
+          }
+          if (onComplete?.triggerStoryletId) {
+            const st = state.storylets.get(onComplete.triggerStoryletId);
+            if (st && st.status === "armed") {
+              state.storylets.set(st.id, { ...st, status: "triggered" });
+              cascadeNotes.push(`🎬${st.title}`);
+            }
+          }
+          for (const hook of state.foresights.values()) {
+            if (hook.status === "open" && hook.dueClockId === tx.clockId) {
+              cascadeNotes.push(`⚠伏笔到期:${hook.summary.slice(0, 16)}`);
+            }
+          }
+          if (onComplete?.note) {
+            cascadeNotes.push(onComplete.note);
+          }
+        }
+        const suffix = cascadeNotes.length > 0 ? ` → ${cascadeNotes.join(" · ")}` : "";
         pushAudit(state, {
-          summary: `时钟 ${state.clocks[tx.clockId]!.label} ${val}/${max}`,
+          summary: `时钟 ${label} ${val}/${max}${nowCompleted && !wasCompleted ? " 满格" : ""}${suffix}`,
           source: "tool",
           undoTx: {
             kind: "progress_clock",
             clockId: tx.clockId,
-            label: state.clocks[tx.clockId]!.label,
+            label,
             delta: -appliedDelta,
             max,
+            completed: wasCompleted,
+            onComplete,
             reason: "undo",
           } as RpTxEntry,
         });
+        if (!wasCompleted && nowCompleted) {
+          runStoryletCascade(state, true);
+        }
       }
       break;
     }
@@ -584,6 +708,9 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         if (pe?.nextObjective && pe.nextObjective.trim()) {
           state.sceneObjective = pe.nextObjective.trim();
         }
+        if (nextStorylet.title.trim()) {
+          state.milestones.add(nextStorylet.title.trim());
+        }
         if (!isUndoTx(tx)) {
           pushAudit(state, {
             summary: `剧情卡完成: ${nextStorylet.title}`,
@@ -592,6 +719,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
               ? ({ kind: "storylet_upsert", storylet: prevStorylet, reason: "undo" } as RpTxEntry)
               : undefined,
           });
+          runStoryletCascade(state, true);
         }
       }
       break;
@@ -606,6 +734,12 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       state.foresights.set(tx.hook.id, { ...tx.hook, entities: [...tx.hook.entities] });
       if (!tx.hook.id.startsWith("hook_init_") || (prevHook && prevHook.status !== tx.hook.status)) {
         state.lastMeaningfulProgressTurn = state.turn;
+      }
+      if (tx.hook.status === "paid_off" && prevHook?.status !== "paid_off" && !isUndoTx(tx)) {
+        const ms = tx.hook.summary.trim().slice(0, 32);
+        if (ms) state.milestones.add(ms);
+        pushAudit(state, { summary: `🔖 伏笔回收: ${tx.hook.summary.slice(0, 28)}`, source: "tool" });
+        runStoryletCascade(state, true);
       }
       break;
     }
@@ -678,8 +812,8 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     }
 
     case "agenda_upsert": {
-      const actor = tx.agenda.actorId.trim();
-      if (!actor) break;
+      const actor = canonicalizeActorName(tx.agenda.actorId, getHygieneCtx(state));
+      if (!actor || actor === "player") break;
       const prev = state.npcAgendas[actor] ? { ...state.npcAgendas[actor]! } : undefined;
       state.npcAgendas[actor] = { ...tx.agenda, actorId: actor };
       if (!isUndoTx(tx)) {
@@ -700,19 +834,34 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       break;
 
     case "pair_bond_upsert": {
-      const id = tx.bond.id.trim();
-      if (!id) break;
+      const canon = canonicalizePairBondActors(tx.bond.actorA, tx.bond.actorB, getHygieneCtx(state));
+      if (!canon) break;
+      const { id, actorA, actorB } = canon;
       const prev = state.pairBonds[id] ? { ...state.pairBonds[id]! } : undefined;
-      state.pairBonds[id] = { ...tx.bond, id, tension: Math.max(-100, Math.min(100, Math.round(tx.bond.tension))) };
+      const tension = Math.max(-100, Math.min(100, Math.round(tx.bond.tension)));
+      state.pairBonds[id] = { ...tx.bond, id, actorA, actorB, tension };
       if (!isUndoTx(tx)) {
         state.lastMeaningfulProgressTurn = state.turn;
+        const bondEffects: string[] = [];
+        const riftFlag = `关系破裂:${actorA}↔${actorB}`;
+        const alliesFlag = `深度羁绊:${actorA}↔${actorB}`;
+        if (tension <= -60 && !state.flags[riftFlag]) {
+          state.flags[riftFlag] = true;
+          state.flags[alliesFlag] = false;
+          bondEffects.push(`🚩${riftFlag}`);
+        } else if (tension >= 60 && !state.flags[alliesFlag]) {
+          state.flags[alliesFlag] = true;
+          state.flags[riftFlag] = false;
+          bondEffects.push(`🚩${alliesFlag}`);
+        }
         pushAudit(state, {
-          summary: `关系 ${tx.bond.actorA}↔${tx.bond.actorB}: ${tx.bond.stance}`,
+          summary: `关系 ${actorA}↔${actorB}: ${tx.bond.stance} (${tension})${bondEffects.length ? ` → ${bondEffects.join(" ")}` : ""}`,
           source: "sidecar",
           undoTx: prev
             ? ({ kind: "pair_bond_upsert", bond: prev, reason: "undo" } as RpTxEntry)
             : { kind: "pair_bond_delete", id },
         });
+        if (bondEffects.length > 0) runStoryletCascade(state, true);
       }
       break;
     }
@@ -736,6 +885,66 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         state.sceneTension = Math.max(0, Math.min(10, Math.round(tx.value)));
       }
       break;
+
+    case "condition_upsert": {
+      const id = tx.condition.id.trim();
+      if (!id) break;
+      const prev = state.conditions[id] ? { ...state.conditions[id]! } : undefined;
+      state.conditions[id] = { ...tx.condition, id };
+      if (!isUndoTx(tx)) {
+        state.lastMeaningfulProgressTurn = state.turn;
+        const ttl = tx.condition.remainingTurns !== null ? `(${tx.condition.remainingTurns}轮)` : "";
+        pushAudit(state, {
+          summary: `⚡ 状态 ${tx.condition.actorId}·${tx.condition.label}${ttl}`,
+          source: "tool",
+          undoTx: prev
+            ? ({ kind: "condition_upsert", condition: prev, reason: "undo" } as RpTxEntry)
+            : ({ kind: "condition_remove", id, reason: "undo" } as RpTxEntry),
+        });
+      }
+      break;
+    }
+
+    case "condition_remove": {
+      const prev = state.conditions[tx.id] ? { ...state.conditions[tx.id]! } : undefined;
+      if (!prev) break;
+      delete state.conditions[tx.id];
+      if (!isUndoTx(tx)) {
+        state.lastMeaningfulProgressTurn = state.turn;
+        pushAudit(state, {
+          summary: `✨ 解除状态 ${prev.actorId}·${prev.label}`,
+          source: "tool",
+          undoTx: { kind: "condition_upsert", condition: prev, reason: "undo" } as RpTxEntry,
+        });
+      }
+      break;
+    }
+
+    case "roll_record": {
+      state.lastRoll = { ...tx.roll, rolls: [...tx.roll.rolls], keptRolls: [...tx.roll.keptRolls] };
+      if (!isUndoTx(tx)) {
+        if (tx.roll.critical === "nat_min") {
+          state.sceneTension = Math.min(10, (state.sceneTension ?? 3) + 2);
+        } else if (tx.roll.critical === "nat_max") {
+          state.sceneTension = Math.min(10, (state.sceneTension ?? 3) + 1);
+        }
+        const badge =
+          tx.roll.critical === "nat_max"
+            ? "大成功★"
+            : tx.roll.critical === "nat_min"
+              ? "大失败✖"
+              : tx.roll.success === true
+                ? "成功✓"
+                : tx.roll.success === false
+                  ? "失败✗"
+                  : "";
+        pushAudit(state, {
+          summary: `🎲 检定 ${tx.roll.expression}→${tx.roll.total}${tx.roll.dc !== undefined ? `/DC${tx.roll.dc}` : ""}${badge ? ` ${badge}` : ""}${tx.roll.reason ? ` (${tx.roll.reason.slice(0, 16)})` : ""}`,
+          source: tx.roll.source === "manual" ? "user" : "tool",
+        });
+      }
+      break;
+    }
   }
 }
 

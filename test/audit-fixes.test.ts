@@ -1,3 +1,5 @@
+import { canonicalizeActorName, canonicalizePairBondActors, isNonCharacterEntity, sanitizeNpcList } from "../src/engine/entity-hygiene.js";
+import { getDesiredRpTools } from "../src/index.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -439,4 +441,177 @@ test("audit-9: v5 Prose-First default, Anti-Godmoding/Anti-Sycophancy/Spotlight 
     "众人沉默不语，眼底闪过一丝不易察觉的慌乱。",
   ]);
   assert.ok(slop.phrases.length >= 1, "Runtime SlopTracker must detect repeated CJK clichés across recent turns");
+});
+
+
+test("audit-10: Cascade Engine (clock->flag->storylet->chained storylet), timed conditions, dice closure & zero ghost tools", async () => {
+  const state = createInitialRpState();
+  state.active = true;
+  state.turn = 1;
+  state.archetype = "companion";
+  state.settlementMode = "sidecar-light";
+
+  // 1. Sidecar-light NEVER hides rp_roll_check even on companion cards
+  const sidecarTools = getDesiredRpTools(state, null);
+  assert.ok(sidecarTools.includes("rp_roll_check"), "rp_roll_check must remain active in sidecar-light");
+
+  // 2. Default tool-assisted dynamically exposes rp_era_advance & rp_npc_deliberate only when relevant
+  state.settlementMode = "tool-assisted";
+  const baseTools = getDesiredRpTools(state, null);
+  assert.ok(baseTools.includes("rp_roll_check"));
+  assert.ok(!baseTools.includes("rp_era_advance"));
+  assert.ok(!baseTools.includes("rp_npc_deliberate"));
+
+  state.era = "第一章";
+  state.presentNpcs = ["艾琳", "凯尔"];
+  const expandedTools = getDesiredRpTools(state, null);
+  assert.ok(expandedTools.includes("rp_era_advance"));
+  assert.ok(expandedTools.includes("rp_npc_deliberate"));
+
+  // 3. Clock fill -> Flag -> Storylet auto-unlock -> Chained Storylet unlock
+  applyRpTx(state, {
+    kind: "storylet_upsert",
+    storylet: {
+      id: "st_alarm",
+      title: "守卫搜捕",
+      triggerPrompt: "守卫封锁出口",
+      gate: { requiredFlags: ["全城通缉"] },
+      postEffects: { setFlags: { 成功脱险: true }, nextObjective: "前往安全屋" },
+      status: "armed",
+      createdTurn: 1,
+    },
+  });
+  applyRpTx(state, {
+    kind: "storylet_upsert",
+    storylet: {
+      id: "st_safehouse",
+      title: "安全屋接头",
+      triggerPrompt: "线人等待汇报",
+      gate: { requiredFlags: ["成功脱险"] },
+      status: "armed",
+      createdTurn: 1,
+    },
+  });
+  applyRpTx(state, {
+    kind: "progress_clock",
+    clockId: "clk_alert",
+    label: "守卫警戒",
+    delta: 4,
+    max: 4,
+    onComplete: { setFlags: { 全城通缉: true } },
+  });
+  assert.equal(state.flags["全城通缉"], true);
+  assert.equal(state.storylets.get("st_alarm")?.status, "triggered");
+
+  // Completing st_alarm auto-applies postEffects AND cascades into st_safehouse!
+  applyRpTx(state, {
+    kind: "storylet_upsert",
+    storylet: { ...state.storylets.get("st_alarm")!, status: "completed" },
+  });
+  assert.equal(state.flags["成功脱险"], true);
+  assert.equal(state.sceneObjective, "前往安全屋");
+  assert.equal(state.storylets.get("st_safehouse")?.status, "triggered");
+  assert.ok(state.milestones.has("守卫搜捕"));
+
+  // 4. Timed conditions auto-decrement & expire on clock_tick
+  applyRpTx(state, {
+    kind: "condition_upsert",
+    condition: { id: "player::中毒", actorId: "player", label: "中毒", effect: "行动受阻", remainingTurns: 2, appliedTurn: 1 },
+  });
+  assert.ok(state.conditions["player::中毒"]);
+  applyRpTx(state, { kind: "clock_tick", beatDelta: 1 });
+  assert.equal(state.conditions["player::中毒"]?.remainingTurns, 1);
+  applyRpTx(state, { kind: "clock_tick", beatDelta: 1 });
+  assert.equal(state.conditions["player::中毒"], undefined);
+
+  // 5. Roll record persists in state.lastRoll
+  applyRpTx(state, {
+    kind: "roll_record",
+    roll: {
+      turn: state.turn,
+      actor: "player",
+      expression: "1d20+3",
+      statKey: "敏捷",
+      statBonus: 3,
+      rolls: [16],
+      keptRolls: [16],
+      modifier: 3,
+      total: 19,
+      dc: 15,
+      success: true,
+      critical: null,
+      reason: "潜行越墙",
+      source: "tool",
+    },
+  });
+  assert.equal(state.lastRoll?.total, 19);
+  assert.equal(state.lastRoll?.success, true);
+});
+
+
+test("audit-11: Entity Hygiene (blocks card titles, metaphors, places & system namespaces) + Full Cohesive Cascade (bond rift, HP danger, agenda expiry)", async () => {
+  // 1. Entity Hygiene rejects non-characters, card titles, and metaphors
+  for (const bad of ["world", "任务", "属性", "经济", "系统", "大明王朝模拟器", "赛博夜城RPG", "黑夜中的幽灵", "沉睡的巨兽", "银月酒馆", "神圣帝国", "所有人"]) {
+    assert.equal(isNonCharacterEntity(bad), true, `Expected "${bad}" to be rejected as non-character`);
+  }
+  for (const good of ["艾琳", "林月", "陈墨", "Seraphina", "林海"]) {
+    assert.equal(isNonCharacterEntity(good), false, `Expected "${good}" to be accepted as character`);
+  }
+
+  // Player canonicalization prevents duplicates
+  assert.equal(canonicalizeActorName("玩家", { personaName: "阿明" }), "player");
+  assert.equal(canonicalizeActorName("阿明", { personaName: "阿明" }), "player");
+  assert.equal(canonicalizeActorName("user", { personaName: "阿明" }), "player");
+
+  // NPC list sanitization strips non-characters & player
+  const cleaned = sanitizeNpcList(["艾琳", "大明王朝模拟器", "黑夜中的幽灵", "player", "艾琳", "陈墨"], { personaName: "阿明" });
+  assert.deepEqual(cleaned, ["艾琳", "陈墨"]);
+
+  // Symmetric pair-bond canonicalization & self-bond rejection
+  const b1 = canonicalizePairBondActors("陈墨", "艾琳");
+  const b2 = canonicalizePairBondActors("艾琳", "陈墨");
+  assert.ok(b1 && b2 && b1.id === b2.id);
+  assert.equal(canonicalizePairBondActors("艾琳", "艾琳"), null);
+  assert.equal(canonicalizePairBondActors("艾琳", "银月酒馆"), null);
+
+  // 2. Full Cohesive Cascade in state-replay
+  const state = createInitialRpState();
+  state.active = true;
+  state.turn = 2;
+
+  // Bond rift -> auto Flag -> auto Storylet unlock
+  const riftBond = canonicalizePairBondActors("艾琳", "陈墨")!;
+  applyRpTx(state, {
+    kind: "storylet_upsert",
+    storylet: {
+      id: "st_betrayal",
+      title: "决裂对峙",
+      triggerPrompt: "两人彻底撕破脸",
+      gate: { requiredFlags: [`关系破裂:${riftBond.actorA}↔${riftBond.actorB}`] },
+      status: "armed",
+      createdTurn: 1,
+    },
+  });
+  applyRpTx(state, {
+    kind: "pair_bond_upsert",
+    bond: { id: "raw", actorA: "陈墨", actorB: "艾琳", stance: "敌对", tension: -75, note: "信任崩塌", updatedTurn: 2 },
+  });
+  assert.equal(state.flags[`关系破裂:${riftBond.actorA}↔${riftBond.actorB}`], true);
+  assert.equal(state.storylets.get("st_betrayal")?.status, "triggered");
+
+  // Vital HP <= 20% -> auto condition "重伤濒危", heal > 30% -> auto clear
+  applyRpTx(state, { kind: "stat_patch", actorId: "player", key: "HP", op: "set", value: 100, min: 0, max: 100, reason: "tool" });
+  applyRpTx(state, { kind: "stat_patch", actorId: "player", key: "HP", op: "set", value: 15, reason: "tool" });
+  assert.ok(state.conditions["player::重伤濒危"], "Critical HP must auto-apply 重伤濒危");
+  applyRpTx(state, { kind: "stat_patch", actorId: "player", key: "HP", op: "set", value: 50, reason: "tool" });
+  assert.equal(state.conditions["player::重伤濒危"], undefined, "Healing HP above 30% must auto-clear 重伤濒危");
+
+  // Agenda countdown to 0 fires audit notice
+  applyRpTx(state, {
+    kind: "agenda_upsert",
+    agenda: { actorId: "陈墨", goal: "潜入档案室", currentActivity: "踩点", etaTurns: 1, updatedTurn: 2 },
+  });
+  applyRpTx(state, { kind: "clock_tick", beatDelta: 1 });
+  assert.equal(state.npcAgendas["陈墨"]?.etaTurns, 0);
+  assert.ok(state.auditLog.some((a) => a.summary.includes("幕后日程达成")));
 });

@@ -557,12 +557,45 @@ export interface CfsmStateRecord {
   reason?: string;
 }
 
+export interface ClockCompletionEffect {
+  setFlags?: Record<string, boolean>;
+  triggerStoryletId?: string;
+  note?: string;
+}
+
 export interface ProgressClock {
   clockId: string;
   label: string;
   value: number;
   max: number;
   completed: boolean;
+  onComplete?: ClockCompletionEffect;
+}
+
+export interface ActiveCondition {
+  id: string;
+  actorId: string;
+  label: string;
+  effect?: string;
+  remainingTurns: number | null;
+  appliedTurn: number;
+}
+
+export interface RollRecord {
+  turn: number;
+  actor?: string;
+  expression: string;
+  statKey?: string;
+  statBonus?: number;
+  rolls: number[];
+  keptRolls: number[];
+  modifier: number;
+  total: number;
+  dc?: number;
+  success?: boolean;
+  critical: "nat_max" | "nat_min" | null;
+  reason?: string;
+  source: "tool" | "manual";
 }
 
 export interface BiTemporalFact {
@@ -794,7 +827,15 @@ export type RpTxEntry =
       reason?: string;
     }
   | { kind: "inventory_patch"; actorId: string; item: string; delta: number; note?: string }
-  | { kind: "progress_clock"; clockId: string; label: string; delta: number; max: number; completed?: boolean }
+  | {
+      kind: "progress_clock";
+      clockId: string;
+      label: string;
+      delta: number;
+      max: number;
+      completed?: boolean;
+      onComplete?: ClockCompletionEffect;
+    }
   | { kind: "fact_add"; fact: BiTemporalFact }
   | { kind: "fact_update"; factId: string; statement?: string; witnessIds?: string[] | "public"; entities?: string[] }
   | { kind: "fact_invalidate"; factId: string; validUntilTurn: number; supersededBy?: string; reason: string }
@@ -839,7 +880,10 @@ export type RpTxEntry =
   | { kind: "pair_bond_delete"; id: string }
   | { kind: "lore_runtime"; sticky: Record<string, number>; cooldown: Record<string, number>; consumedOneShots: string[] }
   | { kind: "anti_godmoding_set"; enabled: boolean }
-  | { kind: "tension_set"; value: number; reason?: string };
+  | { kind: "tension_set"; value: number; reason?: string }
+  | { kind: "condition_upsert"; condition: ActiveCondition }
+  | { kind: "condition_remove"; id: string; reason?: string }
+  | { kind: "roll_record"; roll: RollRecord };
 
 export interface SessionRpState {
   active: boolean;
@@ -908,4 +952,6 @@ export interface SessionRpState {
   sceneTension?: number;
   lastSidecarStatus?: { turn: number; ok: boolean; summary: string };
   slopCounts?: Record<string, number>;
+  conditions: Record<string, ActiveCondition>;
+  lastRoll: RollRecord | null;
 }
