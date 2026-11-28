@@ -147,6 +147,7 @@ export function makeDashboardRuntime(rt: RpRuntimeHandle): DashboardRuntime {
     exportNovel: (ctx) => actionExportNovel(rt, ctx, ""),
     toggleHide: (ctx) => actionToggleHide(rt, ctx, "", true),
     toggleAntiGodmoding: (ctx) => actionToggleAntiGodmoding(rt, ctx),
+      setSettlementMode: (c) => actionSetSettlementMode(rt, c, ""),
     exportWorldSave: (ctx) => actionExportWorldSave(rt, ctx, ""),
     importWorldSave: (ctx) => actionImportWorldSave(rt, ctx, ""),
   };

@@ -68,6 +68,7 @@ export interface DashboardRuntime {
   exportNovel?(ctx: PiExtensionContext): Promise<void>;
   toggleHide?(ctx: PiExtensionContext): Promise<void>;
   toggleAntiGodmoding?(ctx: PiExtensionContext): Promise<void>;
+  setSettlementMode?(ctx: PiExtensionContext): Promise<void>;
   exportWorldSave?(ctx: PiExtensionContext): Promise<void>;
   importWorldSave?(ctx: PiExtensionContext): Promise<void>;
 }
@@ -1444,6 +1445,7 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
       `✒️ 回复篇幅与视角`,
       `🚫 反套话禁词表（${s.bannedPhrases.length} 词）`,
       `🛡 防抢戏开关（严禁代演玩家）：${antiGodmoding ? "● 开" : "○ 关"}`,
+      `⚙️ 记账模式（${s.settlementMode === "tool-assisted" ? "工具实时控账" : s.settlementMode === "sidecar-light" ? "纯文学后台" : "纯聊天"}）`,
       "✂️ 局部定向改写上一条回复",
       `💭 角色内心独白：${s.innerMonologue ? "● 开" : "○ 关"}`,
       "⚡ 快捷回复 / 动作宏",
@@ -1487,7 +1489,11 @@ export async function openNotesAndPacing(rt: DashboardRuntime, ctx: PiExtensionC
       rt.commitTx({ kind: "config_patch", innerMonologue: next });
       rt.refreshHud(ctx);
       ctx.ui.notify(`角色内心独白已${next ? "开启（将以精致引文块呈现潜台词）" : "关闭"}`, "info");
-    } else if (pick.startsWith("🛡")) {
+    } else if (pick.startsWith("⚙️ 记账模式")) {
+      await rt.setSettlementMode?.(ctx);
+      continue;
+    }
+    if (pick.startsWith("🛡")) {
       await rt.toggleAntiGodmoding?.(ctx);
     } else if (pick.startsWith("💾")) {
       await rt.exportWorldSave?.(ctx);

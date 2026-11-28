@@ -1928,10 +1928,10 @@ export async function actionSetSettlementMode(
   if (arg === "off" || arg === "tool-assisted" || arg === "sidecar-light") {
     next = arg;
   } else {
-    const pick = await ctx.ui.select(`⚙ 选择结算模式（当前：${state.settlementMode}）`, [
-      "tool-assisted — 零额外调用，按需工具更新状态（默认推荐）",
-      "sidecar-light — 回合结束后后台异步提炼事实、信念与伏笔（零首字延迟）",
-      "off — 仅基础时间推进，完全关闭自动结算",
+    const pick = await ctx.ui.select(`⚙ 游玩与记账模式（当前：${state.settlementMode === "tool-assisted" ? "工具实时控账" : state.settlementMode === "sidecar-light" ? "纯文学·后台记账" : "纯聊天"}）`, [
+      "tool-assisted — 工具实时控账（单模型推荐，0 额外后台调用）",
+      "sidecar-light — 纯文学优先·后台记账（配小模型最佳，文笔最放得开）",
+      "off — 纯聊天（0 工具、不自动记账）",
     ]);
     if (!pick) return;
     next = pick.split(" ")[0] as SettlementMode;
