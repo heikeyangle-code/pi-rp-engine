@@ -448,7 +448,7 @@ test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, re
     rpEngineExtension(h.pi);
 
     // 16 shortcuts registered + 3 message renderers + 6 tools (all defaultActive: false)
-    assert.equal(h.shortcuts.size, 9);
+    assert.equal(h.shortcuts.size, 11);
     assert.ok(h.shortcuts.has("alt+r"));
     assert.ok(h.shortcuts.has("alt+e"));
     assert.ok(h.shortcuts.has("alt+w"));
