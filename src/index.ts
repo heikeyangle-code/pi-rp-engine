@@ -49,7 +49,7 @@ import {
 import { applyDisplayRegexRules, stripDisplayResiduals } from "./parser/sanitizer.js";
 import { RP_TOOL_NAMES, registerRpTools } from "./tools/rp-tools.js";
 import { clearRpHud, renderRpHud } from "./ui/hud.js";
-import { registerRpEntryRenderer, registerRpMessageRenderers } from "./ui/renderers.js";
+import { registerRpMessageRenderers } from "./ui/renderers.js";
 import {
   type RpRuntimeHandle,
   actionBookmarkGoto,
@@ -252,9 +252,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     refreshHud,
   });
 
-  // Register custom editorial TUI message renderers & /tree entry renderer
+  // Register custom editorial TUI message renderers (keep rp:tx entries invisible in chat for immersion)
   registerRpMessageRenderers(pi);
-  registerRpEntryRenderer(pi);
 
   // Register `/rp` command palette & subcommands
   registerRpCommands(pi, runtime);
@@ -356,8 +355,6 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     if (typeof event?.prompt === "string") {
       lastUserText = event.prompt;
     }
-    const charLabel = activeCard.identity.nickname || activeCard.identity.name;
-    ctx?.ui?.setWorkingMessage?.(isOocTurn ? "OOC 讨论思考中…" : `${charLabel} 正在回应…`);
 
     const initialPersona = state.initialPersona ?? state.currentPersona;
     const zone1 = buildZone1FrozenPrefix({

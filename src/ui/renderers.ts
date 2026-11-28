@@ -9,7 +9,7 @@
  *  - Zero third-party dependencies, 100% safe on desktop TUI and mobile Pi
  */
 
-import type { PiExtensionAPI, PiMessage, RpTxEntry } from "../types.js";
+import type { PiExtensionAPI, PiMessage } from "../types.js";
 
 export interface PiThemeLike {
   fg?: (color: string, text: string) => string;
@@ -258,66 +258,3 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
   });
 }
 
-
-/** Register human-readable `/tree` entry renderer for `rp:tx` session-tree transactions. */
-export function registerRpEntryRenderer(pi: PiExtensionAPI): void {
-  if (typeof pi.registerEntryRenderer !== "function") return;
-
-  pi.registerEntryRenderer("rp:tx", (entry, _options, theme) => {
-    const tx = entry.data as RpTxEntry | undefined;
-    if (!tx || typeof tx !== "object") return undefined;
-
-    let label = `RP 事件: ${tx.kind}`;
-    switch (tx.kind) {
-      case "bind":
-        label = `🎭 开启扮演 · ${tx.cardSlug}`;
-        break;
-      case "unbind":
-        label = "🚪 退出 RP 模式";
-        break;
-      case "location_set":
-        label = `📍 场景变更 · ${tx.location || "(空)"}${tx.presentNpcs.length ? ` (${tx.presentNpcs.join("、")})` : ""}`;
-        break;
-      case "stat_patch":
-        label = `📊 数值 · ${tx.actorId}.${tx.key} ${tx.op === "add" ? (Number(tx.value) >= 0 ? `+${tx.value}` : tx.value) : `= ${String(tx.value)}`}`;
-        break;
-      case "inventory_patch":
-        label = `🎒 物品 · ${tx.actorId} ${tx.item} (${tx.delta > 0 ? `+${tx.delta}` : tx.delta})`;
-        break;
-      case "progress_clock":
-        label = `⏳ 时钟 · ${tx.label} (${tx.delta >= 0 ? `+${tx.delta}` : tx.delta}/${tx.max})`;
-        break;
-      case "cfsm_transition":
-        label = `💭 心态 · ${tx.actorId}.${tx.axis}: ${tx.from} → ${tx.to}`;
-        break;
-      case "fact_add":
-        label = `🧠 事实 · ${tx.fact.statement.slice(0, 42)}`;
-        break;
-      case "fact_invalidate":
-        label = `✖ 事实失效 · ${tx.factId}`;
-        break;
-      case "belief_update":
-        label = `◇ 信念 · ${tx.actorId} → ${tx.target}: ${tx.belief.slice(0, 36)}`;
-        break;
-      case "foresight_upsert":
-        label = `✨ 伏笔 · ${tx.hook.summary.slice(0, 42)} [${tx.hook.status}]`;
-        break;
-      case "era_advance":
-        label = `🎬 阶段跃迁 · ${tx.fromEra || "起"} → ${tx.toEra || "无"}`;
-        break;
-      case "clock_tick":
-        label = tx.worldTimeLabel ? `🕒 时间 · ${tx.worldTimeLabel}` : `🕒 回合推进 (+${tx.beatDelta})`;
-        break;
-      case "note_set":
-        label = `🎬 导演指令 · ${tx.note.text.slice(0, 38)}`;
-        break;
-      case "profile_apply":
-        label = `🔍 画像应用 · ${tx.archetype}`;
-        break;
-      default:
-        return undefined;
-    }
-
-    return createLinesComponent(() => [styleDim(theme, label)]);
-  });
-}

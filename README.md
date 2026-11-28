@@ -94,6 +94,18 @@ git clone https://github.com/heikeyangle-code/tavern-next.git ~/.pi/agent/extens
 
 <br>
 
+### 对比其他「新时代 RP 架构」（多 Agent / 外置向量库）
+
+除了传统酒馆，社区里还出现过两类常见的新路线——**全量多 Agent 编排**（导演 + 每个 NPC 独立一个 Agent + 裁判）和 **外置向量数据库 RAG**（独立跑向量库 + Embedding API）。我们没有走这两条路，原因很直接：
+
+| 路线 | 典型做法 | 实际游玩时的痛点 | Tavern Next 的取舍与优点 |
+| :--- | :--- | :--- | :--- |
+| **全量多 Agent** | 导演、旁白、角色 A/B 各自独立上下文串行调用 | 串行多轮调用导致**首字等待慢**；每个 Agent 各算一份上下文，**Token 翻倍且前缀缓存几乎失效**；跨 Agent 交接摘要容易丢失情绪铺垫与文风连贯 | **单主脑统一执笔 + 代码管状态**：90% 日常与群戏只调 1 次主模型流式直出，文风统一、前缀缓存完整；仅在强信息不对称博弈时按需调用视角隔离视图 |
+| **外置向量 RAG** | 依赖外部向量库与云端 Embedding 接口检索聊天记录 | 手机端本机部署麻烦、依赖额外 API；纯语义相似度不擅长处理**时间线更新**，旧事实与新事实经常同时被召回互相打架 | **本地纯代码零依赖召回**：纯 TypeScript 本地 BM25 + 2 跳实体图谱（PPR）毫秒级运行，配合**双时态事实失效**，旧事实作废后不再干扰当前回合 |
+| **重度前端状态卡** | 用 HTML/CSS/JS 脚本把聊天框改造成网页游戏界面 | 提示词被大量前端格式指令挤占，容易崩格式、污染上下文 | **专注纯文字叙事**：剥离前端壳，正文永远干净，数值/背包/记忆全部交由代码引擎与原生面板维护 |
+
+<br>
+
 ---
 
 <h3 align="center">日常高频玩法</h3>
@@ -141,7 +153,7 @@ git clone https://github.com/heikeyangle-code/tavern-next.git ~/.pi/agent/extens
 - **双时态事实、伏笔与幕间压缩（`bitemporal.ts`、`foresight.ts`、`compaction.ts`）**：事实携带 `validFromTurn` / `validUntilTurn` / `witnessIds`；伏笔每轮按相关性筛选 Top 3；触发长对话压缩（`session_before_compact`）时将当前状态、有效事实、人物信念与开放伏笔归并为结构化幕级摘要。
 
 ### 5. 运行时隔离与底层扩展边界（`src/index.ts`、`src/ui/`）
-- **默认休眠**：注册的 6 个内部工具均设 `defaultActive: false`，未开启 RP 时 0 工具 Token、0 UI 占用、0 Hook 开销；`/tree` 中通过 `registerEntryRenderer("rp:tx")` 将状态事务渲染为可读中文节点，展示层通过 `registerMarkdownTransformer({ messageTypes: ["assistant", "custom"] })` 清理残留标签并执行酒馆 `AI_OUTPUT` 展示正则。
+- **默认休眠**：注册的 6 个内部工具均设 `defaultActive: false`，未开启 RP 时 0 工具 Token、0 UI 占用、0 Hook 开销；`rp:tx` 状态事务在对话流中完全静默不渲染，不打断正文阅读沉浸感；展示层通过 `registerMarkdownTransformer({ messageTypes: ["assistant", "custom"] })` 清理残留标签并执行酒馆 `AI_OUTPUT` 展示正则。
 - **双端一致**：状态栏采用纯文本数组 Widget，输入框预填与多行编辑采用标准 UI 接口，在桌面端终端与移动端 [Pi for Android](https://github.com/heikeyangle-code/pi-android)（RPC 模式）下均可直接工作。
 
 <br>
