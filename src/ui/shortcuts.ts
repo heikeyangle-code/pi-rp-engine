@@ -58,14 +58,19 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
   // In RPC / mobile hosts (e.g. pi-android), `catalog.triggerShortcut` awaits the shortcut handler
   // with a 30s RPC timeout. Launching interactive UI flows non-blocking in non-TUI mode prevents
   // false timeout errors while the user reads or browses a native bottom sheet!
-  const runShortcut = (fn: (ctx: PiExtensionContext) => Promise<void>, ctx: PiExtensionContext): Promise<void> | void => {
-    if (ctx.mode !== "tui") {
-      void Promise.resolve(fn(ctx)).catch((err) => {
+  // Always launch interactive shortcut UI non-blocking so mobile hosts (pi-android)
+  // never hit the 30s `catalog.triggerShortcut` RPC timeout even when ctx.mode === "tui".
+  let shortcutBusy = false;
+  const runShortcut = (fn: (ctx: PiExtensionContext) => Promise<void>, ctx: PiExtensionContext): void => {
+    if (shortcutBusy) return;
+    shortcutBusy = true;
+    void Promise.resolve(fn(ctx))
+      .catch((err) => {
         ctx.ui?.notify?.(`操作执行失败：${(err as Error).message}`, "error");
+      })
+      .finally(() => {
+        shortcutBusy = false;
       });
-      return;
-    }
-    return fn(ctx);
   };
 
   const requireActive = (fn: (ctx: PiExtensionContext) => Promise<void>) => (ctx: PiExtensionContext) => {
@@ -77,82 +82,82 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
   };
 
   pi.registerShortcut("alt+r", {
-    description: "RP 主菜单 / 启动器",
+    description: "🎭 主菜单",
     handler: (ctx) => runShortcut((c) => handlers.openMenu(c), ctx),
   });
 
   pi.registerShortcut("ctrl+shift+r", {
-    description: "RP 世界控制台（TUI 7标签浮窗 / 全功能面板）",
+    description: "📊 世界面板",
     handler: requireActive((ctx) => handlers.openDashboard(ctx)),
   });
 
   pi.registerShortcut("alt+e", {
-    description: "RP 快捷回复与常用动作宏 (/rp qr)",
+    description: "⚡ 快捷回复",
     handler: requireActive((ctx) => handlers.quickReplies(ctx)),
   });
 
   pi.registerShortcut("alt+x", {
-    description: "RP 上下文 X-Ray 透视 (/rp xray)",
+    description: "🔎 X-Ray 透视",
     handler: requireActive((ctx) => handlers.openXRay(ctx)),
   });
 
   pi.registerShortcut("alt+i", {
-    description: "RP 帮我代写主角回复 (/rp imp)",
+    description: "✍️ 代写回复",
     handler: requireActive((ctx) => handlers.impersonate(ctx)),
   });
 
   pi.registerShortcut("alt+q", {
-    description: "RP 零污染场外提问 (/rp ask)",
+    description: "💭 场外提问",
     handler: requireActive((ctx) => handlers.sidePrompt(ctx)),
   });
 
   pi.registerShortcut("alt+w", {
-    description: "RP 重摇上一条回复 (/rp reroll)",
+    description: "🔄 重摇回复",
     handler: requireActive((ctx) => handlers.rerollLast(ctx)),
   });
 
   pi.registerShortcut("alt+k", {
-    description: "RP 续写剧情 (/rp continue)",
+    description: "▶ 续写剧情",
     handler: requireActive((ctx) => handlers.continueStory(ctx)),
   });
 
   pi.registerShortcut("alt+a", {
-    description: "RP 生成行动建议 (/rp act)",
+    description: "💡 行动建议",
     handler: requireActive((ctx) => handlers.actionIdeas(ctx)),
   });
 
   pi.registerShortcut("alt+n", {
-    description: "RP 导演指令管理 (/rp note)",
+    description: "🎬 导演指令",
     handler: requireActive((ctx) => handlers.directorNote(ctx)),
   });
 
   pi.registerShortcut("alt+p", {
-    description: "RP 一键循环切换叙事节奏 (/rp pace)",
+    description: "🎚 切换节奏",
     handler: requireActive((ctx) => handlers.cyclePacing(ctx)),
   });
 
   pi.registerShortcut("alt+t", {
-    description: "RP 切场景 / 跳时间 (/rp skip)",
+    description: "⏳ 切场景/时间",
     handler: requireActive((ctx) => handlers.skipTime(ctx)),
   });
 
   pi.registerShortcut("alt+b", {
-    description: "RP 保存剧情书签 (/rp save)",
+    description: "🔖 保存书签",
     handler: requireActive((ctx) => handlers.saveBookmark(ctx)),
   });
 
   pi.registerShortcut("alt+j", {
-    description: "RP 跳转或分叉至剧情书签 (/rp goto)",
+    description: "⏩ 跳转书签",
     handler: requireActive((ctx) => handlers.gotoBookmark(ctx)),
   });
 
   pi.registerShortcut("alt+h", {
-    description: "RP 循环切换 HUD 显示模式",
+    description: "🖥 切换 HUD",
     handler: requireActive((ctx) => handlers.cycleHud(ctx)),
   });
 
   pi.registerShortcut("alt+shift+x", {
-    description: "RP 彻底退出本会话角色扮演模式",
+    description: "🚪 退出 RP",
     handler: requireActive((ctx) => handlers.exitRp(ctx)),
   });
 }

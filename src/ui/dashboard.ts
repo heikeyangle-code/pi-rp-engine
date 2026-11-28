@@ -67,8 +67,8 @@ function getAllLore(rt: DashboardRuntime): CompiledLoreEntry[] {
 }
 
 /** Clean native bottom-sheet header on RPC/mobile (no terminal `╭─` box-drawing noise). */
-function sheetHeader(ctx: PiExtensionContext, title: string): string {
-  return ctx.mode === "tui" ? `╭─ ${title}` : title;
+function sheetHeader(_ctx: PiExtensionContext, title: string): string {
+  return title;
 }
 
 async function editLongText(ctx: PiExtensionContext, title: string, initial: string): Promise<string | undefined> {
@@ -1370,6 +1370,7 @@ export async function openRpDashboard(
   rt: DashboardRuntime,
   ctx: PiExtensionContext,
   initialTab: OverlayTabIndex = 0,
+  preferTuiOverlay = false,
 ): Promise<void> {
   const state = rt.getState();
   if (!state.active) {
@@ -1377,8 +1378,9 @@ export async function openRpDashboard(
     return;
   }
 
-  // Primary Desktop TUI experience: genuine 7-tab interactive overlay (`ctx.ui.custom(..., { overlay: true })`)
-  if (ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
+  // Optional Desktop-keyboard 7-tab TUI overlay (opt-in via `/rp panel tui` so mobile pi-android
+  // always opens the crisp native touch Bottom Sheet instead of a tiny 97x16 virtual terminal!)
+  if (preferTuiOverlay && ctx.mode === "tui" && typeof ctx.ui.custom === "function") {
     let tab: OverlayTabIndex = initialTab;
     while (rt.getState().active) {
       const action = await openTuiOverlayDashboard(ctx, {
@@ -1424,11 +1426,16 @@ export async function openRpDashboard(
       `6. 🔎 上下文 X-Ray 透视 & 审计撤销（${xray ? `KV×${xray.cacheHitStreak} · 召回${xray.recalled.length}` : "待捕获"} · 审计 ${s.auditLog.length}）`,
       `7. ⚙ 跑团机制、Sidecar 模型、预算与资产库`,
       "8. 🌍 会话总览、上下文用量与导入审计",
+      ...(s.auditLog.length > 0 ? [`↩ 撤销上次状态变更（${s.auditLog[s.auditLog.length - 1]!.summary.slice(0, 26)}）`] : []),
       "9. 🚪 彻底退出本会话 RP 模式",
       "✕ 关闭面板",
     ]);
 
     if (!choice || choice.startsWith("✕")) return;
+    if (choice.startsWith("↩")) {
+      await rt.undoLast(ctx, true);
+      continue;
+    }
     if (choice.startsWith("1.")) await openSceneSection(rt, ctx);
     else if (choice.startsWith("2.")) await openCharactersSection(rt, ctx);
     else if (choice.startsWith("3.")) await openMemoryBookSection(rt, ctx);

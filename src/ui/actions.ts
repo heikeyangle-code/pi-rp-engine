@@ -765,16 +765,64 @@ export async function actionContinue(rt: RpRuntimeHandle, ctx: PiExtensionContex
 }
 
 export async function actionIdeas(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
-  if (!rt.getState().active) {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
     ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
     return;
   }
+
+  // Zero-pollution interactive Bottom Sheet picker (generates directly-sendable replies via isolated call!)
+  if (canCompleteWithRegistry(ctx)) {
+    const recent = collectRecentDialogueLines(ctx, state, 6);
+    const systemPrompt =
+      `Generate 3 distinct, concrete, directly-sendable first-person player replies for an interactive roleplay. ` +
+      `Player persona: "${state.currentPersona.name}". Match the story's language and tone strictly. ` +
+      `Return ONLY strict JSON array: [{"tag":"主动/破局","text":"..."},{"tag":"观察/试探","text":"..."},{"tag":"对话/情绪","text":"..."}]. Each text should be 1-3 natural sentences ready to send as-is.`;
+    const userPrompt =
+      `Scene: ${[state.era, state.worldTimeLabel, state.location].filter(Boolean).join(" · ") || "unset"}\n` +
+      (state.sceneObjective ? `Objective: ${state.sceneObjective}\n` : "") +
+      (recent.length ? `Recent dialogue:\n${recent.join("\n")}\n` : "") +
+      `Output JSON array now:`;
+
+    ctx.ui.notify("💡 正在构思 3 个贴合当下情境的行动选项…", "info");
+    try {
+      const raw = await completeWithRegistry(ctx, ctx.model, {
+        systemPrompt,
+        userPrompt,
+        maxTokens: 480,
+        signal: ctx.signal,
+      });
+      const m = /\[[\s\S]*\]/.exec(raw);
+      if (m) {
+        const parsed = JSON.parse(m[0]!) as Array<{ tag?: string; text?: string }>;
+        const choices = parsed
+          .filter((x) => x && typeof x.text === "string" && x.text.trim().length > 0)
+          .slice(0, 4);
+        if (choices.length > 0) {
+          const opts = choices.map((c, i) => `${i + 1}. [${c.tag || "选项"}] ${previewText(c.text!, 58)}`);
+          const pick = await ctx.ui.select("💡 选择行动建议（点选直接填入输入框，不污染聊天记录）", [...opts, "✕ 取消"]);
+          if (!pick || pick.startsWith("✕")) return;
+          const idx = opts.indexOf(pick);
+          const chosen = choices[idx];
+          if (chosen?.text) {
+            ctx.ui.setEditorText(chosen.text.trim());
+            ctx.ui.notify("✍️ 已填入输入框，可直接微调后发送。", "info");
+          }
+          return;
+        }
+      }
+    } catch {
+      // Fall back cleanly below if model call fails
+    }
+  }
+
   rt.markNextTurnOoc();
   rt.pi.sendMessage(
     {
       customType: "rp:ooc",
       content:
-        "[OOC Request] Please suggest 3 distinct, in-character action or dialogue choices the player could take right now (e.g., 1 bold/proactive, 1 observant/tactical, 1 emotional/conversational). Keep each concise (1-2 sentences) and do NOT advance the scene.",
+        "[OOC Request] Please suggest 3 distinct, in-character action or dialogue choices the player could take right now (1 proactive, 1 observant/tactical, 1 conversational). Keep each concise (1-2 sentences) and do NOT advance the scene.",
       display: true,
       details: { kind: "ideas" },
     },
@@ -835,10 +883,13 @@ export async function actionDirectorNote(rt: RpRuntimeHandle, ctx: PiExtensionCo
 
   // Interactive humanized manager
   const quickTemplates = [
-    "放慢节奏，侧重环境氛围、微表情与内心潜台词描写",
-    "提高戏剧张力，引入一个合理的意外线索或冲突转折",
-    "让角色更主动地推动对话并向玩家抛出一两个具体问题",
-    "回复篇幅保持精炼紧凑（约 250-400 字），加快互动节奏",
+    "去 AI 味：禁止排比句、总结式升华与“空气仿佛凝固/眼底闪过一丝”等陈词滥调，用克制白描和具体动作推动场景",
+    "严禁越权：绝不替玩家说话、动作或揣测玩家内心决定，把选择权完整留给玩家",
+    "保持人物棱角：角色遵循自身立场、利害与防备心，不无端讨好或瞬间软化，对白留有潜台词",
+    "群像自然运转：在场配角各自有短期意图与小动作，不全部围着主角转，允许打断与信息差",
+    "细节镜头：放慢当前一拍，通过声音、气味、光线与微表情展现情绪，避免直接点破心理",
+    "打破平淡：引入一个合乎逻辑的外部变数、意外访客或隐蔽线索，在结尾留出明确行动钩子",
+    "紧凑提速：正文控制在 250–400 字内，对白干脆利落，加快交互节奏",
   ];
 
   const opts = [
@@ -1268,9 +1319,27 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
   }
   let desc = argsText.trim();
   if (!desc) {
-    const entered = await ctx.ui.input("⏳ 跳过时间 / 幕间蒙太奇（如：3天后、次日清晨、进入第二幕）", "次日清晨");
-    if (!entered?.trim()) return;
-    desc = entered.trim();
+    const pick = await ctx.ui.select("⏳ 切场景 / 跳时间", [
+      "🌅 次日清晨",
+      "🌙 夜幕降临",
+      "⏳ 三日之后",
+      "📍 切换至新地点（自定义）",
+      "✏️ 输入自定义时间或章节跳转",
+      "✕ 取消",
+    ]);
+    if (!pick || pick.startsWith("✕")) return;
+    if (pick.startsWith("📍")) {
+      const loc = (await ctx.ui.input("输入要切往的新地点与简短情境", ""))?.trim();
+      if (!loc) return;
+      rt.commitTx({ kind: "location_set", location: loc, presentNpcs: state.presentNpcs });
+      desc = `转场至：${loc}`;
+    } else if (pick.startsWith("✏️")) {
+      const entered = (await ctx.ui.input("输入时间推进或转场描述（如：半月后、入冬大雪）", "次日清晨"))?.trim();
+      if (!entered) return;
+      desc = entered;
+    } else {
+      desc = pick.replace(/^[^\s]+\s+/, "");
+    }
   }
   const dayMatch = /(\d+)\s*(天|日|days?)/i.exec(desc);
   const dayDelta = dayMatch ? Number(dayMatch[1]) : /次日|明天|隔日|翌/i.test(desc) ? 1 : 0;
@@ -1298,7 +1367,7 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
   rt.pi.sendMessage(
     {
       customType: "rp:era",
-      content: `时光流转：${desc}\n请写一段简短、富有画面感的过渡蒙太奇，并自然切入新时间点后的下一场戏。`,
+      content: `[场景/时间过渡：${desc}] 请用克制具体的画面感交代这段时间内的自然变化（避免空泛总结），直接切入新时间点与当下场景的开场细节，将主动权交给玩家。`,
       display: true,
       details: { fromEra: state.era, toEra: nextEra, kind: "montage" },
     },
@@ -1442,6 +1511,7 @@ export async function actionSetSettlementMode(
     next = pick.split(" ")[0] as SettlementMode;
   }
   rt.commitTx({ kind: "config_patch", settlementMode: next });
+  rt.activateRpTools();
   rt.refreshHud(ctx);
   ctx.ui.notify(`结算模式已切换为：${next}`, "info");
 }

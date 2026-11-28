@@ -156,15 +156,24 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     applyRpTx(state, tx);
   }
 
+  function getDesiredRpTools(): string[] {
+    // In sidecar-light or off mode, the main narrative model does not need state/fact write tools;
+    // omitting them saves tool-schema tokens and prevents XML-style `<rp_state_patch">` leaks.
+    if (state.settlementMode === "sidecar-light" || state.settlementMode === "off") {
+      return RP_TOOL_NAMES.filter((t) => t !== "rp_state_patch" && t !== "rp_fact_commit");
+    }
+    return [...RP_TOOL_NAMES];
+  }
+
   function activateRpTools(): void {
     const current = pi.getActiveTools();
-    const isAlreadyPureRp =
-      current.length === RP_TOOL_NAMES.length && current.every((t) => rpToolSet.has(t));
+    const desired = getDesiredRpTools();
+    const isAlreadyPureRp = current.length > 0 && current.every((t) => rpToolSet.has(t));
     if (!isAlreadyPureRp) {
       const nonRp = current.filter((t) => !rpToolSet.has(t));
       savedCodingTools = nonRp;
     }
-    pi.setActiveTools([...RP_TOOL_NAMES]);
+    pi.setActiveTools(desired);
   }
 
   function restoreCodingTools(): void {

@@ -161,7 +161,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               actor: { type: "string" },
               key: { type: "string" },
               op: { type: "string", enum: ["set", "add"] },
-              value: {},
+              value: { anyOf: [{ type: "number" }, { type: "string" }, { type: "boolean" }], description: "Numeric, string, or boolean value" },
               min: { type: "number" },
               max: { type: "number" },
               reason: { type: "string" },
