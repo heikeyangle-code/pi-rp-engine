@@ -177,28 +177,10 @@ function renderEditorialCard(options: {
   return lines;
 }
 
-/** Register custom Pi message renderers for RP narrative cards (`rp:greeting`, `rp:event`, `rp:ooc`, `rp:era`). */
+/** Register custom Pi message renderers for auxiliary RP cards (`rp:event`, `rp:ooc`, `rp:era`).
+ *  Note: `rp:greeting` intentionally uses Pi's native Markdown renderer without an ASCII frame for clean reading. */
 export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
   if (typeof pi.registerMessageRenderer !== "function") return;
-
-  pi.registerMessageRenderer("rp:greeting", (message, options, theme) => {
-    const details = (message.details ?? {}) as { cardName?: string; greetingIndex?: number; era?: string };
-    const title = details.cardName || "角色开场白";
-    const subtitle = `开场 #${(details.greetingIndex ?? 0) + 1}${details.era ? ` · ${details.era}` : ""}`;
-    const text = extractMessageText(message);
-    return createLinesComponent((width) =>
-      renderEditorialCard({
-        tag: "OPENING",
-        title,
-        subtitle,
-        body: text,
-        accentColor: "accent",
-        theme,
-        width,
-        maxLines: options?.expanded ? undefined : 22,
-      }),
-    );
-  });
 
   pi.registerMessageRenderer("rp:event", (message, options, theme) => {
     const details = (message.details ?? {}) as { kind?: string; title?: string; subtitle?: string };

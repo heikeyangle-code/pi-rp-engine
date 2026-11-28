@@ -444,7 +444,7 @@ test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, re
     assert.equal(h.shortcuts.size, 14);
     assert.ok(h.shortcuts.has("alt+r"));
     assert.ok(h.shortcuts.has("alt+shift+x"));
-    assert.equal(h.messageRenderers.size, 4);
+    assert.equal(h.messageRenderers.size, 3);
     assert.equal(h.tools.size, 6);
     for (const tool of h.tools.values()) {
       assert.equal(tool.defaultActive, false);
