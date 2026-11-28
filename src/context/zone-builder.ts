@@ -508,10 +508,16 @@ export function buildZone3TransientTail(options: {
       if (state.turn >= 18) score += 40;
       else if (state.turn >= 12) score += 30;
       else if (state.turn >= 6) score += 18;
-      const keywords = `${st.title} ${st.triggerPrompt}`.match(/[\u4e00-\u9fff]{2,4}|[a-zA-Z]{4,}/g) ?? [];
+      const rawText = `${st.title} ${st.triggerPrompt}`;
+      const kwSet = new Set<string>();
+      for (const m of rawText.match(/[a-zA-Z]{4,}/g) ?? []) kwSet.add(m.toLowerCase());
+      for (const run of rawText.match(/[\u4e00-\u9fff]{2,}/g) ?? []) {
+        for (let i = 0; i <= run.length - 2 && kwSet.size < 20; i++) {
+          kwSet.add(run.slice(i, i + 2));
+        }
+      }
       let hits = 0;
-      for (const kw of keywords.slice(0, 12)) {
-        const kl = kw.toLowerCase();
+      for (const kl of kwSet) {
         if (recentLow.includes(kl) || locLow.includes(kl)) hits += 1;
       }
       score += Math.min(45, hits * 15);

@@ -232,11 +232,9 @@ export function evaluateNarrativeHealth(
   // 2. Real plot-stagnation detection: NEVER false-alarm when prose is fresh & moving forward!
   // Only warn when BOTH state is unchanged AND prose overlap is rising (>=0.30 for >=6 turns), OR >=10 turns with zero state shift.
   const isPlotDriven = state.archetype !== "companion" && state.archetype !== "slice-of-life";
-  const isTrulyStagnant =
-    (stagnantTurns >= 6 && repetitionScore >= 0.30) ||
-    stagnantTurns >= 10;
+  const isTrulyStagnant = stagnantTurns >= 5;
   const antiStagnationCue =
-    state.settlementMode !== "off" && isPlotDriven && state.pacingMode !== "relaxed" && state.turn >= 6 && isTrulyStagnant
+    state.settlementMode !== "off" && isPlotDriven && state.pacingMode !== "relaxed" && state.turn >= 4 && isTrulyStagnant
       ? `Anti-stagnation cue: ${stagnantTurns} turns have elapsed with no concrete world shift. Surface an organic complication, subtle clue, NPC initiative, or consequence tied to the current scene objective.`
       : null;
 
