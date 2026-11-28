@@ -1,3 +1,5 @@
+import { extractInlineDelta, parseAndValidateInlineDelta } from "../src/engine/inline-delta.js";
+import { maybeBuildAutoSceneChapter } from "../src/memory/compaction.js";
 import { resolveCanonicalStatKey } from "../src/engine/cfsm.js";
 import { styleDim } from "../src/ui/renderers.js";
 import { attachZone3ToMessages } from "../src/context/zone-builder.js";
@@ -683,4 +685,61 @@ test("audit-12: Full-codebase audit fixes (entity-hygiene \\b, toolResult Zone3,
   // 7. Pi v1.7.0 theme.fg('dim', text) in styleDim
   const styled = styleDim({ fg: (c: string, t: string) => `<${c}>${t}</${c}>` }, "提示");
   assert.equal(styled, "<dim>提示</dim>");
+});
+
+test("v6-single-model: Primary era calendar math, [[RP_DELTA]] zero-RTT sync, Auto Scene Chapter, Soft Storylets & Consequence Echoes", () => {
+  // 1. Exact screenshot bug: 康熙五十三年（距崇祯七年整八十年）+ 320 years MUST be 1714+320=2034 (NOT 1634+320=1954 or 乾隆十九年!)
+  const anchor = computeCalendarAnchor("康熙五十三年深秋（距崇祯七年整八十年）", 320, 0);
+  assert.ok(anchor);
+  assert.equal(anchor!.sourceYear, 1714);
+  assert.equal(anchor!.targetYear, 2034);
+  assert.equal(anchor!.targetEraLabel, "公元2034年");
+
+  // 2. [[RP_DELTA]] zero-RTT inline delta extraction, validation & commit
+  const st = createInitialRpState();
+  st.active = true;
+  st.turn = 8;
+  st.location = "河神庙";
+  st.era = "初遇·河神庙";
+  st.sceneObjective = "走进河神庙";
+  st.objectiveUpdatedTurn = 1;
+  applyRpTx(st, { kind: "progress_clock", clockId: "clk_season", label: "运河封冻", delta: 2, max: 6 });
+
+  const rawReply = `风从亭子那头穿过去，绳头被铁环绕紧。\n\n[[RP_DELTA]]\nloc: 运河码头 | 提灯先生, 疤脸河兵\nstage: 码头劫船\nobj: 借乱脱身并查明幕后主使\nclock: 运河封冻 +1\necho: 当街喊反清复明 -> 暗桩开始排查 [weight: high] [entities: 提灯先生, 运河码头]\n[[/RP_DELTA]]`;
+  const { cleanProse, rawBlock } = extractInlineDelta(rawReply);
+  assert.equal(cleanProse.includes("RP_DELTA"), false);
+  assert.ok(rawBlock);
+  const parsed = parseAndValidateInlineDelta(rawBlock!, st);
+  for (const tx of parsed.txs) applyRpTx(st, tx);
+  assert.equal(st.location, "运河码头");
+  assert.equal(st.era, "码头劫船");
+  assert.equal(st.sceneObjective, "借乱脱身并查明幕后主使");
+  assert.equal(st.clocks["clk_season"]?.value, 3);
+  assert.equal(st.consequences.size, 1);
+
+  // 3. Auto Episodic -> Semantic Scene Consolidation on location shift after >=5 turns
+  const ch = maybeBuildAutoSceneChapter(st, "河神庙", "初遇·河神庙");
+  assert.ok(ch, "Should auto-archive Memory Book chapter on scene shift");
+  assert.ok(ch!.title.includes("河神庙"));
+
+  // 4. Soft-Hybrid Storylet triggering + Consequence Echo surfacing in <rp_drama_beat>
+  st.turn = 14;
+  applyRpTx(st, {
+    kind: "storylet_upsert",
+    storylet: {
+      id: "st_dock_ambush",
+      title: "运河夜袭",
+      triggerPrompt: "码头暗桩突然发难",
+      status: "armed",
+      createdTurn: 1,
+      gate: { requiredFlags: ["未达成标记"] },
+    },
+  });
+  const card = compileCharacterCard(
+    { spec: "chara_card_v2", data: { name: "柳春娘", description: "运河游医", scenario: "运河码头", first_mes: "请坐。" } },
+    "v2",
+  );
+  const z3 = buildZone3TransientTail({ card, state: st, recalledLore: [], recentText: "运河码头 提灯先生 夜袭" });
+  assert.ok(z3.includes("[STORYLET READY id=\"st_dock_ambush\"]"), "Soft-hybrid storylet must fire organically");
+  assert.ok(z3.includes("[CONSEQUENCE ECHO id="), "Consequence echo must surface when entity re-enters");
 });

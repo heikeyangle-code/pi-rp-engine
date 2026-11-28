@@ -145,6 +145,8 @@ export function createInitialRpState(): SessionRpState {
     memoryBooks: new Map(),
     storylets: new Map(),
     foresights: new Map(),
+    consequences: new Map(),
+    objectiveUpdatedTurn: 0,
     notes: [],
     hiddenEntryIds: new Set<string>(),
     hiddenFingerprints: new Set<string>(),
@@ -369,6 +371,7 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
         state.lastMeaningfulProgressTurn = state.turn;
       }
       state.sceneObjective = tx.objective;
+      state.objectiveUpdatedTurn = state.turn;
       break;
 
     case "flag_set": {
@@ -749,6 +752,20 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
     case "storylet_delete":
       state.storylets.delete(tx.storyletId);
       break;
+
+    case "consequence_upsert": {
+      const prev = state.consequences.get(tx.echo.id);
+      state.consequences.set(tx.echo.id, { ...tx.echo });
+      if (!isUndoTx(tx)) {
+        state.lastMeaningfulProgressTurn = state.turn;
+        pushAudit(state, {
+          summary: `因果回响(${tx.echo.status === "resolved" ? "已兑现" : tx.echo.weight}): ${tx.echo.choice.slice(0, 22)}`,
+          source: state.settlementMode === "tool-assisted" ? "tool" : "sidecar",
+          undoTx: prev ? ({ kind: "consequence_upsert", echo: prev, reason: "undo" } as RpTxEntry) : undefined,
+        });
+      }
+      break;
+    }
 
     case "foresight_upsert": {
       const prevHook = state.foresights.get(tx.hook.id);

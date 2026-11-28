@@ -99,6 +99,11 @@ function buildEngineProtocol(activeToolNames?: string[]): string {
   if (toolHints.length > 0) {
     lines.push(`- Active tools (skip on pure casual chat, invoke promptly when triggered): ${toolHints.join("; ")}.`);
   }
+  if (hasWriteTools) {
+    lines.push(
+      "- Prose-first zero-interruption sync: Write uninterrupted literary prose FIRST. Whenever location, present NPCs, time, stage, scene objective, stats, items, flags, clocks, facts, beliefs, foresights, physical state, or major choice consequences change, append a compact `[[RP_DELTA]]...[[/RP_DELTA]]` block at the very end (stripped from display; omit on pure banter turns). Keys: `loc: 地点 | NPC1, NPC2`, `time:`, `stage:`, `obj:`, `stat: 角色.键 +N`, `inv: player.物 ±N`, `flag: 键=true`, `clock: ID +1`, `storylet_done: ID`, `fact: 内容 [witness: ...]`, `fact_off: ID`, `belief: A->B: 信念 | 诱因`, `hook: 伏笔 | 提示`, `hook_done: ID`, `echo: 选择 -> 潜在后果 [weight: high]`, `phys: 角色 | outfit=... | pose=... | held=...`.",
+    );
+  }
   if (!hasWriteTools) {
     lines.push("- World state bookkeeping runs silently in the background; NEVER output raw XML/JSON state tags or status widgets.");
   }
@@ -487,8 +492,55 @@ export function buildZone3TransientTail(options: {
   const activeStoryletsForBeat = evaluateActiveStorylets(state);
   for (const st of activeStoryletsForBeat.slice(0, 2)) {
     dramaBeats.push(
-      `[STORYLET id="${st.id}"] ${st.title}: ${st.triggerPrompt} (Once played out, pass completed_storylets: ["${st.id}"] in rp_state_patch)`,
+      `[STORYLET id="${st.id}"] ${st.title}: ${st.triggerPrompt} (Once played out, record \`storylet_done: ${st.id}\` in [[RP_DELTA]])`,
     );
+  }
+  // Soft + Hard Hybrid Storylet Director (Drama Llama / Magnet)
+  if (activeStoryletsForBeat.length === 0 && state.storylets.size > 0 && state.turn >= 4) {
+    const recentLow = (recentText ?? "").toLowerCase();
+    const locLow = (state.location ?? "").toLowerCase();
+    let bestSoft: { st: StoryletEntry; score: number } | null = null;
+    for (const st of state.storylets.values()) {
+      if (st.status !== "armed") continue;
+      if (st.gate?.minTurn !== undefined && state.turn < st.gate.minTurn) continue;
+      if (st.gate?.forbiddenFlags?.some((f) => Boolean(state.flags[f]))) continue;
+      let score = 0;
+      if (state.turn >= 18) score += 40;
+      else if (state.turn >= 12) score += 30;
+      else if (state.turn >= 6) score += 18;
+      const keywords = `${st.title} ${st.triggerPrompt}`.match(/[\u4e00-\u9fff]{2,4}|[a-zA-Z]{4,}/g) ?? [];
+      let hits = 0;
+      for (const kw of keywords.slice(0, 12)) {
+        const kl = kw.toLowerCase();
+        if (recentLow.includes(kl) || locLow.includes(kl)) hits += 1;
+      }
+      score += Math.min(45, hits * 15);
+      if (st.gate?.requiredFlags?.some((f) => Boolean(state.flags[f]))) score += 20;
+      if (score >= 55 && (!bestSoft || score > bestSoft.score)) {
+        bestSoft = { st, score };
+      }
+    }
+    if (bestSoft) {
+      dramaBeats.push(
+        `[STORYLET READY id="${bestSoft.st.id}"] ${bestSoft.st.title}: ${bestSoft.st.triggerPrompt} (Weave organically when natural; mark \`storylet_done: ${bestSoft.st.id}\` once played out)`,
+      );
+    }
+  }
+  // Choice Consequence Echoes
+  if (state.consequences.size > 0) {
+    const recentLow = `${recentText ?? ""} ${state.location} ${state.presentNpcs.join(" ")}`.toLowerCase();
+    for (const echo of state.consequences.values()) {
+      if (echo.status !== "pending") continue;
+      const age = state.turn - echo.plantedTurn;
+      if (age < 3) continue;
+      const entityHit = echo.entities.some((e) => e && recentLow.includes(e.toLowerCase()));
+      const highWeightDue = echo.weight === "high" && age >= 8;
+      if (entityHit || highWeightDue) {
+        dramaBeats.push(
+          `[CONSEQUENCE ECHO id="${echo.id}" from T${echo.plantedTurn}] Past choice "${echo.choice}" -> ripple: ${echo.consequence} (Mark \`echo_done: ${echo.id}\` once surfaced)`,
+        );
+      }
+    }
   }
   for (const clk of Object.values(state.clocks)) {
     if (clk.completed && (clk.completedTurn === undefined || state.turn - clk.completedTurn <= 1)) {
@@ -852,8 +904,14 @@ export function buildZone3TransientTail(options: {
     spotlightCue = `Spotlight Director: Focus active dialogue and reactions primarily on ${focalNpcs.join(" & ")} this turn; keep other present NPCs brief or reactive rather than taking equal turns.`;
   }
 
+  const staleObjectiveCue =
+    state.sceneObjective && state.turn >= 5 && state.turn - (state.objectiveUpdatedTurn ?? 0) >= 6
+      ? "Scene objective/stage refresh: If the immediate goal or chapter has moved past the recorded scene objective/stage, update `obj:` and `stage:` in [[RP_DELTA]]."
+      : null;
+
   const noteLines = [
     ...(antiGodmodingCue ? [`- ${antiGodmodingCue}`] : []),
+    ...(staleObjectiveCue ? [`- ${staleObjectiveCue}`] : []),
     ...(antiSycophancyCue ? [`- ${antiSycophancyCue}`] : []),
     ...(spotlightCue ? [`- ${spotlightCue}`] : []),
     ...(pointInTimeOverride ? [`- ${pointInTimeOverride}`] : []),

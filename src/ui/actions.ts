@@ -1772,11 +1772,23 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
   }
 
   if (sim) {
+    // Hard-enforce mathematically computed calendar anchor if LLM hallucinated a conflicting reign/year!
+    if (calendarAnchor?.targetEraLabel && sim.worldTimeLabel) {
+      const hasExactYear =
+        sim.worldTimeLabel.includes(calendarAnchor.targetEraLabel) ||
+        sim.worldTimeLabel.includes(String(calendarAnchor.targetYear));
+      if (!hasExactYear) {
+        const seasonTail = /(?:春|夏|秋|冬|正月|腊月|冬月|初春|深秋|盛夏|隆冬|清晨|黄昏|夜)[^（(\s]{0,6}/.exec(sim.worldTimeLabel)?.[0];
+        sim.worldTimeLabel = seasonTail
+          ? `${calendarAnchor.targetEraLabel}·${seasonTail}`
+          : calendarAnchor.targetEraLabel;
+      }
+    }
     const previewLines = [
-      `🕒 新时间：${sim.worldTimeLabel || desc}`,
+      `🕒 新时间：${sim.worldTimeLabel || calendarAnchor?.targetEraLabel || desc}`,
       sim.location ? `📍 新地点：${sim.location}${sim.presentNpcs?.length ? `（在场：${sim.presentNpcs.join("、")}）` : ""}` : null,
       sim.clockDeltas?.length
-        ? `⏳ 时钟推进：${sim.clockDeltas.map((c) => `${c.clockId} +${c.delta}${c.reason ? `（${c.reason}）` : ""}`).join("；")}`
+        ? `⏳ 时钟推进：${sim.clockDeltas.map((c) => `${state.clocks[c.clockId]?.label ?? c.clockId} +${c.delta}${c.reason ? `（${c.reason}）` : ""}`).join("；")}`
         : null,
       ...(sim.offscreenEvents ?? []).map((e) => `${e.public === false ? "🔒 幕后暗流" : "📰 世界变动"}：${e.statement}`),
       sim.openingBeat ? `🎬 切入镜头：${sim.openingBeat}` : null,

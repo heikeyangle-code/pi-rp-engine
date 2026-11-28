@@ -671,6 +671,18 @@ export interface ForesightHook {
   status: "open" | "paid_off" | "expired";
 }
 
+/** First-class Choice Consequence Echo: tracks player decisions that boomerang back 3–30 turns later. */
+export interface ConsequenceEcho {
+  id: string;
+  choice: string;
+  consequence: string;
+  entities: string[];
+  weight: "low" | "medium" | "high";
+  plantedTurn: number;
+  status: "pending" | "echoed" | "resolved";
+  echoedTurn?: number;
+}
+
 export interface DirectorNote {
   id: string;
   text: string;
@@ -860,6 +872,7 @@ export type RpTxEntry =
   | { kind: "storylet_upsert"; storylet: StoryletEntry }
   | { kind: "storylet_delete"; storyletId: string }
   | { kind: "foresight_upsert"; hook: ForesightHook }
+  | { kind: "consequence_upsert"; echo: ConsequenceEcho }
   | {
       kind: "era_advance";
       fromEra: string;
@@ -937,6 +950,8 @@ export interface SessionRpState {
   memoryBooks: Map<string, MemoryBookEntry>;
   storylets: Map<string, StoryletEntry>;
   foresights: Map<string, ForesightHook>;
+  consequences: Map<string, ConsequenceEcho>;
+  objectiveUpdatedTurn: number;
   notes: DirectorNote[];
   hiddenEntryIds: Set<string>;
   hiddenFingerprints: Set<string>;

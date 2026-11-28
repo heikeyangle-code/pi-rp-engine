@@ -8,7 +8,7 @@
  *  - Gracefully falls back to deterministic `buildMemSceneCompactionSummary` when offline or headless.
  */
 
-import type { PiExtensionContext, PiMessage, SessionRpState } from "../types.js";
+import type { MemoryBookEntry, PiExtensionContext, PiMessage, SessionRpState } from "../types.js";
 import { getActiveFacts } from "./bitemporal.js";
 import { canCompleteWithRegistry, completeWithRegistry, resolveSidecarModel } from "../engine/llm-helper.js";
 
@@ -236,4 +236,83 @@ export async function buildSemanticMemSceneCompaction(
   }
 
   return buildMemSceneCompactionSummary(state, options);
+}
+
+/**
+ * Automatic Episodic -> Semantic Scene Consolidation (zero extra LLM cost).
+ * Fires when a scene location shifts after >=5 turns, story era/stage advances,
+ * or 12+ turns have elapsed since the last archived Memory Book chapter.
+ */
+export function maybeBuildAutoSceneChapter(
+  state: SessionRpState,
+  prevLocation: string,
+  prevEra: string,
+): MemoryBookEntry | null {
+  if (!state.active || state.turn < 5) return null;
+
+  let lastEndTurn = 0;
+  for (const ch of state.memoryBooks.values()) {
+    if (ch.turnRange[1] > lastEndTurn) lastEndTurn = ch.turnRange[1];
+  }
+  const span = state.turn - lastEndTurn;
+  if (span < 5) return null;
+
+  const locationShifted = Boolean(prevLocation && state.location && prevLocation !== state.location);
+  const eraShifted = Boolean(prevEra && state.era && prevEra !== state.era);
+  const periodicDue = span >= 12;
+
+  if (!locationShifted && !eraShifted && !periodicDue) return null;
+
+  const startTurn = Math.max(1, lastEndTurn + 1);
+  const endTurn = state.turn;
+  const chapterNum = state.memoryBooks.size + 1;
+  const label = (prevLocation || state.location || prevEra || state.era || "剧情片段")
+    .replace(/[（(][^）)]*[）)]/g, "")
+    .trim()
+    .slice(0, 18);
+
+  const sliceFacts = Array.from(state.facts.values())
+    .filter((f) => f.validFromTurn >= startTurn && f.validFromTurn <= endTurn)
+    .slice(-5)
+    .map((f) => f.statement);
+  const sliceAudit = state.auditLog
+    .filter((a) => a.turn >= startTurn && a.turn <= endTurn)
+    .slice(-6)
+    .map((a) => a.summary);
+  const sliceHooks = Array.from(state.foresights.values())
+    .filter((h) => h.status === "open" && h.plantedTurn >= startTurn)
+    .slice(-3)
+    .map((h) => `伏笔：${h.summary}`);
+  const sliceEchoes = Array.from(state.consequences.values())
+    .filter((e) => e.status === "pending" && e.plantedTurn >= startTurn)
+    .slice(-3)
+    .map((e) => `因果：${e.choice} → ${e.consequence}`);
+
+  const bullets = [...sliceFacts, ...sliceHooks, ...sliceEchoes];
+  if (bullets.length === 0 && sliceAudit.length > 0) {
+    bullets.push(...sliceAudit.slice(0, 4));
+  }
+  if (bullets.length === 0) {
+    bullets.push(`在「${label}」经历了第 ${startTurn}–${endTurn} 轮的剧情推进（时间：${state.worldTimeLabel || "未知"}）。`);
+  }
+
+  const entities = Array.from(
+    new Set([
+      ...state.presentNpcs,
+      ...(prevLocation ? [prevLocation.replace(/[（(][^）)]*[）)]/g, "").trim()] : []),
+      ...(state.location ? [state.location.replace(/[（(][^）)]*[）)]/g, "").trim()] : []),
+    ].filter(Boolean)),
+  ).slice(0, 8);
+
+  return {
+    id: `mb_auto_t${startTurn}_${endTurn}`,
+    title: `第 ${chapterNum} 幕 · ${label}`,
+    summary: bullets.map((b) => `- ${b}`).join("\n"),
+    entities,
+    keywords: entities,
+    turnRange: [startTurn, endTurn],
+    enabled: true,
+    pinned: false,
+    createdTurn: endTurn,
+  };
 }

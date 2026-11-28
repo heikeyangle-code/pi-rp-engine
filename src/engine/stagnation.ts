@@ -229,10 +229,14 @@ export function evaluateNarrativeHealth(
       ? "Anti-repetition cue: Recent narration shows high phrasing overlap. Vary sentence rhythm, avoid repeating prior gestures/metaphors, and move the immediate beat forward with fresh concrete action or dialogue."
       : null;
 
-  // 2. Real plot-stagnation detection (only on plot-driven cards when pacing is balanced/dramatic and settlement is active)
+  // 2. Real plot-stagnation detection: NEVER false-alarm when prose is fresh & moving forward!
+  // Only warn when BOTH state is unchanged AND prose overlap is rising (>=0.30 for >=6 turns), OR >=10 turns with zero state shift.
   const isPlotDriven = state.archetype !== "companion" && state.archetype !== "slice-of-life";
+  const isTrulyStagnant =
+    (stagnantTurns >= 6 && repetitionScore >= 0.30) ||
+    stagnantTurns >= 10;
   const antiStagnationCue =
-    state.settlementMode !== "off" && isPlotDriven && state.pacingMode !== "relaxed" && state.turn >= 4 && stagnantTurns >= 4
+    state.settlementMode !== "off" && isPlotDriven && state.pacingMode !== "relaxed" && state.turn >= 6 && isTrulyStagnant
       ? `Anti-stagnation cue: ${stagnantTurns} turns have elapsed with no concrete world shift. Surface an organic complication, subtle clue, NPC initiative, or consequence tied to the current scene objective.`
       : null;
 

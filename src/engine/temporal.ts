@@ -285,23 +285,34 @@ export function computeCalendarAnchor(
   if (!label || wholeYears === 0) return null;
 
   // 1. Chinese imperial reign year (e.g. "崇祯七年", "康熙53年", "乾隆元年")
-  for (const era of CHINESE_ERAS) {
-    const re = new RegExp(`${era.name}\\s*(${NUM_TOKEN})\\s*年`);
-    const m = re.exec(label);
-    if (m) {
-      const regnal = parseFlexNumber(m[1] ?? "");
-      if (regnal && regnal >= 1 && regnal <= 100) {
-        const sourceYear = era.startYear + Math.round(regnal) - 1;
-        const targetYear = sourceYear + wholeYears;
-        const targetEraLabel = formatYearInChineseEras(targetYear);
-        return {
-          system: "chinese_era",
-          sourceYear,
-          targetYear,
-          targetEraLabel,
-          exactHint: `Exact calendar math: ${era.name}${m[1]}年 = ${sourceYear} CE; +${wholeYears} years = ${targetEraLabel}. Do NOT invent a different year or era.`,
-        };
+  // Strip parenthetical comparative notes like "（距崇祯七年整八十年）" first, and pick the earliest match by index!
+  const primaryLabel = label.replace(/[（(][^）)]*[）)]/g, " ").trim() || label;
+  const searchCandidates = primaryLabel !== label ? [primaryLabel, label] : [label];
+  for (const candidate of searchCandidates) {
+    let best: { idx: number; eraName: string; rawNum: string; startYear: number; regnal: number } | null = null;
+    for (const era of CHINESE_ERAS) {
+      const re = new RegExp(`${era.name}\\s*(${NUM_TOKEN})\\s*年`);
+      const m = re.exec(candidate);
+      if (m) {
+        const regnal = parseFlexNumber(m[1] ?? "");
+        if (regnal && regnal >= 1 && regnal <= 100) {
+          if (!best || m.index < best.idx) {
+            best = { idx: m.index, eraName: era.name, rawNum: m[1]!, startYear: era.startYear, regnal };
+          }
+        }
       }
+    }
+    if (best) {
+      const sourceYear = best.startYear + Math.round(best.regnal) - 1;
+      const targetYear = sourceYear + wholeYears;
+      const targetEraLabel = formatYearInChineseEras(targetYear);
+      return {
+        system: "chinese_era",
+        sourceYear,
+        targetYear,
+        targetEraLabel,
+        exactHint: `Exact calendar math: ${best.eraName}${best.rawNum}年 = ${sourceYear} CE; +${wholeYears} years = ${targetEraLabel}. Do NOT invent a different year or era.`,
+      };
     }
   }
 

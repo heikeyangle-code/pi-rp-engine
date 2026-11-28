@@ -2004,21 +2004,21 @@ export async function openRpDashboard(
     }
     const card = rt.getCard();
     const openHooks = Array.from(s.foresights.values()).filter((h) => h.status === "open").length;
+    const pendingEchoes = Array.from(s.consequences.values()).filter((e) => e.status === "pending").length;
     const activeFactsList = getActiveFacts(s);
     const title = `◆ ${[card?.identity.name ?? s.cardSlug ?? "RP", s.era, s.worldTimeLabel, `T${s.turn}`].filter(Boolean).join(" · ")}`;
     const activeFlagsCount = Object.values(s.flags).filter(Boolean).length;
     const lastUndoable = s.auditLog.filter((r) => Boolean(r.undoTx)).at(-1);
-    const locShort = clipChars(s.location || "未设定", 12);
+    const locShort = clipChars((s.location || "未设定").replace(/[（(][^）)]*[）)]/g, "").trim() || "未设定", 12);
     const personaShort = clipChars(s.currentPersona.name, 12);
     const choice = await ctx.ui.select(title, [
       `1. 📋 本局动态（变更 ${s.auditLog.length} · 事实 ${activeFactsList.length} · 伏笔 ${openHooks}${activeFlagsCount ? ` · 标记 ${activeFlagsCount}` : ""}）`,
       `2. 📍 场景与世界（${locShort} · 时钟 ${Object.keys(s.clocks).length}）`,
       `3. 👥 人物与关系（马甲：${personaShort}）`,
-      `4. 📖 记忆与世界书（事实 ${activeFactsList.length} · 世界书 ${getAllLore(rt).length}）`,
+      `4. 📖 记忆与世界书（事实 ${activeFactsList.length} · 因果 ${pendingEchoes} · 书 ${getAllLore(rt).length}）`,
       `5. 🎬 导演台与设置（节奏：${PACING_ZH[s.pacingMode]} · 风格 · 存档）`,
       ...(lastUndoable ? [`↩ 撤销上次变更（${clipChars(formatUndoSummary(lastUndoable.summary), 20)}）`] : []),
-      "6. 🚪 退出本会话 RP 模式",
-      "✕ 关闭面板",
+      "6. 🚪 退出本会话角色扮演",
     ]);
 
     if (!choice || choice.startsWith("✕")) return;

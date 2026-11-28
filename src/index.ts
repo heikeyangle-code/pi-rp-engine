@@ -38,7 +38,8 @@ import { RP_ENTRY_TYPE, applyRpTx, computeMessageFingerprint, createInitialRpSta
 import { loadCompiledCard, loadCompiledPreset, resolveCardBySlug } from "./storage/workspace-store.js";
 import { recallLoreWithGraphPpr, recallMemoryBooks } from "./memory/graph-ppr.js";
 import { type HistoryRecallCooldown, createTurnRecallScope } from "./memory/history-recall.js";
-import { buildSemanticMemSceneCompaction } from "./memory/compaction.js";
+import { buildSemanticMemSceneCompaction, maybeBuildAutoSceneChapter } from "./memory/compaction.js";
+import { extractInlineDelta, parseAndValidateInlineDelta, stripInlineDelta } from "./engine/inline-delta.js";
 import { getActiveFacts } from "./memory/bitemporal.js";
 import { evaluateNarrativeHealth } from "./engine/stagnation.js";
 import { estimateTokens } from "./context/token-budget.js";
@@ -700,8 +701,30 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       narrativeHealth,
     });
 
+    const cleanedMessages: PiMessage[] = messages.map((m) => {
+      if (m.role !== "assistant") return m;
+      if (typeof m.content === "string") {
+        const stripped = stripInlineDelta(m.content);
+        return stripped === m.content ? m : { ...m, content: stripped };
+      }
+      if (Array.isArray(m.content)) {
+        let changed = false;
+        const blocks = m.content.map((b) => {
+          if (b && b.type === "text" && typeof b.text === "string") {
+            const s = stripInlineDelta(b.text);
+            if (s !== b.text) {
+              changed = true;
+              return { ...b, text: s };
+            }
+          }
+          return b;
+        });
+        return changed ? { ...m, content: blocks } : m;
+      }
+      return m;
+    });
     const outMessages = attachZone3ToMessages(
-      messages,
+      cleanedMessages,
       zone3,
       state.hiddenEntryIds,
       state.hiddenFingerprints,
@@ -990,6 +1013,21 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       commitTx({ kind: "hide_toggle", entryIds: Array.from(new Set(hideIds)), fingerprints: Array.from(new Set(hideFps)), hidden: true });
     }
 
+    const prevLocBeforeDelta = state.location;
+    const prevEraBeforeDelta = state.era;
+
+    // Single-model zero-RTT inline delta sync (`[[RP_DELTA]]...[[/RP_DELTA]]`)
+    if (!thisTurnOoc && lastAssistantText) {
+      const { cleanProse, rawBlock } = extractInlineDelta(lastAssistantText);
+      if (rawBlock) {
+        lastAssistantText = cleanProse;
+        const parsedDelta = parseAndValidateInlineDelta(rawBlock, state);
+        for (const dtx of parsedDelta.txs) {
+          commitTx(dtx);
+        }
+      }
+    }
+
     runDeterministicTurnSettlement({
       pi,
       allLoreEntries: getAllActiveLoreEntries(),
@@ -997,6 +1035,14 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       isOocTurn: thisTurnOoc,
       pendingLoreRuntime,
     });
+
+    // Automatic Episodic -> Semantic Scene Consolidation (zero LLM cost)
+    if (!thisTurnOoc) {
+      const autoChapter = maybeBuildAutoSceneChapter(state, prevLocBeforeDelta, prevEraBeforeDelta);
+      if (autoChapter) {
+        commitTx({ kind: "memory_book_upsert", entry: autoChapter });
+      }
+    }
 
     isOocTurn = false;
     pendingLoreRuntime = null;
