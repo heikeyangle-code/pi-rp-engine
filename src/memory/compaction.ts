@@ -130,7 +130,7 @@ export function buildMemSceneCompactionSummary(
   );
 
   if (options?.previousSummary?.trim()) {
-    lines.push(`## 更早幕次脉络\n${options.previousSummary.trim().slice(0, 1200)}`);
+    lines.push(`## 更早幕次脉络\n${options.previousSummary.trim().slice(0, 3200)}`);
   }
 
   const beats = options?.droppedMessagesSummary?.trim() || condenseMessagesToBeats(options?.messagesToSummarize);
@@ -170,7 +170,7 @@ export async function buildSemanticMemSceneCompaction(
     const clean = stripCompactionNoise(extractMessagePlainText(m));
     if (!clean) continue;
     const speaker = m.role === "user" ? state.currentPersona.name : "叙事";
-    allSnippets.push(`[${speaker}] ${clean.slice(0, 420)}`);
+    allSnippets.push(`[${speaker}] ${clean.slice(0, 1200)}`);
   }
 
   if (allSnippets.length === 0) {
@@ -178,8 +178,8 @@ export async function buildSemanticMemSceneCompaction(
   }
 
   // Head + Tail budget allocation (~8000 chars total: 2000 head + 6000 tail) so newest messages are ALWAYS preserved!
-  const TOTAL_BUDGET = 8000;
-  const HEAD_BUDGET = 2000;
+  const TOTAL_BUDGET = 24000;
+  const HEAD_BUDGET = 6000;
   const TAIL_BUDGET = TOTAL_BUDGET - HEAD_BUDGET;
 
   const totalChars = allSnippets.reduce((sum, s) => sum + s.length, 0);
@@ -217,11 +217,11 @@ export async function buildSemanticMemSceneCompaction(
       systemPrompt:
         "You are a narrative memory archivist compressing roleplay history into an EverMemOS MemScene summary. " +
         "Preserve: (1) concrete plot events in chronological order, (2) emotional/relationship turning points and character subtext, " +
-        "(3) promises, secrets, clues, and unresolved tensions. Match the story's language. Be dense and accurate (max 380 Chinese chars or 220 English words). Output ONLY the summary bullets.",
+        "(3) promises, secrets, clues, and unresolved tensions. Match the story's language. Be dense and accurate (max 900 Chinese chars or 500 English words). Output ONLY the summary bullets.",
       userPrompt:
-        (options?.previousSummary ? `Prior Arc:\n${options.previousSummary.slice(0, 800)}\n\n` : "") +
+        (options?.previousSummary ? `Prior Arc:\n${options.previousSummary.slice(0, 2400)}\n\n` : "") +
         `Transcript to compress:\n${lines.join("\n")}`,
-      maxTokens: 520,
+      maxTokens: 1500,
       signal: options?.signal ?? ctx.signal,
     });
 
@@ -247,6 +247,7 @@ export function maybeBuildAutoSceneChapter(
   state: SessionRpState,
   prevLocation: string,
   prevEra: string,
+  recentProseHighlight?: string,
 ): MemoryBookEntry | null {
   if (!state.active || state.turn < 5) return null;
 
@@ -291,6 +292,9 @@ export function maybeBuildAutoSceneChapter(
   const bullets = [...sliceFacts, ...sliceHooks, ...sliceEchoes];
   if (bullets.length === 0 && sliceAudit.length > 0) {
     bullets.push(...sliceAudit.slice(0, 4));
+  }
+  if (bullets.length === 0 && recentProseHighlight && recentProseHighlight.trim().length >= 16) {
+    bullets.push(`在「${label}」的关键情节：${recentProseHighlight.replace(/\s+/g, " ").trim().slice(0, 260)}`);
   }
   if (bullets.length === 0) {
     bullets.push(`在「${label}」经历了第 ${startTurn}–${endTurn} 轮的剧情推进（时间：${state.worldTimeLabel || "未知"}）。`);

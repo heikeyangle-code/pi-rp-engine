@@ -3040,14 +3040,17 @@ export async function actionXRay(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     `记忆与隔离: 有效事实 ${xray.activeFactCount} 条 · 认知盲区保护 ${xray.blindSpotCount} 处 · 激活剧情卡 ${xray.activeStoryletTitles.length} 张`,
   ];
 
+  if (xray.aliasExpansions && xray.aliasExpansions.length > 0) {
+    lines.push(`别名与指代展开: ${xray.aliasExpansions.slice(0, 8).join(" · ")}`);
+  }
   if (xray.activeStoryletTitles.length > 0) {
-    lines.push(`触发 Storylets: ${xray.activeStoryletTitles.join("、")}`);
+    lines.push(`触发剧情卡: ${xray.activeStoryletTitles.join("、")}`);
   }
 
   if (xray.recalled.length > 0) {
     lines.push("", `【本轮召回条目 (${xray.recalled.length})】`);
     for (const r of xray.recalled) {
-      const src = r.source === "memory_book" ? "记忆书" : "世界书";
+      const src = r.source === "memory_book" ? "记忆书" : r.source === "card_knowledge" ? "卡体知识" : "世界书";
       const key = r.matchedKey ? ` 命中="${r.matchedKey}"` : "";
       lines.push(`· [${src}/${r.reason}] ${r.title}${key} (分:${r.score} · ~${r.tokens}t)`);
     }

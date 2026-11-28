@@ -241,17 +241,17 @@ Strict Quality Rules:
 7. SPOILER LORE GATES: Only gate lorebook entries that contain genuine late-game twists, secret identities, or sealed truths.
 8. LANGUAGE: Write all extracted labels, beliefs, facts, foresights, and storylets in the primary language of the character card.`;
 
-  // Prioritize constant, high-priority, and spoiler-candidate entries up to 140 entries within a smart budget
+  // Modern flagship budget: inspect up to 300 lorebook entries within 32,000 chars
   const prioritizedLore = [...card.loreBook.entries]
     .sort((a, b) => Number(b.constant) - Number(a.constant) || b.priority - a.priority)
-    .slice(0, 140);
+    .slice(0, 300);
 
   let loreChars = 0;
-  const maxLoreChars = 9000;
+  const maxLoreChars = 32000;
   const loreLines: string[] = [];
   for (const e of prioritizedLore) {
-    const excerptLen = e.constant ? 240 : 140;
-    const line = `- id="${e.id}" title="${e.title}" keys=[${e.keys.slice(0, 6).join(", ")}] constant=${e.constant}: ${e.content
+    const excerptLen = e.constant ? 480 : 280;
+    const line = `- id="${e.id}" title="${e.title}" keys=[${e.keys.slice(0, 8).join(", ")}] constant=${e.constant}: ${e.content
       .replace(/\s+/g, " ")
       .slice(0, excerptLen)}`;
     if (loreChars + line.length > maxLoreChars) break;
@@ -262,7 +262,7 @@ Strict Quality Rules:
   const salvagedSummary =
     card.salvagedStateSchema.length > 0
       ? card.salvagedStateSchema
-          .slice(0, 40)
+          .slice(0, 80)
           .map(
             (v) =>
               `- [${v.actorId ?? card.identity.name}] (${v.category ?? "stat"}) ${v.key} = ${JSON.stringify(v.initialValue)}${
@@ -275,18 +275,41 @@ Strict Quality Rules:
   const altGreetingsSummary =
     card.greetings.alternates.length > 0
       ? card.greetings.alternates
-          .slice(0, 3)
-          .map((g, i) => `Alt Greeting #${i + 1}: ${g.replace(/\s+/g, " ").slice(0, 500)}`)
+          .slice(0, 6)
+          .map((g, i) => `Alt Greeting #${i + 1}: ${g.replace(/\s+/g, " ").slice(0, 1500)}`)
           .join("\n")
       : "";
+
+  // Generous modern description budget (60,000 chars); for 60K-500K+ giant cards, sample Head (24K) + Middle (20K) + Tail (16K) + Full TOC/Entities!
+  const rawDesc = card.frozen.description || "";
+  let descPayload = "";
+  if (rawDesc.length <= 60000) {
+    descPayload = rawDesc;
+  } else {
+    const headPart = rawDesc.slice(0, 24000);
+    const midStart = Math.max(24000, Math.floor(rawDesc.length / 2) - 10000);
+    const midPart = rawDesc.slice(midStart, midStart + 20000);
+    const tailPart = rawDesc.slice(Math.max(midStart + 20000, rawDesc.length - 16000));
+    const ki = card.knowledgeIndex;
+    const tocSummary = ki
+      ? `\n[Full Card Chapters (${ki.chapters.length}): ${ki.chapters.slice(0, 60).map((c) => c.path).join(" | ")}]` +
+        (ki.entities.length > 0
+          ? `\n[Detected Entities & Aliases (${ki.entities.length}): ${ki.entities
+              .slice(0, 80)
+              .map((e) => (e.aliases.length ? `${e.canonical}(${e.aliases.join("/")})` : e.canonical))
+              .join("、")}]`
+          : "")
+      : "";
+    descPayload = `${headPart}\n\n[... 中段关键章节采样 @${Math.round(midStart / 1000)}K ...]\n${midPart}\n\n[... 尾卷关键章节采样 @${Math.round((rawDesc.length - 16000) / 1000)}K ...]\n${tailPart}${tocSummary}`;
+  }
 
   const userPrompt = [
     `Card Name: ${card.identity.name}${card.identity.nickname ? ` (nickname: ${card.identity.nickname})` : ""}`,
     card.meta.tags.length ? `Tags: ${card.meta.tags.join(", ")}` : "",
-    card.frozen.description ? `Description:\n${card.frozen.description.slice(0, 5500)}` : "",
-    card.frozen.personality ? `Personality:\n${card.frozen.personality.slice(0, 2200)}` : "",
-    card.frozen.scenario ? `Scenario:\n${card.frozen.scenario.slice(0, 2600)}` : "",
-    card.greetings.firstMes ? `First Message:\n${card.greetings.firstMes.slice(0, 3200)}` : "",
+    descPayload ? `Description (${rawDesc.length} chars total):\n${descPayload}` : "",
+    card.frozen.personality ? `Personality:\n${card.frozen.personality.slice(0, 12000)}` : "",
+    card.frozen.scenario ? `Scenario:\n${card.frozen.scenario.slice(0, 12000)}` : "",
+    card.greetings.firstMes ? `First Message:\n${card.greetings.firstMes.slice(0, 12000)}` : "",
     altGreetingsSummary ? `Alternate Greetings Preview:\n${altGreetingsSummary}` : "",
     salvagedSummary ? `Already Extracted L0 Variables (${card.salvagedStateSchema.length} total):\n${salvagedSummary}` : "",
     loreLines.length > 0 ? `Lorebook Entries (${loreLines.length}/${card.loreBook.entries.length} shown):\n${loreLines.join("\n")}` : "",
@@ -694,7 +717,7 @@ export async function analyzeCardWithModel(
   const raw = await completeWithRegistry(ctx, model, {
     systemPrompt,
     userPrompt,
-    maxTokens: 4096,
+    maxTokens: 8192,
     signal: ctx.signal,
   });
   return parseAnalyzeResponse(raw, card);

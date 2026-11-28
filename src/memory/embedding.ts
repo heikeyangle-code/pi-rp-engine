@@ -1,30 +1,65 @@
 /**
- * Optional Zero-Dependency Hybrid Semantic Embedding Recall (BM25 + Cosine Vector RRF).
- *
- * Bridges the lexical-semantic gap highlighted in MRBench (2026) & KDD 2026 RoleplayAgent Survey
- * (e.g. metaphors, paraphrases, and indirect references with zero keyword overlap).
- *
- * - Works with ANY OpenAI-compatible `/v1/embeddings` endpoint (OpenAI, SiliconFlow, local Ollama).
- * - Strict 3.5s timeout + graceful silent fallback to pure BM25 when disabled or unreachable.
- * - Content-hashed Float32Array LRU vector cache avoids re-embedding unchanged rounds or lore entries.
+ * Optional Zero-Dependency Hybrid Semantic Embedding Recall (BM25 + Cosine Vector RRF)
+ * with Disk-Backed LRU Vector Cache & Zero-Blocking Cached Auto-Recall Channel.
  */
 
 import { createHash } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { EmbeddingConfig } from "../types.js";
 
-const MAX_CACHE_ENTRIES = 2048;
+const MAX_CACHE_ENTRIES = 4096;
 const EMBEDDING_BATCH_SIZE = 32;
 const vectorCache = new Map<string, Float32Array>();
+let diskCacheLoaded = false;
+
+function getDefaultCachePath(): string {
+  const agentDir = process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent");
+  return path.join(agentDir, "rp-library", "vector-cache.json");
+}
 
 function cacheKey(endpoint: string, model: string, text: string): string {
   const hash = createHash("sha1").update(text, "utf8").digest("hex").slice(0, 16);
   return `${endpoint}|${model}|${hash}`;
 }
 
+export function loadVectorCacheFromDisk(filePath = getDefaultCachePath()): void {
+  if (diskCacheLoaded) return;
+  diskCacheLoaded = true;
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const raw = JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, number[]>;
+    if (!raw || typeof raw !== "object") return;
+    for (const [k, arr] of Object.entries(raw)) {
+      if (Array.isArray(arr) && arr.length > 0) {
+        vectorCache.set(k, Float32Array.from(arr));
+      }
+    }
+  } catch {
+    // Non-fatal
+  }
+}
+
+export function saveVectorCacheToDisk(filePath = getDefaultCachePath()): void {
+  try {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const obj: Record<string, number[]> = {};
+    let count = 0;
+    for (const [k, vec] of vectorCache.entries()) {
+      obj[k] = Array.from(vec);
+      if (++count >= MAX_CACHE_ENTRIES) break;
+    }
+    fs.writeFileSync(filePath, JSON.stringify(obj), "utf8");
+  } catch {
+    // Non-fatal
+  }
+}
+
 function lruGet(key: string): Float32Array | undefined {
+  loadVectorCacheFromDisk();
   const hit = vectorCache.get(key);
   if (!hit) return undefined;
-  // Promote to most-recently-used position
   vectorCache.delete(key);
   vectorCache.set(key, hit);
   return hit;
@@ -59,8 +94,7 @@ export function cosineSimilarity(a: Float32Array | number[], b: Float32Array | n
 }
 
 /**
- * Reciprocal Rank Fusion (RRF, k=60): fuses BM25 ranked IDs and semantic vector ranked IDs
- * into a unified ranking without needing fragile score-scale calibration.
+ * Reciprocal Rank Fusion (RRF, k=60): fuses two ranked ID lists without fragile score calibration.
  */
 export function reciprocalRankFusion<T extends string | number>(
   bm25Ranked: T[],
@@ -80,14 +114,46 @@ export function reciprocalRankFusion<T extends string | number>(
 }
 
 /**
- * Batch-embed texts via an OpenAI-compatible `/embeddings` endpoint with LRU content caching
- * and automatic 32-text chunking.
- * Returns null cleanly if config is disabled, invalid, timed out, or errored.
+ * Synchronous zero-blocking semantic ranking using already-cached vectors
+ * (allows automatic per-turn recall to fuse semantic RRF with 0 network wait when cache is warm).
+ */
+export function getCachedSemanticRanking(
+  config: EmbeddingConfig | undefined,
+  query: string,
+  documents: string[],
+  minSimilarity = 0.30,
+): Array<{ index: number; similarity: number }> | null {
+  if (!config?.enabled || !config.endpoint.trim() || !config.model.trim() || !query.trim() || documents.length === 0) {
+    return null;
+  }
+  const endpoint = config.endpoint.trim();
+  const model = config.model.trim();
+  const qVec = lruGet(cacheKey(endpoint, model, query.trim().slice(0, 1800)));
+  if (!qVec) return null;
+
+  const scored: Array<{ index: number; similarity: number }> = [];
+  for (let i = 0; i < documents.length; i++) {
+    const trimmed = (documents[i] ?? "").trim().slice(0, 1800);
+    if (!trimmed) continue;
+    const dVec = lruGet(cacheKey(endpoint, model, trimmed));
+    if (!dVec) continue;
+    const sim = cosineSimilarity(qVec, dVec);
+    if (sim >= minSimilarity) {
+      scored.push({ index: i, similarity: sim });
+    }
+  }
+  if (scored.length === 0) return null;
+  scored.sort((a, b) => b.similarity - a.similarity);
+  return scored;
+}
+
+/**
+ * Batch-embed texts via an OpenAI-compatible `/embeddings` endpoint with persistent LRU content caching.
  */
 export async function embedTexts(
   config: EmbeddingConfig | undefined,
   texts: string[],
-  timeoutMs = 3500,
+  timeoutMs = 5000,
 ): Promise<Array<Float32Array | null> | null> {
   if (!config?.enabled || !config.endpoint.trim() || !config.model.trim() || texts.length === 0) {
     return null;
@@ -116,6 +182,7 @@ export async function embedTexts(
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let wroteNew = false;
   try {
     const headers: Record<string, string> = { "Content-Type": "application/json" };
     if (config.apiKey?.trim()) {
@@ -137,7 +204,7 @@ export async function embedTexts(
       };
       if (!Array.isArray(json?.data)) return null;
 
-      const rows: Array<{ index?: number; embedding?: number[] }> = json.data;
+      const rows = json.data;
       for (let j = 0; j < rows.length; j++) {
         const row = rows[j];
         if (!row || !Array.isArray(row.embedding) || row.embedding.length === 0) continue;
@@ -148,8 +215,10 @@ export async function embedTexts(
         const vec = Float32Array.from(row.embedding);
         results[origIdx] = vec;
         lruSet(cacheKey(endpoint, model, text), vec);
+        wroteNew = true;
       }
     }
+    if (wroteNew) saveVectorCacheToDisk();
     return results;
   } catch {
     return null;

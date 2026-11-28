@@ -32,7 +32,9 @@ import { getActiveFacts } from "../memory/bitemporal.js";
 import { evaluateGate, partitionEpistemicFacts } from "../engine/gates.js";
 import { canonicalizeActorName, isNonCharacterEntity } from "../engine/entity-hygiene.js";
 import { evaluateActiveStorylets } from "../context/zone-builder.js";
-import { compileLoreBook } from "../parser/lore-compiler.js";
+import { compileLoreBook, extractEntryEntities } from "../parser/lore-compiler.js";
+import { recallCardKnowledge } from "../parser/card-knowledge.js";
+import { buildEntityRegistry } from "../memory/entity-registry.js";
 import { saveUpdatedCard } from "../storage/workspace-store.js";
 import { renderProgressBar } from "./renderers.js";
 import { RP_SHORTCUT_LIST } from "./shortcuts.js";
@@ -1662,6 +1664,117 @@ export async function openMemoryBookSection(rt: DashboardRuntime, ctx: PiExtensi
 // ---------------------------------------------------------------------------
 // 4. 世界书完整 CRUD 管理（查看全文 / 编辑标题触发词正文 / 手动新增 / AI 生成 / 删除）
 // ---------------------------------------------------------------------------
+
+export async function openCardKnowledgeInspector(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
+  while (true) {
+    const card = rt.getCard();
+    const s = rt.getState();
+    if (!card) return;
+    const ki = card.knowledgeIndex;
+    if (!ki) {
+      ctx.ui.notify("当前角色卡尚未建立知识库索引。", "info");
+      return;
+    }
+    const modeLabel = ki.dualTrackActive
+      ? card.forceFullZone1
+        ? "强制全文常驻（用户覆写）"
+        : `自动双轨（骨架常驻 + ${ki.passages.length} 片段按需原文召回）`
+      : `全文常驻（${ki.totalTokens}t ≤ ${ki.directTokenLimit}t 阈值）`;
+
+    const pick = await ctx.ui.select(
+      `🧠 卡体知识库与实体图谱 · ${card.identity.name}`,
+      [
+        `📊 索引概览：${ki.totalChars} 字 · ~${ki.totalTokens}t · ${ki.chapters.length} 章 · ${ki.entities.length} 实体`,
+        `📑 按章节目录浏览全文（共 ${ki.chapters.length} 章）`,
+        `🔍 全卡原文检索（测试别名与父子块召回）`,
+        `🕸 实体与别名表（共 ${ki.entities.length} 组）`,
+        ...(ki.dualTrackActive
+          ? [card.forceFullZone1 ? "🔄 切回自动双轨模式（推荐大卡）" : "📌 切换为强制全文常驻 Zone 1"]
+          : []),
+        "← 返回上一级",
+      ],
+    );
+    if (!pick || pick.startsWith("←")) return;
+
+    if (pick.startsWith("📊")) {
+      ctx.ui.notify(
+        `模式：${modeLabel}\n正文：${ki.totalChars} 字 (~${ki.totalTokens}t)\n章节：${ki.chapters.length} · 父子片段：${ki.passages.length} · 实体：${ki.entities.length}`,
+        "info",
+      );
+      continue;
+    }
+
+    if (pick.startsWith("🔄") || pick.startsWith("📌")) {
+      card.forceFullZone1 = !card.forceFullZone1;
+      if (persistCardSafely(s.worldDir, card, ctx)) {
+        rt.reloadRuntime(ctx);
+      }
+      ctx.ui.notify(`已切换为：${card.forceFullZone1 ? "强制全文常驻 Zone 1" : "自动双轨按需召回"}`, "info");
+      continue;
+    }
+
+    if (pick.startsWith("📑")) {
+      const chOpts = ki.chapters
+        .slice(0, 80)
+        .map((ch, idx) => `${idx + 1}. ${ch.path} (~${ch.tokens}t)`);
+      const chPick = await ctx.ui.select(`📑 全卡章节目录（${ki.chapters.length} 章）`, [...chOpts, "← 返回上一级"]);
+      if (!chPick || chPick.startsWith("←")) continue;
+      const m = /^(\d+)\./.exec(chPick);
+      const ch = m ? ki.chapters[Number(m[1]) - 1] : undefined;
+      if (ch) {
+        const chPassages = ki.passages.filter((p) => p.chapterId === ch.id);
+        const body = chPassages.map((p) => p.text).join("\n\n");
+        ctx.ui.notify(`【${ch.path}】(~${ch.tokens}t)\n${body.slice(0, 1200)}${body.length > 1200 ? "…" : ""}`, "info");
+      }
+      continue;
+    }
+
+    if (pick.startsWith("🔍")) {
+      const q = (await ctx.ui.input("输入人物名、别名、地点或事件关键词进行全卡检索", ""))?.trim();
+      if (!q) continue;
+      const reg = buildEntityRegistry({ card, extraCastCards: rt.getExtraCastCards(), state: s });
+      const res = recallCardKnowledge({
+        knowledgeIndex: ki,
+        queryText: q,
+        registry: reg,
+        tokenBudget: 3200,
+        maxPassages: 6,
+        isManual: true,
+      });
+      if (res.passages.length === 0) {
+        ctx.ui.notify(`未在全卡知识库中命中与「${q}」相关的片段。`, "warning");
+      } else {
+        const lines = res.passages.map(
+          (p, i) => `${i + 1}. [${p.chapterPath}] (分:${p.score}) ${p.text.replace(/\s+/g, " ").slice(0, 120)}…`,
+        );
+        ctx.ui.notify(`命中 ${res.passages.length} 个原文片段 (~${res.usedTokens}t)：\n${lines.join("\n")}`, "info");
+      }
+      continue;
+    }
+
+    if (pick.startsWith("🕸")) {
+      const entOpts = ki.entities.slice(0, 80).map((e, i) => {
+        const al = e.aliases.length > 0 ? ` [${e.aliases.slice(0, 3).join("/")}]` : "";
+        return `${i + 1}. ${e.canonical}${al} (${e.passageIds.length} 处)`;
+      });
+      const ep = await ctx.ui.select(`🕸 全卡实体与别名表（${ki.entities.length} 组）`, [...entOpts, "← 返回上一级"]);
+      if (!ep || ep.startsWith("←")) continue;
+      const m = /^(\d+)\./.exec(ep);
+      const ent = m ? ki.entities[Number(m[1]) - 1] : undefined;
+      if (ent) {
+        const chNames = ent.chapterIds
+          .map((cid) => ki.chapters.find((c) => c.id === cid)?.path)
+          .filter(Boolean)
+          .slice(0, 6);
+        ctx.ui.notify(
+          `实体：${ent.canonical}\n别名：${ent.aliases.join("、") || "无"}\n出场章节：${chNames.join(" / ") || "无"}`,
+          "info",
+        );
+      }
+    }
+  }
+}
+
 export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionContext): Promise<void> {
   type LoreFilterMode = "all" | "enabled" | "constant" | "gated";
   let searchQuery = "";
@@ -1815,6 +1928,7 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
       const edited = await editLongText(ctx, `世界书全文 · ${entry.title}`, entry.content);
       if (isPrimaryEntry && primaryCard && edited !== undefined && edited.trim() && edited.trim() !== entry.content) {
         entry.content = edited.trim();
+        entry.revision = (entry.revision ?? 1) + 1;
         if (persistCardSafely(s.worldDir, primaryCard, ctx)) {
           rt.reloadRuntime(ctx);
         }
@@ -1827,6 +1941,8 @@ export async function openLoreManager(rt: DashboardRuntime, ctx: PiExtensionCont
       if (nextKeysRaw === undefined) continue;
       entry.title = nextTitleRaw.trim() || entry.title;
       entry.keys = nextKeysRaw.split(/[,，]/).map((x) => x.trim()).filter(Boolean);
+      entry.entities = extractEntryEntities(entry.title, entry.keys);
+      entry.revision = (entry.revision ?? 1) + 1;
       if (persistCardSafely(s.worldDir, primaryCard, ctx)) {
         rt.reloadRuntime(ctx);
       }

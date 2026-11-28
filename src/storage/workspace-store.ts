@@ -13,6 +13,7 @@ import * as path from "node:path";
 import type { CompiledCard, CompiledLoreBook, CompiledPreset, PersonaProfile } from "../types.js";
 import type { UnpackedAsset } from "../parser/unpack.js";
 import { sanitizeZipEntryPath } from "../parser/unpack.js";
+import { compileCardKnowledgeIndex, computeCardKnowledgeHash } from "../parser/card-knowledge.js";
 
 export function getProjectRpDir(cwd: string): string {
   return path.join(cwd, ".pi", "rp");
@@ -96,15 +97,37 @@ export function saveCompiledCard(options: {
   }
 
   writeJson(path.join(cardDir, "card.raw.json"), options.rawJson);
-  writeJson(path.join(cardDir, "card.compiled.json"), options.card);
+  if (options.card.knowledgeIndex) {
+    writeJson(path.join(cardDir, "knowledge.index.json"), options.card.knowledgeIndex);
+  }
+  const { knowledgeIndex: _ki, ...cardWithoutHeavyIndex } = options.card;
+  writeJson(path.join(cardDir, "card.compiled.json"), cardWithoutHeavyIndex);
   return cardDir;
 }
 
 export function loadCompiledCard(baseDir: string, slug: string): CompiledCard | null {
   try {
     const safeSlug = assertSafeSegment(slug, "card slug");
-    const target = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.compiled.json");
-    return readJsonSafe<CompiledCard>(target);
+    const cardDir = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug);
+    const card = readJsonSafe<CompiledCard>(path.join(cardDir, "card.compiled.json"));
+    if (!card) return null;
+    const expectedHash = computeCardKnowledgeHash(
+      card.frozen.description || "",
+      card.frozen.personality || "",
+      card.frozen.scenario || "",
+    );
+    const cachedKi = card.knowledgeIndex ?? readJsonSafe<CompiledCard["knowledgeIndex"]>(path.join(cardDir, "knowledge.index.json"));
+    if (cachedKi && cachedKi.contentHash === expectedHash) {
+      card.knowledgeIndex = cachedKi;
+    } else {
+      card.knowledgeIndex = compileCardKnowledgeIndex(card);
+      try {
+        writeJson(path.join(cardDir, "knowledge.index.json"), card.knowledgeIndex);
+      } catch {
+        // Non-fatal if read-only
+      }
+    }
+    return card;
   } catch {
     return null;
   }
@@ -282,8 +305,11 @@ export function saveUpdatedCard(baseDir: string, card: CompiledCard): void {
   card.importReport.loreCount = card.loreBook.entries.length;
   card.importReport.constantLoreCount = constantCount;
   card.importReport.dynamicLoreCount = Math.max(0, card.loreBook.entries.length - constantCount);
-  const dest = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug, "card.compiled.json");
-  writeJson(dest, card);
+  const cardDir = resolveInsideRoot(path.join(baseDir, "cards"), safeSlug);
+  card.knowledgeIndex = compileCardKnowledgeIndex(card);
+  writeJson(path.join(cardDir, "knowledge.index.json"), card.knowledgeIndex);
+  const { knowledgeIndex: _ki, ...cardWithoutHeavyIndex } = card;
+  writeJson(path.join(cardDir, "card.compiled.json"), cardWithoutHeavyIndex);
 }
 
 export function deleteCompiledCard(baseDir: string, slug: string): boolean {

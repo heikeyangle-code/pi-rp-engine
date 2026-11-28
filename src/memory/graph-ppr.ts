@@ -1,16 +1,14 @@
 /**
- * Zero-dependency local HippoRAG 2 (2-hop Personalized PageRank) + BM25 + Official SillyTavern
- * World Info + Memory Books unified recall engine:
- *  - Inline `/pattern/flags` regex keys (even when `useRegex: false`)
- *  - Full 4-way `selectiveLogic` (`AND_ANY`, `AND_ALL`, `NOT_ANY`, `NOT_ALL`) + independent CCV3 `excludeKeys`
- *  - Fixes `staticPrebound` bug (grants a relevance boost instead of unconditionally hogging token budget every turn)
- *  - Unifies archived Memory Book chapters (`state.memoryBooks`) into entity/keyword recall so 200+ turn stories never forget early arcs
- *  - Emits full Context X-Ray diagnostics (`traces`, `gatedOut`, `budgetDropped`)
+ * Zero-dependency local HippoRAG 2 (Passage + Entity Hybrid 2-hop Personalized PageRank)
+ * + Unified Denoised CJK/EN BM25 + Aho-Corasick Alias & Salience Coreference
+ * + Reciprocal Rank Fusion (RRF, k=60) + Official SillyTavern World Info + Memory Books recall engine.
  */
 
+import * as crypto from "node:crypto";
 import type {
   CompiledLoreEntry,
   DreamBelief,
+  EmbeddingConfig,
   LoreRecallTraceItem,
   MemoryBookEntry,
   PiMessage,
@@ -20,31 +18,13 @@ import { evaluateGate } from "../engine/gates.js";
 import { parseInlineRegexKey, isSafeRegexPattern } from "../parser/lore-compiler.js";
 import { estimateTokens, selectWithinTokenBudget } from "../context/token-budget.js";
 import { getActiveFacts } from "./bitemporal.js";
+import { type Bm25Index, bm25Scores, buildBm25Index, tokenizeBigram } from "./bm25.js";
+import { getCachedSemanticRanking, reciprocalRankFusion } from "./embedding.js";
+import type { EntityRegistry } from "./entity-registry.js";
 
-/** Tokenize mixed Chinese/English text into CJK bigrams + lowercased Latin words. */
+/** Tokenize mixed Chinese/English text using the unified stopword-filtered CJK/EN tokenizer. */
 export function tokenizeHybrid(text: string): string[] {
-  const tokens: string[] = [];
-  const lower = text.toLowerCase();
-
-  const wordRe = /[a-z0-9_]{2,}/g;
-  let m: RegExpExecArray | null;
-  while ((m = wordRe.exec(lower)) !== null) {
-    tokens.push(m[0]!);
-  }
-
-  const cjkRe = /[\u4e00-\u9fff]+/g;
-  while ((m = cjkRe.exec(lower)) !== null) {
-    const run = m[0]!;
-    if (run.length === 1) {
-      tokens.push(run);
-    } else {
-      for (let i = 0; i < run.length - 1; i++) {
-        tokens.push(run.slice(i, i + 2));
-      }
-    }
-  }
-
-  return tokens;
+  return tokenizeBigram(text);
 }
 
 function escapeRegExp(s: string): string {
@@ -149,13 +129,15 @@ function deterministicPercent(seed: string): number {
 export function recallMemoryBooks(
   state: SessionRpState,
   queryText: string,
-  maxChapters = 4,
+  maxChapters = 6,
   memoryBookBudget?: number,
+  registry?: EntityRegistry,
 ): { chapters: MemoryBookEntry[]; traces: LoreRecallTraceItem[] } {
   const all = Array.from(state.memoryBooks.values()).filter((m) => m.enabled && m.summary.trim());
   if (all.length === 0) return { chapters: [], traces: [] };
 
-  const hay = `${queryText}\n${state.location}\n${state.presentNpcs.join(" ")}`.toLowerCase();
+  const expanded = registry ? registry.expandQueryForRecall(queryText).expandedText : queryText;
+  const hay = `${expanded}\n${state.location}\n${state.presentNpcs.join(" ")}`.toLowerCase();
   const qTokens = new Set(tokenizeHybrid(hay));
 
   const scored: Array<{ entry: MemoryBookEntry; score: number; reason: LoreRecallTraceItem["reason"]; matchedKey?: string }> = [];
@@ -178,7 +160,6 @@ export function recallMemoryBooks(
     }
   }
 
-  // Always keep the most recent archived chapter as continuity anchor if nothing else matched
   if (scored.length === 0) {
     const latest = all.sort((a, b) => b.createdTurn - a.createdTurn)[0];
     if (latest) {
@@ -216,26 +197,25 @@ export function recallMemoryBooks(
   };
 }
 
-/**
- * RoleMemo DualMem query-relevant belief selection:
- * Ranks beliefs by present NPC presence, query entity/name hits, lexical overlap with
- * activatingEvent/belief/subjectiveInsight, and recency — eliminating naive blind slicing.
- */
+/** RoleMemo DualMem query-relevant belief selection (alias-aware). */
 export function selectRelevantBeliefs(
   state: SessionRpState,
   queryText: string,
-  limit = 6,
+  limit = 8,
+  registry?: EntityRegistry,
 ): DreamBelief[] {
   if (state.beliefs.length === 0) return [];
-  const presentSet = new Set(state.presentNpcs.map((n) => n.toLowerCase()));
-  const personaLower = state.currentPersona.name.toLowerCase();
-  const queryLower = queryText.toLowerCase();
+  const norm = (n: string) => (registry ? registry.resolveCanonical(n).toLowerCase() : n.toLowerCase());
+  const presentSet = new Set(state.presentNpcs.map(norm));
+  const personaLower = norm(state.currentPersona.name);
+  const expanded = registry ? registry.expandQueryForRecall(queryText).expandedText : queryText;
+  const queryLower = expanded.toLowerCase();
   const queryTokens = new Set(tokenizeHybrid(queryLower));
 
   const scored = state.beliefs.map((b, idx) => {
     let score = 0;
-    const actorLower = b.actorId.toLowerCase();
-    const targetLower = b.target.toLowerCase();
+    const actorLower = norm(b.actorId);
+    const targetLower = norm(b.target);
     if (presentSet.has(actorLower)) score += 5;
     if (presentSet.has(targetLower) || targetLower === personaLower || targetLower === "player") score += 1.5;
     if (actorLower.length >= 2 && queryLower.includes(actorLower)) score += 3.5;
@@ -251,7 +231,6 @@ export function selectRelevantBeliefs(
     if (overlap > 0) {
       score += Math.min(4.5, overlap * 0.85);
     }
-    // Gentle recency tiebreaker so newer shifts win when relevance is equal
     score += b.turn * 0.04 + idx * 0.001;
     return { belief: b, score };
   });
@@ -260,54 +239,54 @@ export function selectRelevantBeliefs(
   return scored.slice(0, limit).map((s) => s.belief);
 }
 
-interface CachedLoreEntryIndex {
-  tokens: string[];
-  tf: Map<string, number>;
-  uniqueTokens: string[];
+interface CachedLoreEntryMeta {
+  docIdx: number;
   baseEntities: string[];
   lowerContent: string;
   matchedCorpusEntities: string[];
 }
 
 interface CachedLoreCorpus {
-  length: number;
   fingerprint: string;
-  byId: Map<string, CachedLoreEntryIndex>;
+  bm25: Bm25Index;
+  byId: Map<string, CachedLoreEntryMeta>;
 }
 
 const loreCorpusCache = new WeakMap<CompiledLoreEntry[], CachedLoreCorpus>();
 
+/** Full-corpus SHA-1 fingerprint covering EVERY entry's id, title, keys, entities, revision & content (never stale!). */
 function computeEntriesFingerprint(entries: CompiledLoreEntry[]): string {
-  if (entries.length === 0) return "0";
-  const first = entries[0]!;
-  const last = entries[entries.length - 1]!;
-  return `${entries.length}:${first.id}:${first.content.length}:${last.id}:${last.content.length}`;
+  const h = crypto.createHash("sha1");
+  for (const e of entries) {
+    h.update(
+      `${e.id}|${e.revision ?? 1}|${e.title}|${e.keys.join(",")}|${e.entities.join(",")}|${e.content.length}|${e.content.slice(0, 48)}|${e.content.slice(-32)}\n`,
+    );
+  }
+  return h.digest("hex");
 }
 
 function getOrBuildLoreCorpus(entries: CompiledLoreEntry[]): CachedLoreCorpus {
   const fp = computeEntriesFingerprint(entries);
   const existing = loreCorpusCache.get(entries);
-  if (existing && existing.length === entries.length && existing.fingerprint === fp) {
+  if (existing && existing.fingerprint === fp) {
     return existing;
   }
 
-  const byId = new Map<string, CachedLoreEntryIndex>();
+  // Field-weighted documents: title + keys weighted 2x over content for sharper precision
+  const docs: string[] = [];
+  const byId = new Map<string, CachedLoreEntryMeta>();
   const allCorpusEntities = new Set<string>();
 
-  for (const e of entries) {
-    const tokens = tokenizeHybrid(`${e.title} ${e.keys.join(" ")} ${e.content}`);
-    const tf = new Map<string, number>();
-    for (const t of tokens) {
-      tf.set(t, (tf.get(t) ?? 0) + 1);
-    }
-    const baseEntities = Array.from(new Set(e.entities.map((ent) => ent.toLowerCase())));
+  for (let i = 0; i < entries.length; i++) {
+    const e = entries[i]!;
+    const header = `${e.title} ${e.keys.join(" ")}`;
+    docs.push(`${header} ${header}\n${e.content}`);
+    const baseEntities = Array.from(new Set(e.entities.map((ent) => ent.toLowerCase()).filter((x) => x.length >= 2)));
     for (const ent of baseEntities) {
-      if (ent.length >= 2) allCorpusEntities.add(ent);
+      allCorpusEntities.add(ent);
     }
     byId.set(e.id, {
-      tokens,
-      tf,
-      uniqueTokens: Array.from(tf.keys()),
+      docIdx: i,
       baseEntities,
       lowerContent: e.content.toLowerCase(),
       matchedCorpusEntities: [],
@@ -316,7 +295,8 @@ function getOrBuildLoreCorpus(entries: CompiledLoreEntry[]): CachedLoreCorpus {
 
   const entityList = Array.from(allCorpusEntities);
   for (const e of entries) {
-    if (e.noGraphSpread) continue;
+    const preventOut = e.preventRecursion ?? e.noGraphSpread;
+    if (preventOut) continue;
     const item = byId.get(e.id)!;
     const matched: string[] = [];
     for (const ent of entityList) {
@@ -327,7 +307,8 @@ function getOrBuildLoreCorpus(entries: CompiledLoreEntry[]): CachedLoreCorpus {
     item.matchedCorpusEntities = matched;
   }
 
-  const built: CachedLoreCorpus = { length: entries.length, fingerprint: fp, byId };
+  const bm25 = buildBm25Index(docs);
+  const built: CachedLoreCorpus = { fingerprint: fp, bm25, byId };
   loreCorpusCache.set(entries, built);
   return built;
 }
@@ -343,10 +324,12 @@ export interface RecallResult {
   traces: LoreRecallTraceItem[];
   gatedOut: Array<{ id: string; title: string }>;
   budgetDropped: Array<{ id: string; title: string; tokens: number }>;
+  aliasExpansions?: string[];
 }
 
 /**
- * Local BM25 + 2-hop Personalized PageRank Entity Graph Recall with full SillyTavern World Info semantics.
+ * Local Unified Denoised BM25 + HippoRAG 2 (Passage + Entity Bipartite PPR) + AC Alias/Salience
+ * + RRF + Official SillyTavern World Info recall engine.
  */
 export function recallLoreWithGraphPpr(options: {
   entries: CompiledLoreEntry[];
@@ -356,40 +339,63 @@ export function recallLoreWithGraphPpr(options: {
   defaultScanDepth?: number;
   tokenBudget: number;
   manualQuery?: string;
+  registry?: EntityRegistry;
+  embeddingConfig?: EmbeddingConfig;
+  minActivations?: number;
 }): RecallResult {
-  const { entries, state, recentText, messages, defaultScanDepth = 4, tokenBudget, manualQuery } = options;
+  const {
+    entries,
+    state,
+    recentText,
+    messages,
+    defaultScanDepth = 4,
+    tokenBudget,
+    manualQuery,
+    registry,
+    embeddingConfig,
+    minActivations = 0,
+  } = options;
   const isManual = Boolean(manualQuery);
-  const queryText = isManual ? manualQuery! : recentText;
+  const rawQueryText = isManual ? manualQuery! : recentText;
 
-  // Exclude OOC/event custom messages from per-entry scanDepth slices too
+  // AC Alias & Salience Coreference query expansion
+  const expansion = registry
+    ? registry.expandQueryForRecall(rawQueryText, { messages, presentNpcs: state.presentNpcs })
+    : null;
+  const queryText = expansion?.expandedText ?? rawQueryText;
+  const aliasExpansions = [
+    ...(expansion?.matchedAliases.map((m) => `${m.alias}→${m.canonical}`) ?? []),
+    ...(expansion?.salienceResolved.map((s) => `指代→${s}`) ?? []),
+  ];
+
   const cleanMessages = messages?.filter(
     (m) => m.customType !== "rp:ooc" && m.customType !== "rp:event",
   );
 
   const depthTextCache = new Map<number, string>();
-  const getHaystackForEntry = (entry: CompiledLoreEntry): string => {
-    if (isManual || !cleanMessages || cleanMessages.length === 0 || !entry.scanDepthOverride) {
+  const getHaystackForEntry = (entry: CompiledLoreEntry, extraDepthBoost = 0): string => {
+    if (isManual || !cleanMessages || cleanMessages.length === 0 || (!entry.scanDepthOverride && extraDepthBoost === 0)) {
       return queryText;
     }
-    const d = Math.max(1, entry.scanDepthOverride);
+    const d = Math.max(1, (entry.scanDepthOverride ?? defaultScanDepth) + extraDepthBoost);
     let cached = depthTextCache.get(d);
     if (cached === undefined) {
-      cached = cleanMessages.slice(-d).map(extractMsgText).join("\n");
+      const rawSlice = cleanMessages.slice(-d).map(extractMsgText).join("\n");
+      cached = registry ? registry.expandQueryForRecall(rawSlice, { presentNpcs: state.presentNpcs }).expandedText : rawSlice;
       depthTextCache.set(d, cached);
     }
     return cached;
   };
-  void defaultScanDepth;
 
   const gatedOut: Array<{ id: string; title: string }> = [];
 
-  // 1. Filter eligible dynamic entries (live loreOverrides + physical EraGate + cooldown + oneShot)
+  // 1. Filter eligible dynamic entries
   const eligible = entries.filter((e) => {
     const effectiveEnabled = state.loreOverrides[e.id] ?? e.enabled;
     if (!effectiveEnabled || !e.content) return false;
     if (e.constant && !isManual) return false;
     if (e.manualRecallOnly && !isManual) return false;
-    if (!evaluateGate(e.gate, state)) {
+    if (!evaluateGate(e.gate, state, registry)) {
       gatedOut.push({ id: e.id, title: e.title });
       return false;
     }
@@ -410,79 +416,80 @@ export function recallLoreWithGraphPpr(options: {
       traces: [],
       gatedOut,
       budgetDropped: [],
+      aliasExpansions,
     };
   }
 
-  // 2. Local BM25 index over eligible entries (using WeakMap pre-tokenized corpus cache)
+  // 2. Unified denoised BM25 scoring via bm25.ts (deduplicated queryTokens + CJK/EN stopwords!)
   const corpus = getOrBuildLoreCorpus(entries);
-  const df = new Map<string, number>();
-  let totalLen = 0;
-
+  const eligibleDocSet = new Set<number>();
   for (const e of eligible) {
-    const idxEntry = corpus.byId.get(e.id)!;
-    totalLen += idxEntry.tokens.length;
-    for (const t of idxEntry.uniqueTokens) {
-      df.set(t, (df.get(t) ?? 0) + 1);
-    }
+    const meta = corpus.byId.get(e.id);
+    if (meta) eligibleDocSet.add(meta.docIdx);
   }
-  const avgLen = Math.max(1, totalLen / eligible.length);
-  const queryTokens = tokenizeHybrid(queryText);
+  const queryTokens = Array.from(new Set(tokenizeBigram(queryText)));
+  const rawBm25Array = bm25Scores(queryTokens, corpus.bm25, eligibleDocSet);
 
-  const bm25Scores = new Map<string, number>();
-  const N = eligible.length;
-  const k1 = 1.2;
-  const b = 0.75;
-
+  const bm25ScoreMap = new Map<string, number>();
   for (const e of eligible) {
-    const idxEntry = corpus.byId.get(e.id)!;
-    const tf = idxEntry.tf;
-    const docLen = idxEntry.tokens.length;
-    let score = 0;
-    for (const qt of queryTokens) {
-      const f = tf.get(qt) ?? 0;
-      if (f === 0) continue;
-      const docFreq = df.get(qt) ?? 1;
-      const idf = Math.log(1 + (N - docFreq + 0.5) / (docFreq + 0.5));
-      score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + b * (docLen / avgLen))));
-    }
-    bm25Scores.set(e.id, score);
+    const meta = corpus.byId.get(e.id);
+    bm25ScoreMap.set(e.id, meta ? (rawBm25Array[meta.docIdx] ?? 0) : 0);
   }
 
-  // 3. Build lightweight Entity -> Entry adjacency graph & run 2-hop Personalized PageRank
+  // Adaptive BM25 threshold: scales cleanly with query vocabulary size so long 4-turn chats don't flood noise!
+  const adaptiveBm25Threshold = isManual
+    ? 0.45
+    : Math.max(4.8, 2.8 + Math.log2(Math.max(4, queryTokens.length)) * 1.35);
+
+  // 3. HippoRAG 2 Bipartite Graph: Passage Nodes + Entity Nodes -> 2-hop PPR
   const entityToEntries = new Map<string, Set<string>>();
   const entryToEntities = new Map<string, Set<string>>();
   const eligibleById = new Map(eligible.map((e) => [e.id, e]));
 
   for (const e of eligible) {
-    const idxEntry = corpus.byId.get(e.id)!;
+    const meta = corpus.byId.get(e.id)!;
     const ents = new Set<string>();
-    for (const norm of idxEntry.baseEntities) {
-      ents.add(norm);
-      if (!entityToEntries.has(norm)) entityToEntries.set(norm, new Set());
-      entityToEntries.get(norm)!.add(e.id);
+    for (const norm of meta.baseEntities) {
+      const canon = registry ? registry.resolveCanonical(norm).toLowerCase() : norm;
+      ents.add(canon);
+      if (!entityToEntries.has(canon)) entityToEntries.set(canon, new Set());
+      entityToEntries.get(canon)!.add(e.id);
+      if (canon !== norm) {
+        ents.add(norm);
+        if (!entityToEntries.has(norm)) entityToEntries.set(norm, new Set());
+        entityToEntries.get(norm)!.add(e.id);
+      }
     }
     entryToEntities.set(e.id, ents);
   }
 
   const allEntityNames = Array.from(entityToEntries.keys());
   for (const e of eligible) {
-    if (e.noGraphSpread) continue;
-    const idxEntry = corpus.byId.get(e.id)!;
+    const preventOut = e.preventRecursion ?? e.noGraphSpread;
+    if (preventOut) continue;
+    const meta = corpus.byId.get(e.id)!;
     const ents = entryToEntities.get(e.id)!;
-    for (const ent of idxEntry.matchedCorpusEntities) {
-      if (entityToEntries.has(ent)) {
-        ents.add(ent);
-        entityToEntries.get(ent)!.add(e.id);
+    for (const ent of meta.matchedCorpusEntities) {
+      const canon = registry ? registry.resolveCanonical(ent).toLowerCase() : ent;
+      if (entityToEntries.has(canon)) {
+        ents.add(canon);
+        // Only link back into entityToEntries if the target entry allows being recursively reached
+        if (!(e.excludeRecursion ?? false)) {
+          entityToEntries.get(canon)!.add(e.id);
+        }
       }
     }
   }
 
-  // Build cross-entity co-occurrence bridges from active Bi-Temporal Facts & enabled Memory Books
-  // so HippoRAG 2 unifies Facts + Chapters + World Info in one multi-hop entity graph!
+  // Cross-entity co-occurrence bridges from active Bi-Temporal Facts & Memory Books
   const entityCooccur = new Map<string, Set<string>>();
   const linkEntities = (rawList: string[]) => {
     const norms = Array.from(
-      new Set(rawList.map((x) => x.trim().toLowerCase()).filter((x) => x.length >= 2)),
+      new Set(
+        rawList
+          .map((x) => (registry ? registry.resolveCanonical(x) : x).trim().toLowerCase())
+          .filter((x) => x.length >= 2),
+      ),
     );
     if (norms.length < 2) return;
     for (let i = 0; i < norms.length; i++) {
@@ -496,21 +503,15 @@ export function recallLoreWithGraphPpr(options: {
       }
     }
   };
-  const activeFacts = getActiveFacts(state);
-  for (const fact of activeFacts) {
-    linkEntities(fact.entities);
-  }
+  const activeFacts = getActiveFacts(state, registry);
+  for (const fact of activeFacts) linkEntities(fact.entities);
   for (const ch of state.memoryBooks.values()) {
     if (!ch.enabled) continue;
     linkEntities([...ch.entities, ...ch.keywords]);
   }
 
-  // Seed entity scores from queryText + presentNpcs + current location + recently touched fact entities
-  const recentFactEntities = activeFacts
-    .slice(0, 6)
-    .flatMap((f) => f.entities)
-    .filter((ent) => ent && queryText.toLowerCase().includes(ent.toLowerCase()));
-  const seedContext = `${queryText}\n${state.location}\n${state.presentNpcs.join(" ")}\n${recentFactEntities.join(" ")}`.toLowerCase();
+  // Seed entity scores from expanded query + AC matched canonicals + location + presentNpcs
+  const seedContext = `${queryText}\n${state.location}\n${state.presentNpcs.join(" ")}`.toLowerCase();
   const seedEntities = new Map<string, number>();
   const allKnownEntities = new Set<string>([...allEntityNames, ...entityCooccur.keys()]);
   for (const ent of allKnownEntities) {
@@ -518,8 +519,16 @@ export function recallLoreWithGraphPpr(options: {
       seedEntities.set(ent, 1.0);
     }
   }
+  if (expansion) {
+    for (const c of expansion.matchedCanonicals) {
+      const cl = c.toLowerCase();
+      if (entityToEntries.has(cl) || entityCooccur.has(cl)) {
+        seedEntities.set(cl, Math.max(seedEntities.get(cl) ?? 0, 1.15));
+      }
+    }
+  }
 
-  // Propagate 1-hop entity-to-entity bridges from active Facts & Memory Books (true normalization by coList.size)
+  // 1-hop entity-to-entity bridges from active Facts & Memory Books
   const bridgedSeeds = new Map<string, number>();
   for (const [ent, weight] of seedEntities.entries()) {
     const coList = entityCooccur.get(ent);
@@ -535,7 +544,7 @@ export function recallLoreWithGraphPpr(options: {
     seedEntities.set(ent, (seedEntities.get(ent) ?? 0) + w);
   }
 
-  // Pre-evaluate direct key hits & sticky status so regex-triggered entries ALSO seed 2-hop PPR!
+  // Pre-evaluate direct key hits & sticky status (with optional minActivations progressive scanDepth)
   const directKeyMap = new Map<string, string | null>();
   const stickyActiveMap = new Map<string, boolean>();
   for (const e of eligible) {
@@ -544,7 +553,27 @@ export function recallLoreWithGraphPpr(options: {
     stickyActiveMap.set(e.id, !isManual && (state.loreSticky[e.id] ?? 0) > 0);
   }
 
-  // 2-hop PPR power iteration: (Entity + Fact/Book Bridges + Direct/Sticky Triggers) -> Entry -> Entity -> Entry
+  // Progressive scanDepth expansion if minActivations > 0 and too few direct hits
+  if (!isManual && minActivations > 0 && cleanMessages && cleanMessages.length > defaultScanDepth) {
+    let directCount = 0;
+    for (const v of directKeyMap.values()) if (v) directCount++;
+    if (directCount < minActivations) {
+      for (const boost of [4, 8, 16]) {
+        for (const e of eligible) {
+          if (directKeyMap.get(e.id)) continue;
+          const widerHay = getHaystackForEntry(e, boost);
+          const hit = findMatchedWorldInfoKey(widerHay, e);
+          if (hit) {
+            directKeyMap.set(e.id, hit);
+            directCount++;
+          }
+        }
+        if (directCount >= minActivations) break;
+      }
+    }
+  }
+
+  // HippoRAG 2: 2-hop PPR with Passage Nodes (0.05 reset weight for top BM25 passages) + Entity Nodes
   const pprEntryScores = new Map<string, number>();
   const damping = 0.85;
   const hop1Entry = new Map<string, number>();
@@ -554,9 +583,23 @@ export function recallLoreWithGraphPpr(options: {
     if (!neighbors || neighbors.size === 0) continue;
     const share = weight / neighbors.size;
     for (const entryId of neighbors) {
+      const target = eligibleById.get(entryId);
+      // Respect strict matchWholeWords on hop-1 entity seeding too
+      if (target?.matchWholeWords && !directKeyMap.get(entryId)) continue;
       hop1Entry.set(entryId, (hop1Entry.get(entryId) ?? 0) + share);
     }
   }
+
+  // Passage-level seed reset (HippoRAG 2: 0.05 weight on high-BM25 passages)
+  const topBm25ForPpr = eligible
+    .map((e) => ({ id: e.id, score: bm25ScoreMap.get(e.id) ?? 0, entry: e }))
+    .filter((x) => x.score >= adaptiveBm25Threshold && !(x.entry.matchWholeWords && !directKeyMap.get(x.id)))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 8);
+  for (const p of topBm25ForPpr) {
+    hop1Entry.set(p.id, (hop1Entry.get(p.id) ?? 0) + Math.min(0.6, p.score * 0.05));
+  }
+
   for (const e of eligible) {
     if (directKeyMap.get(e.id) || stickyActiveMap.get(e.id)) {
       hop1Entry.set(e.id, (hop1Entry.get(e.id) ?? 0) + 1.0);
@@ -571,7 +614,9 @@ export function recallLoreWithGraphPpr(options: {
     const hop2Entity = new Map<string, number>();
     for (const [entryId, weight] of hop1Entry.entries()) {
       const entry = eligibleById.get(entryId);
-      if (!entry || entry.noGraphSpread) continue;
+      // preventRecursion blocks OUTGOING spread from this entry's content
+      const preventOut = entry ? (entry.preventRecursion ?? entry.noGraphSpread) : true;
+      if (!entry || preventOut) continue;
       const ents = entryToEntities.get(entryId);
       if (!ents || ents.size === 0) continue;
       const share = (weight * damping) / ents.size;
@@ -591,12 +636,47 @@ export function recallLoreWithGraphPpr(options: {
       if (!neighbors || neighbors.size === 0) continue;
       const share = weight / neighbors.size;
       for (const entryId of neighbors) {
+        const target = eligibleById.get(entryId);
+        // excludeRecursion strictly blocks INCOMING hop-2 recursion activation!
+        if (!target || target.excludeRecursion) continue;
+        if (target.matchWholeWords && !directKeyMap.get(entryId)) continue;
         pprEntryScores.set(entryId, (pprEntryScores.get(entryId) ?? 0) + share * 0.65);
       }
     }
   }
 
-  // 4. Combine direct key match, sticky, gentle staticPrebound boost, BM25, and 2-hop PPR
+  // Optional non-blocking cached semantic ranking (when user enabled embeddings & cache is warm)
+  const semanticScoreMap = new Map<string, number>();
+  if (embeddingConfig?.enabled) {
+    const docs = eligible.map((e) => `${e.title}: ${e.content.slice(0, 1200)}`);
+    const cachedSem = getCachedSemanticRanking(embeddingConfig, rawQueryText, docs, 0.32);
+    if (cachedSem && cachedSem.length > 0) {
+      for (const hit of cachedSem.slice(0, 12)) {
+        const entry = eligible[hit.index];
+        if (entry) semanticScoreMap.set(entry.id, hit.similarity);
+      }
+    }
+  }
+
+  // RRF fusion bonus across BM25 + PPR + Semantic channels
+  const bm25RankedIds = eligible
+    .filter((e) => (bm25ScoreMap.get(e.id) ?? 0) >= adaptiveBm25Threshold)
+    .sort((a, b) => (bm25ScoreMap.get(b.id) ?? 0) - (bm25ScoreMap.get(a.id) ?? 0))
+    .map((e) => e.id);
+  const pprRankedIds = eligible
+    .filter((e) => (pprEntryScores.get(e.id) ?? 0) >= 0.12)
+    .sort((a, b) => (pprEntryScores.get(b.id) ?? 0) - (pprEntryScores.get(a.id) ?? 0))
+    .map((e) => e.id);
+  const semRankedIds = Array.from(semanticScoreMap.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([id]) => id);
+  const rrfFused = reciprocalRankFusion(bm25RankedIds, pprRankedIds, 60);
+  const rrfWithSem = semRankedIds.length > 0
+    ? reciprocalRankFusion(rrfFused.map((x) => x.id), semRankedIds, 60)
+    : rrfFused;
+  const rrfMap = new Map(rrfWithSem.map((x) => [x.id, x.score]));
+
+  // 4. Combine direct key match, sticky, staticPrebound, denoised BM25, 2-hop PPR, and cached Semantic RRF
   const activated: Array<{
     entry: CompiledLoreEntry;
     score: number;
@@ -610,7 +690,8 @@ export function recallLoreWithGraphPpr(options: {
     const matchedKey = directKeyMap.get(e.id) ?? undefined;
     const directHit = Boolean(matchedKey);
     const ppr = pprEntryScores.get(e.id) ?? 0;
-    const bm25 = bm25Scores.get(e.id) ?? 0;
+    const bm25 = bm25ScoreMap.get(e.id) ?? 0;
+    const semSim = semanticScoreMap.get(e.id) ?? 0;
 
     if (!isStickyActive && !isManual) {
       if (e.excludeKeys.length > 0 && e.excludeKeys.some((k) => matchWorldInfoKey(haystack, k, e))) {
@@ -630,21 +711,27 @@ export function recallLoreWithGraphPpr(options: {
           continue;
         }
       }
+      // Strict matchWholeWords guard: never let fuzzy BM25 bypass an explicit whole-word entry!
+      if (e.matchWholeWords && !directHit && semSim < 0.45) {
+        continue;
+      }
     }
 
     const graphOnlyBlocked = e.graphSecondHopOnly && !isManual && ppr < 0.08;
     if (graphOnlyBlocked && !isStickyActive) continue;
 
-    // Fix: staticPrebound boosts relevant entries (or fires on Turn 0/1) instead of unconditionally hogging budget every turn
-    const staticTrigger = e.staticPrebound && (state.turn <= 1 || bm25 >= 0.8 || ppr >= 0.05);
+    const staticTrigger = e.staticPrebound && (state.turn <= 1 || bm25 >= adaptiveBm25Threshold * 0.5 || ppr >= 0.08);
+    const bm25Triggered = bm25 >= adaptiveBm25Threshold;
+    const pprTriggered = ppr >= 0.12;
+    const semTriggered = semSim >= 0.36;
 
     const triggered =
       isStickyActive ||
       directHit ||
       staticTrigger ||
-      ppr >= 0.12 ||
-      (isManual && bm25 > 0.25) ||
-      bm25 >= 2.2;
+      pprTriggered ||
+      bm25Triggered ||
+      semTriggered;
 
     if (!triggered) continue;
 
@@ -657,18 +744,23 @@ export function recallLoreWithGraphPpr(options: {
       ? "sticky"
       : directHit
         ? "direct_key"
-        : ppr >= 0.12
+        : pprTriggered
           ? "ppr_2hop"
-          : staticTrigger
-            ? "static"
-            : "bm25";
+          : semTriggered && !bm25Triggered
+            ? "semantic_rrf"
+            : staticTrigger
+              ? "static"
+              : "bm25";
 
+    const rrfBoost = (rrfMap.get(e.id) ?? 0) * 180;
     const totalScore =
-      (isStickyActive ? 12 : 0) +
-      (directHit ? 10 : 0) +
+      (isStickyActive ? 14 : 0) +
+      (directHit ? 12 : 0) +
       (e.staticPrebound ? 2 : 0) +
       ppr * 6 +
-      bm25 * 1.5;
+      bm25 * 1.2 +
+      semSim * 10 +
+      rrfBoost;
 
     activated.push({ entry: e, score: totalScore, reason, matchedKey });
   }
@@ -758,7 +850,7 @@ export function recallLoreWithGraphPpr(options: {
     };
   });
 
-  // 7. Compute next sticky / cooldown / oneShot runtime maps (persisted at settled turn_end)
+  // 7. Compute next sticky / cooldown / oneShot runtime maps
   const nextSticky: Record<string, number> = { ...state.loreSticky };
   const nextCooldown: Record<string, number> = { ...state.loreCooldown };
   const nextConsumed = new Set(state.loreConsumedOneShots);
@@ -789,6 +881,7 @@ export function recallLoreWithGraphPpr(options: {
     traces,
     gatedOut,
     budgetDropped,
+    aliasExpansions,
   };
 }
 
@@ -813,15 +906,17 @@ export function tickLoreRuntime(
     } else if (rem > 1) {
       nextSticky[id] = rem - 1;
     } else {
-      const cd = byId.get(id)?.cooldownTurns ?? 0;
-      if (cd > 0) nextCooldown[id] = cd;
+      const entry = byId.get(id);
+      if (entry && entry.cooldownTurns > 0) {
+        nextCooldown[id] = entry.cooldownTurns;
+      }
     }
   }
 
   for (const id of activatedIds) {
     const entry = byId.get(id);
     if (!entry) continue;
-    if (!entry.stickyPermanent && entry.stickyTurns <= 0 && entry.cooldownTurns > 0 && !nextSticky[id]) {
+    if (entry.cooldownTurns > 0 && !nextSticky[id] && entry.stickyTurns === 0 && !entry.stickyPermanent) {
       nextCooldown[id] = entry.cooldownTurns;
     }
   }

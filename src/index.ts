@@ -37,6 +37,9 @@ import { createHash } from "node:crypto";
 import { RP_ENTRY_TYPE, applyRpTx, computeMessageFingerprint, createInitialRpState, replayBranchState } from "./engine/state-replay.js";
 import { loadCompiledCard, loadCompiledPreset, resolveCardBySlug } from "./storage/workspace-store.js";
 import { recallLoreWithGraphPpr, recallMemoryBooks } from "./memory/graph-ppr.js";
+import { buildEntityRegistry } from "./memory/entity-registry.js";
+import { recallCardKnowledge } from "./parser/card-knowledge.js";
+import { loadUiPrefs } from "./ui/file-picker.js";
 import { type HistoryRecallCooldown, createTurnRecallScope } from "./memory/history-recall.js";
 import { buildSemanticMemSceneCompaction, maybeBuildAutoSceneChapter } from "./memory/compaction.js";
 import { extractInlineDelta, parseAndValidateInlineDelta, stripInlineDelta, stripInlineDeltaStreaming } from "./engine/inline-delta.js";
@@ -48,6 +51,7 @@ import {
   attachZone3ToMessages,
   buildZone1FrozenPrefix,
   buildZone3TransientTail,
+  buildZone3TransientTailWithStats,
   computeMessagesTokens,
   computeZone1Hash,
   extractRecentMessagesText,
@@ -638,10 +642,17 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     const scanDepth = activeCard.loreBook.scanDepth || 4;
     const recentText = extractRecentMessagesText(messages, scanDepth);
     const allLoreEntries = getAllActiveLoreEntries();
-    const totalLoreBudget = Math.min(state.loreTokenBudget, activeCard.loreBook.tokenBudget || state.loreTokenBudget);
+    const registry = buildEntityRegistry({ card: activeCard, extraCastCards, state });
+    const embeddingConfig = loadUiPrefs().embeddingConfig;
+    const cardDefaultBudget = activeCard.loreBook.tokenBudget || 4000;
+    const totalLoreBudget = state.loreBudgetUserSet
+      ? state.loreTokenBudget
+      : Math.max(state.loreTokenBudget, cardDefaultBudget);
     const hasMemoryBooks = state.memoryBooks.size > 0;
-    const memoryBookBudget = hasMemoryBooks ? Math.min(450, Math.floor(totalLoreBudget * 0.25)) : 0;
-    const loreBudget = Math.max(200, totalLoreBudget - memoryBookBudget);
+    const memoryBookBudget = hasMemoryBooks ? Math.min(1200, Math.floor(totalLoreBudget * 0.25)) : 0;
+    const isDualTrackCard = Boolean(activeCard.knowledgeIndex?.dualTrackActive && !activeCard.forceFullZone1);
+    const cardKbBudget = isDualTrackCard ? Math.min(2800, Math.floor(totalLoreBudget * 0.45)) : 0;
+    const loreBudget = Math.max(400, totalLoreBudget - memoryBookBudget);
 
     const recall = recallLoreWithGraphPpr({
       entries: allLoreEntries,
@@ -650,10 +661,22 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       messages,
       defaultScanDepth: scanDepth,
       tokenBudget: loreBudget,
+      registry,
+      embeddingConfig,
     });
 
+    const cardKbRecall = isDualTrackCard
+      ? recallCardKnowledge({
+          knowledgeIndex: activeCard.knowledgeIndex,
+          queryText: recentText,
+          registry,
+          tokenBudget: cardKbBudget,
+          maxPassages: 6,
+        })
+      : { passages: [], traces: [], usedTokens: 0 };
+
     const memBookRecall = hasMemoryBooks
-      ? recallMemoryBooks(state, recentText, 4, memoryBookBudget)
+      ? recallMemoryBooks(state, recentText, 6, memoryBookBudget, registry)
       : { chapters: [], traces: [] };
     const memBookTokens = memBookRecall.traces.reduce((acc, t) => acc + t.tokens, 0);
 
@@ -692,18 +715,20 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     ];
     const narrativeHealth = evaluateNarrativeHealth(state, visibleMessagesForHealth, properNouns);
 
-    const zone3 = buildZone3TransientTail({
+    const { text: zone3, stats: zone3Stats } = buildZone3TransientTailWithStats({
       card: activeCard,
       extraCastCards,
       state,
       preset: activePreset,
       recalledLore: recall.selected,
+      recalledCardPassages: cardKbRecall.passages,
       recalledMemoryBooks: memBookRecall.chapters,
       budgetDroppedLore: recall.budgetDropped,
       recentText,
       lastUserMessage: lastUserMsg,
       lastCharMessage: lastCharMsg,
       narrativeHealth,
+      registry,
     });
 
     const cleanedMessages: PiMessage[] = messages.map((m) => {
@@ -771,17 +796,11 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     // If multiple context calls fire inside the same turn (tool-call loop), next step inherits prefix_hit unless mutated!
     pendingCacheInvalidation = "prefix_hit";
 
-    // Record live Context X-Ray snapshot (0 extra LLM calls; reuse zone3 output directly without re-running fact/storylet queries!)
-    const recalledBlock = /<rp_recalled_context>([\s\S]*?)<\/rp_recalled_context>/.exec(zone3)?.[1] ?? "";
-    const knownFactCount = (recalledBlock.match(/^- \[T\d+\] /gm) ?? []).length;
-    const blindSpotCount = (recalledBlock.match(/^- \[HIDDEN FROM: /gm) ?? []).length;
+    // Record live Context X-Ray snapshot from exact structured Zone 3 stats (zero fragile regex parsing!)
+    const knownFactCount = zone3Stats.knownFactCount;
+    const blindSpotCount = zone3Stats.blindSpotCount;
     const activeFactCount = knownFactCount + blindSpotCount;
-
-    const directorBlock = /<rp_director_note>([\s\S]*?)<\/rp_director_note>/.exec(zone3)?.[1] ?? "";
-    const activeStoryletTitles: string[] = [];
-    for (const m of directorBlock.matchAll(/^- \[Triggered Storylet · ([^\]]+)\]/gm)) {
-      if (m[1]) activeStoryletTitles.push(m[1]);
-    }
+    const activeStoryletTitles = zone3Stats.activeStoryletTitles;
 
     const zone3Tokens = estimateTokens(zone3);
     const zone2Tokens = Math.max(0, computeMessagesTokens(outMessages) - zone3Tokens);
@@ -798,9 +817,11 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       zone1Tokens: lastZone1Tokens,
       zone2Tokens,
       zone3Tokens,
-      loreTokens: recall.usedTokens + memBookTokens,
+      loreTokens: recall.usedTokens + cardKbRecall.usedTokens + memBookTokens + zone3Stats.zone3ConstLoreTokens,
       loreBudget: totalLoreBudget,
-      recalled: [...recall.traces, ...memBookRecall.traces],
+      recalled: [...recall.traces, ...cardKbRecall.traces, ...memBookRecall.traces],
+      aliasExpansions: recall.aliasExpansions,
+      zone3ConstLoreTokens: zone3Stats.zone3ConstLoreTokens,
       gatedOut: recall.gatedOut,
       budgetDropped: recall.budgetDropped,
       activeFactCount,
@@ -1066,7 +1087,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
         }
       }
       if (rawBlock) {
-        const parsedDelta = parseAndValidateInlineDelta(rawBlock, state);
+        const turnRegistry = buildEntityRegistry({ card: activeCard, extraCastCards, state });
+        const parsedDelta = parseAndValidateInlineDelta(rawBlock, state, turnRegistry);
         for (const dtx of parsedDelta.txs) {
           commitTx(dtx);
         }
@@ -1088,7 +1110,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
 
     // Automatic Episodic -> Semantic Scene Consolidation (zero LLM cost)
     if (!thisTurnOoc) {
-      const autoChapter = maybeBuildAutoSceneChapter(state, prevLocBeforeDelta, prevEraBeforeDelta);
+      const autoChapter = maybeBuildAutoSceneChapter(state, prevLocBeforeDelta, prevEraBeforeDelta, lastAssistantText);
       if (autoChapter) {
         commitTx({ kind: "memory_book_upsert", entry: autoChapter });
       }
@@ -1173,7 +1195,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       pendingCompactionBookEntry = {
         id: `mb_compact_t${endTurn}_${Date.now().toString(36).slice(-4)}`,
         title: `压缩记忆章 (T${startTurn}-T${endTurn}${state.location ? ` · ${state.location}` : ""})`,
-        summary: summary.trim().slice(0, 1600),
+        summary: summary.trim().slice(0, 4000),
         entities,
         keywords: entities.slice(0, 8),
         turnRange: [startTurn, endTurn],

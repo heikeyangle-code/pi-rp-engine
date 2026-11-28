@@ -16,6 +16,9 @@ import {
 } from "./cfsm.js";
 import { canonicalizeActorName, isNonCharacterEntity, sanitizeNpcList } from "./entity-hygiene.js";
 import { makeRouteId, normalizePlaceName } from "./world-sim.js";
+import { findSupersededFactsForStatement } from "../memory/bitemporal.js";
+import { validateCfsmTransition } from "./cfsm.js";
+import type { EntityRegistry } from "../memory/entity-registry.js";
 
 const DELTA_OPEN_RE = /\[\[RP_DELTA\]\]/i;
 const DELTA_FULL_RE = /\[\[RP_DELTA\]\]([\s\S]*?)(?:\[\[\/RP_DELTA\]\]|$)/gi;
@@ -77,6 +80,7 @@ function hygieneCtx(state: SessionRpState) {
 export function parseAndValidateInlineDelta(
   rawBlock: string,
   state: SessionRpState,
+  registry?: EntityRegistry,
 ): ParsedDeltaResult {
   const txs: RpTxEntry[] = [];
   const applied: string[] = [];
@@ -112,7 +116,16 @@ export function parseAndValidateInlineDelta(
     }
 
     if (key === "time" || key === "world_time") {
-      txs.push({ kind: "clock_tick", beatDelta: 0, dayDelta: 0, worldTimeLabel: val });
+      let dayDelta = 0;
+      const dMatch = /(?:次日|翌日|第二天|隔日)/.exec(val);
+      const numDayMatch = /(\d+)\s*(?:日后|天后|days?\s*later)/i.exec(val);
+      const numMonthMatch = /(\d+)\s*(?:个月后|月后|months?\s*later)/i.exec(val);
+      const numYearMatch = /(\d+)\s*(?:年后|years?\s*later)/i.exec(val);
+      if (numYearMatch) dayDelta = Math.min(36500, Number(numYearMatch[1]) * 365);
+      else if (numMonthMatch) dayDelta = Math.min(3650, Number(numMonthMatch[1]) * 30);
+      else if (numDayMatch) dayDelta = Math.min(3650, Number(numDayMatch[1]));
+      else if (dMatch) dayDelta = 1;
+      txs.push({ kind: "clock_tick", beatDelta: 0, dayDelta, worldTimeLabel: val });
       applied.push(`time=${val}`);
       continue;
     }
@@ -232,6 +245,14 @@ export function parseAndValidateInlineDelta(
       const st = state.storylets.get(val) ?? Array.from(state.storylets.values()).find((s) => s.title === val);
       if (st && st.status !== "completed") {
         txs.push({ kind: "storylet_upsert", storylet: { ...st, status: "completed" } });
+        if (st.postEffects?.setFlags) {
+          for (const [fk, fv] of Object.entries(st.postEffects.setFlags)) {
+            txs.push({ kind: "flag_set", flag: fk, value: fv });
+          }
+        }
+        if (st.postEffects?.nextObjective) {
+          txs.push({ kind: "scene_objective_set", objective: st.postEffects.nextObjective });
+        }
         applied.push(`storylet_done:${st.title}`);
       }
       continue;
@@ -249,13 +270,44 @@ export function parseAndValidateInlineDelta(
         }
       }
       if (!statement) continue;
+      const extractedEnts = registry
+        ? registry.extractEntitiesFromText(statement, state.presentNpcs, 6)
+        : (() => {
+            const out: string[] = [];
+            const seen = new Set<string>();
+            const qRe = /[「《【]([^」》】\n]{2,16})[」》】]/g;
+            let qm: RegExpExecArray | null;
+            while ((qm = qRe.exec(statement)) !== null) {
+              const t = qm[1]!.trim();
+              if (!seen.has(t.toLowerCase())) { seen.add(t.toLowerCase()); out.push(t); }
+            }
+            for (const c of [...state.presentNpcs, ...Object.keys(state.factions), state.location]) {
+              if (c && c.length >= 2 && statement.includes(c) && !seen.has(c.toLowerCase())) {
+                seen.add(c.toLowerCase());
+                out.push(c);
+              }
+            }
+            // Fallback: extract key 2-4 char CJK noun phrases when no registered entity matched
+            if (out.length === 0) {
+              const nouns = statement.match(/[\u4e00-\u9fff]{2,6}/g) ?? [];
+              for (const n of nouns.slice(0, 4)) {
+                if (!seen.has(n)) { seen.add(n); out.push(n); }
+              }
+            }
+            return out.length > 0 ? out.slice(0, 6) : state.presentNpcs.slice(0, 4);
+          })();
+      // Auto-invalidate directly superseded older facts on high entity+token overlap
+      const superseded = findSupersededFactsForStatement(state, statement, extractedEnts, registry);
+      for (const oldF of superseded) {
+        txs.push({ kind: "fact_invalidate", factId: oldF.id, validUntilTurn: state.turn, reason: "auto_superseded" });
+      }
       const id = `fact_t${state.turn}_d${txs.length}`;
       txs.push({
         kind: "fact_add",
         fact: {
           id,
           statement,
-          entities: state.presentNpcs.slice(0, 4),
+          entities: extractedEnts,
           witnessIds,
           validFromTurn: state.turn,
           validUntilTurn: null,
@@ -509,10 +561,12 @@ export function parseAndValidateInlineDelta(
         if (eq <= 0) continue;
         const field = seg.slice(0, eq).trim().toLowerCase();
         const fv = seg.slice(eq + 1).trim();
-        if (field === "outfit" || field === "着装") snap.outfit = fv;
-        else if (field === "pose" || field === "posture" || field === "姿态") snap.posture = fv;
+        if (field === "outfit" || field === "attire" || field === "着装") { snap.attire = fv; snap.outfit = fv; }
+        else if (field === "pose" || field === "posture" || field === "姿态" || field === "pos" || field === "position" || field === "站位") {
+          snap.position = snap.position ? `${snap.position}；${fv}` : fv;
+          snap.posture = fv;
+        }
         else if (field === "held" || field === "holding" || field === "手持") snap.holding = fv;
-        else if (field === "pos" || field === "position" || field === "站位") snap.position = fv;
         else if (field === "condition" || field === "状态") snap.condition = fv;
       }
       txs.push({
@@ -522,6 +576,53 @@ export function parseAndValidateInlineDelta(
       applied.push(`phys:${actor}`);
       continue;
     }
+
+
+    if (key === "cfsm") {
+      // e.g. `沈青璃.信任 -> 试探 | 见其解围`
+      const m = /^([^.=\s]+)\.([^\s->→]+)\s*(?:->|→|=)\s*([^|]+)(?:\|\s*(.+))?$/.exec(val);
+      if (m) {
+        const actor = canonicalizeActorName(m[1]!.trim(), hctx);
+        const axis = m[2]!.trim();
+        const to = m[3]!.trim();
+        const reason = m[4]?.trim() || "inline_delta";
+        if (actor && axis && to) {
+          const check = validateCfsmTransition(state, actor, axis, to);
+          if (check.ok) {
+            const fromState = state.cfsmStates[actor]?.[axis]?.state ?? "";
+            txs.push({ kind: "cfsm_transition", actorId: actor, axis, from: fromState, to, reason, turn: state.turn });
+            applied.push(`cfsm:${actor}.${axis}→${to}`);
+          }
+        }
+      }
+      continue;
+    }
+
+    if (key === "bond") {
+      // e.g. `沈青璃 <-> 林霜 | 盟友 | +20 | 并肩抗敌`
+      const parts = val.split("|").map((x) => x.trim()).filter(Boolean);
+      const pair = (parts[0] ?? "").split(/(?:<->|↔|->|→)/).map((x) => x.trim()).filter(Boolean);
+      if (pair.length >= 2) {
+        const actorA = canonicalizeActorName(pair[0]!, hctx) || pair[0]!;
+        const actorB = canonicalizeActorName(pair[1]!, hctx) || pair[1]!;
+        const id = [actorA.toLowerCase(), actorB.toLowerCase()].sort().join("<->");
+        const prev = state.pairBonds[id];
+        const stance = parts[1] || prev?.stance || "中立";
+        let tension = prev?.tension ?? 0;
+        if (parts[2] && /^[+-]?\d+$/.test(parts[2])) {
+          const n = Number(parts[2]);
+          tension = parts[2].startsWith("+") || parts[2].startsWith("-") ? tension + n : n;
+        }
+        tension = Math.max(-100, Math.min(100, tension));
+        txs.push({
+          kind: "pair_bond_upsert",
+          bond: { id, actorA, actorB, stance, tension, note: parts[3] || prev?.note || "", updatedTurn: state.turn },
+        });
+        applied.push(`bond:${actorA}↔${actorB}`);
+      }
+      continue;
+    }
+
   }
 
   return { applied, txs };

@@ -375,6 +375,52 @@ export interface CardWorldProfile {
   source: "heuristic" | "llm-analyzed";
 }
 
+
+export interface CardChapterNode {
+  id: string;
+  title: string;
+  path: string;
+  level: number;
+  charOffset: number;
+  charLength: number;
+  tokens: number;
+  excerpt: string;
+  passageIds: string[];
+}
+
+export interface CardPassageNode {
+  id: string;
+  chapterId: string;
+  chapterPath: string;
+  text: string;
+  contextualPrefix: string;
+  charOffset: number;
+  tokens: number;
+  entities: string[];
+}
+
+export interface CardEntityNode {
+  canonical: string;
+  aliases: string[];
+  chapterIds: string[];
+  passageIds: string[];
+  contextHints: string[];
+}
+
+export interface CardKnowledgeIndex {
+  version: number;
+  contentHash: string;
+  totalChars: number;
+  totalTokens: number;
+  dualTrackActive: boolean;
+  directTokenLimit: number;
+  skeletonTokenLimit: number;
+  zone1Skeleton: string;
+  chapters: CardChapterNode[];
+  passages: CardPassageNode[];
+  entities: CardEntityNode[];
+}
+
 export interface CompiledCard {
   id: string;
   slug: string;
@@ -418,6 +464,9 @@ export interface CompiledCard {
   };
   /** Pure-text display regex rules (AI_OUTPUT, zero HTML/JS) */
   displayRegexRules: CompiledRegexRule[];
+  promptRegexRules?: CompiledRegexRule[];
+  knowledgeIndex?: CardKnowledgeIndex;
+  forceFullZone1?: boolean;
   salvagedStateSchema: SalvagedVariable[];
   worldProfile?: CardWorldProfile;
   loreBook: CompiledLoreBook;
@@ -475,6 +524,9 @@ export interface CompiledLoreEntry {
   groupWeight: number;
   useGroupScoring?: boolean;
   noGraphSpread: boolean;
+  preventRecursion?: boolean;
+  excludeRecursion?: boolean;
+  revision?: number;
   graphSecondHopOnly: boolean;
   outletName?: string;
   staticPrebound: boolean;
@@ -747,8 +799,8 @@ export interface TxAuditRecord {
 export interface LoreRecallTraceItem {
   id: string;
   title: string;
-  source: "lore" | "memory_book";
-  reason: "sticky" | "direct_key" | "ppr_2hop" | "bm25" | "static" | "pinned";
+  source: "lore" | "memory_book" | "card_knowledge";
+  reason: "sticky" | "direct_key" | "ppr_2hop" | "bm25" | "static" | "pinned" | "semantic_rrf";
   matchedKey?: string;
   score: number;
   tokens: number;
@@ -778,6 +830,8 @@ export interface ContextXRaySnapshot {
   repetitionScore?: number;
   /** Turns elapsed since last meaningful world-state mutation */
   stagnantTurns?: number;
+  aliasExpansions?: string[];
+  zone3ConstLoreTokens?: number;
 }
 
 
@@ -794,9 +848,11 @@ export interface VoiceAnchor {
 export interface PhysicalSnapshot {
   actorId: string;
   attire?: string;
+  outfit?: string;
   condition?: string;
   holding?: string;
   position?: string;
+  posture?: string;
   updatedTurn: number;
 }
 
@@ -971,6 +1027,7 @@ export interface SessionRpState {
   narrativePov: NarrativePovMode;
   bannedPhrases: string[];
   loreTokenBudget: number;
+  loreBudgetUserSet?: boolean;
   sidecarModel?: string;
   innerMonologue: boolean;
   applyPresetSampling: boolean;

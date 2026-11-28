@@ -29,6 +29,8 @@ import {
   renderHistoryRecall,
 } from "../memory/history-recall.js";
 import { rankBySemanticSimilarity, reciprocalRankFusion } from "../memory/embedding.js";
+import { buildEntityRegistry } from "../memory/entity-registry.js";
+import { recallCardKnowledge } from "../parser/card-knowledge.js";
 import { loadUiPrefs } from "../ui/file-picker.js";
 import { evaluateGate, isFactVisibleToActor } from "../engine/gates.js";
 import { createLinesComponent, styleBold, styleDim, styleFg, wrapDisplayLine } from "../ui/renderers.js";
@@ -1280,7 +1282,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       if (!query) {
         return { isError: true, content: [{ type: "text", text: "query is required for action='search'." }], details: undefined };
       }
-      const budget = typeof params.token_budget === "number" ? Math.min(2400, Math.max(200, params.token_budget)) : 900;
+      const budget = typeof params.token_budget === "number" ? Math.min(8000, Math.max(300, params.token_budget)) : 2400;
+      const registry = buildEntityRegistry({ card, extraCastCards: rt.getExtraCastCards(), state });
 
       const loreRes = recallLoreWithGraphPpr({
         entries: visibleLore,
@@ -1288,6 +1291,15 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         recentText: query,
         tokenBudget: budget,
         manualQuery: query,
+        registry,
+      });
+      const cardKbRes = recallCardKnowledge({
+        knowledgeIndex: card.knowledgeIndex,
+        queryText: query,
+        registry,
+        tokenBudget: Math.min(3200, budget),
+        maxPassages: 6,
+        isManual: true,
       });
 
       const qLower = query.toLowerCase();
@@ -1322,30 +1334,37 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         .filter((h) => h.status === "open" && (h.summary.toLowerCase().includes(qLower) || h.triggerHint.toLowerCase().includes(qLower)))
         .slice(0, 4);
 
-      // Optional Hybrid Semantic Embedding boost for worldbook entries when Embedding is enabled
+      // Optional Hybrid Semantic Embedding RRF boost for up to 500 worldbook entries
       const recallEmbCfg = loadUiPrefs().embeddingConfig;
       if (recallEmbCfg?.enabled && visibleLore.length > 0) {
-        const loreDocs = visibleLore.slice(0, 80).map((e) => `${e.title}: ${e.content.slice(0, 500)}`);
-        const semHits = await rankBySemanticSimilarity(recallEmbCfg, query, loreDocs, 0.30);
+        const pool = visibleLore.slice(0, 500);
+        const loreDocs = pool.map((e) => `${e.title}: ${e.content.slice(0, 1500)}`);
+        const semHits = await rankBySemanticSimilarity(recallEmbCfg, query, loreDocs, 0.28);
         if (semHits && semHits.length > 0) {
-          const existingIds = new Set(loreRes.selected.map((e) => e.id));
-          let usedTokens = loreRes.selected.reduce((sum, e) => sum + Math.ceil(e.content.length / 3), 0);
-          for (const hit of semHits.slice(0, 3)) {
-            const entry = visibleLore[hit.index];
-            if (entry && !existingIds.has(entry.id)) {
-              const est = Math.ceil(entry.content.length / 3);
-              if (usedTokens + est > budget && loreRes.selected.length > 0) continue;
-              loreRes.selected.push(entry);
-              existingIds.add(entry.id);
-              usedTokens += est;
-            }
+          const bmIds = loreRes.selected.map((e) => e.id);
+          const semIds = semHits.slice(0, 10).map((h) => pool[h.index]!.id);
+          const fused = reciprocalRankFusion(bmIds, semIds, 60);
+          const byId = new Map(pool.map((e) => [e.id, e]));
+          const nextSelected: CompiledLoreEntry[] = [];
+          let usedTokens = 0;
+          for (const item of fused) {
+            const entry = byId.get(item.id);
+            if (!entry) continue;
+            const est = Math.ceil(entry.content.length / 2.2);
+            if (usedTokens + est > budget && nextSelected.length > 0) continue;
+            nextSelected.push(entry);
+            usedTokens += est;
           }
+          if (nextSelected.length > 0) loreRes.selected = nextSelected;
         }
       }
 
       const parts: string[] = [];
       if (loreRes.selected.length > 0) {
         parts.push(`## Recalled Lore\n${loreRes.selected.map((e) => `### ${e.title}\n${e.content}`).join("\n\n")}`);
+      }
+      if (cardKbRes.passages.length > 0) {
+        parts.push(`## Recalled Card Knowledge\n${cardKbRes.passages.map((p) => `### ${p.chapterPath}\n${p.text}`).join("\n\n")}`);
       }
       if (matchedBooks.length > 0) {
         parts.push(

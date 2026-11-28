@@ -115,7 +115,7 @@ export function createInitialRpState(): SessionRpState {
     responseLength: "standard",
     narrativePov: "auto",
     bannedPhrases: [],
-    loreTokenBudget: 1800,
+    loreTokenBudget: 4000,
     sidecarModel: undefined,
     innerMonologue: false,
     applyPresetSampling: false,

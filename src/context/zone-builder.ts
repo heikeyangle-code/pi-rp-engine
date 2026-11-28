@@ -46,6 +46,8 @@ import { selectRelevantBeliefs } from "../memory/graph-ppr.js";
 import { detectRepeatedCliches, detectRuntimeSlop, type NarrativeHealthReport } from "../engine/stagnation.js";
 import { estimateTokens } from "./token-budget.js";
 import { extractHeuristicVoiceAnchor } from "../parser/analyzer.js";
+import type { EntityRegistry } from "../memory/entity-registry.js";
+import type { CardKnowledgeRecallResult } from "../parser/card-knowledge.js";
 
 function fnv1aSeed(str: string): number {
   let h = 2166136261;
@@ -115,6 +117,7 @@ function buildEngineProtocol(
       "`time:`",
       "`obj:`",
       "`fact: 事实 [witness: ...]`",
+      "`fact_off: 旧事实ID`",
       "`belief: A->B: 信念 | 诱因`",
       "`echo: 选择 -> 后果`",
     ];
@@ -131,6 +134,8 @@ function buildEngineProtocol(
             "`promise: A->B: 承诺 | due: TN`",
             "`phys: 角色 | outfit=... | pose=...`",
             "`stat: 角色.键 +N`",
+            "`cfsm: 角色.轴 -> 状态`",
+            "`bond: A<->B | 立场 | ±N`",
             "`hook: 伏笔 | 提示`",
           ];
     lines.push(
@@ -312,16 +317,20 @@ export function buildZone1FrozenPrefix(options: {
     sections.push(`## World Lore (Core)\n${formatLoreEntries(loreBeforeChar, macroCtx, preset?.utilityPrompts.wiFormat)}`);
   }
 
-  // 4. Primary Character Core (description + personality + scenario)
+  // 4. Primary Character Core (Dual-Track for giant >24K-token pure-text cards; 100% verbatim for normal cards)
   const charParts: string[] = [`# Character: ${charName}`];
-  if (card.frozen.description.trim()) {
-    charParts.push(evaluateMacros(card.frozen.description, macroCtx));
-  }
-  if (card.frozen.personality.trim()) {
-    charParts.push(`## Personality\n${evaluateMacros(card.frozen.personality, macroCtx)}`);
-  }
-  if (card.frozen.scenario.trim()) {
-    charParts.push(`## Scenario\n${evaluateMacros(card.frozen.scenario, macroCtx)}`);
+  if (card.knowledgeIndex?.dualTrackActive && !card.forceFullZone1 && card.knowledgeIndex.zone1Skeleton.trim()) {
+    charParts.push(evaluateMacros(card.knowledgeIndex.zone1Skeleton, macroCtx));
+  } else {
+    if (card.frozen.description.trim()) {
+      charParts.push(evaluateMacros(card.frozen.description, macroCtx));
+    }
+    if (card.frozen.personality.trim()) {
+      charParts.push(`## Personality\n${evaluateMacros(card.frozen.personality, macroCtx)}`);
+    }
+    if (card.frozen.scenario.trim()) {
+      charParts.push(`## Scenario\n${evaluateMacros(card.frozen.scenario, macroCtx)}`);
+    }
   }
   sections.push(charParts.join("\n\n"));
 
@@ -375,12 +384,21 @@ export function buildZone1FrozenPrefix(options: {
 /**
  * Build Zone 3 Transient Tail Frame (appended ONLY to the outbound request tail, never persisted).
  */
-export function buildZone3TransientTail(options: {
+export interface Zone3BuildStats {
+  knownFactCount: number;
+  blindSpotCount: number;
+  activeStoryletTitles: string[];
+  zone3ConstLoreTokens: number;
+  recalledCardPassageCount: number;
+}
+
+export interface Zone3BuildOptions {
   card: CompiledCard;
   extraCastCards?: CompiledCard[];
   state: SessionRpState;
   preset?: CompiledPreset | null;
   recalledLore: CompiledLoreEntry[];
+  recalledCardPassages?: CardKnowledgeRecallResult["passages"];
   recalledMemoryBooks?: MemoryBookEntry[];
   budgetDroppedLore?: Array<{ title: string; tokens?: number }>;
   recentText: string;
@@ -388,14 +406,23 @@ export function buildZone3TransientTail(options: {
   lastCharMessage?: string;
   narrativeHealth?: NarrativeHealthReport;
   maxZone3Tokens?: number;
-}): string {
+  registry?: EntityRegistry;
+}
+
+export function buildZone3TransientTail(options: Zone3BuildOptions): string {
+  return buildZone3TransientTailWithStats(options).text;
+}
+
+export function buildZone3TransientTailWithStats(options: Zone3BuildOptions): { text: string; stats: Zone3BuildStats } {
   const {
     card,
     extraCastCards = [],
     state,
     preset,
     recalledLore,
+    recalledCardPassages = [],
     recalledMemoryBooks = [],
+    registry,
     budgetDroppedLore = [],
     recentText,
     lastUserMessage,
@@ -423,9 +450,10 @@ export function buildZone3TransientTail(options: {
       e.constant &&
       (e.position === 2 || e.position === 3 || e.position === 4) &&
       e.content.trim().length > 0 &&
-      evaluateGate(e.gate, state)
+      evaluateGate(e.gate, state, registry)
     );
   });
+  const zone3ConstLoreTokens = zone3ConstantLore.reduce((acc, e) => acc + estimateTokens(`[${e.title}] ${e.content}`), 0);
 
   // Collect dynamic outlet entries (position=7) and deduplicate Zone 3 constant + recalled lore
   const dynamicOutlets: Record<string, string> = {};
@@ -535,6 +563,7 @@ export function buildZone3TransientTail(options: {
   //     into ONE high-salience narrative beat so every subsystem visibly drives the story.
   const dramaBeats: string[] = [];
   const activeStoryletsForBeat = evaluateActiveStorylets(state);
+  const xrayStoryletTitles: string[] = activeStoryletsForBeat.slice(0, 2).map((st) => st.title);
   for (const st of activeStoryletsForBeat.slice(0, 2)) {
     dramaBeats.push(
       `[STORYLET id="${st.id}"] ${st.title}: ${st.triggerPrompt} (Once played out, record \`storylet_done: ${st.id}\` in [[RP_DELTA]])`,
@@ -549,10 +578,11 @@ export function buildZone3TransientTail(options: {
       if (st.status !== "armed") continue;
       if (st.gate?.minTurn !== undefined && state.turn < st.gate.minTurn) continue;
       if (st.gate?.forbiddenFlags?.some((f) => Boolean(state.flags[f]))) continue;
+      if (st.gate?.requiredLocations?.length && !st.gate.requiredLocations.some((rl) => locLow.includes(rl.toLowerCase()))) continue;
       let score = 0;
-      if (state.turn >= 18) score += 40;
-      else if (state.turn >= 12) score += 30;
-      else if (state.turn >= 6) score += 18;
+      if (state.turn >= 18) score += 25;
+      else if (state.turn >= 12) score += 18;
+      else if (state.turn >= 6) score += 10;
       const rawText = `${st.title} ${st.triggerPrompt}`;
       const kwSet = new Set<string>();
       for (const m of rawText.match(/[a-zA-Z]{4,}/g) ?? []) kwSet.add(m.toLowerCase());
@@ -567,11 +597,13 @@ export function buildZone3TransientTail(options: {
       }
       score += Math.min(45, hits * 15);
       if (st.gate?.requiredFlags?.some((f) => Boolean(state.flags[f]))) score += 20;
-      if (score >= 55 && (!bestSoft || score > bestSoft.score)) {
+      const hasFlagBoost = Boolean(st.gate?.requiredFlags?.some((f) => Boolean(state.flags[f])));
+      if ((hits >= 2 || (hits >= 1 && hasFlagBoost)) && score >= 55 && (!bestSoft || score > bestSoft.score)) {
         bestSoft = { st, score };
       }
     }
     if (bestSoft) {
+      xrayStoryletTitles.push(bestSoft.st.title);
       dramaBeats.push(
         `[STORYLET READY id="${bestSoft.st.id}"] ${bestSoft.st.title}: ${bestSoft.st.triggerPrompt} (Weave organically when natural; mark \`storylet_done: ${bestSoft.st.id}\` once played out)`,
       );
@@ -672,6 +704,13 @@ export function buildZone3TransientTail(options: {
     if (loreText) recalledSections.push(`## World Lore\n${loreText}`);
   }
 
+  if (recalledCardPassages.length > 0) {
+    const cardText = recalledCardPassages
+      .map((p) => `[卡体原文 · ${p.chapterPath}] ${evaluateMacros(p.text, macroCtx).trim()}`)
+      .join("\n\n");
+    if (cardText) recalledSections.push(`## Card Knowledge Passages (Verbatim Evidence)\n${cardText}`);
+  }
+
   if (recalledMemoryBooks.length > 0) {
     const bookText = recalledMemoryBooks
       .map((b) => `- [${b.title} | T${b.turnRange[0]}-T${b.turnRange[1]}] ${b.summary}`)
@@ -679,10 +718,14 @@ export function buildZone3TransientTail(options: {
     recalledSections.push(`## Archived Story Chapters (Memory Books)\n${bookText}`);
   }
 
-  const activeFacts = selectFactsForZone3(state, recentText, 8, 6);
+  let xrayKnownFactCount = 0;
+  let xrayBlindSpotCount = 0;
+  const activeFacts = selectFactsForZone3(state, recentText, 14, 12, registry);
   if (activeFacts.length > 0) {
     const epistemicActors = state.presentNpcs.length > 0 ? state.presentNpcs : (charName ? [charName] : []);
-    const { known, blindSpots } = partitionEpistemicFacts(activeFacts, epistemicActors);
+    const { known, blindSpots } = partitionEpistemicFacts(activeFacts, epistemicActors, registry);
+    xrayKnownFactCount = known.length;
+    xrayBlindSpotCount = blindSpots.length;
     if (known.length > 0) {
       recalledSections.push(
         `## Established Facts\n${known.map((f) => `- [${f.id} | T${f.validFromTurn}] ${f.statement}`).join("\n")}`,
@@ -702,7 +745,7 @@ export function buildZone3TransientTail(options: {
   if (state.beliefs.length > 0) {
     const presentSet = new Set(state.presentNpcs.map((n) => n.toLowerCase()));
     const recentLower = recentText.toLowerCase();
-    const relevantBeliefs = selectRelevantBeliefs(state, recentText, 8)
+    const relevantBeliefs = selectRelevantBeliefs(state, recentText, 10, registry)
       .filter((b) => {
         if (presentSet.size === 0) return true;
         const actorLower = b.actorId.toLowerCase();
@@ -767,11 +810,13 @@ export function buildZone3TransientTail(options: {
   );
   if (visiblePhysical.length > 0 || state.spatialNotes.trim()) {
     const physLines = visiblePhysical.slice(0, 6).map((ps) => {
+      const effAttire = ps.attire || ps.outfit;
+      const effPosition = ps.position || ps.posture;
       const attrs = [
-        ps.attire ? `attire=${ps.attire}` : null,
+        effAttire ? `attire=${effAttire}` : null,
         ps.condition ? `condition=${ps.condition}` : null,
         ps.holding ? `holding=${ps.holding}` : null,
-        ps.position ? `position=${ps.position}` : null,
+        effPosition ? `position=${effPosition}` : null,
       ]
         .filter(Boolean)
         .join(" | ");
@@ -1017,9 +1062,16 @@ export function buildZone3TransientTail(options: {
     pushSection(evaluateMacros(card.tailInstructions.postHistoryInstructions, macroCtx).trim(), 1);
   }
 
-  // Enforce a total Zone 3 token budget cap by dropping lower-priority optional sections first
-  const loreTokenBudget = state.loreTokenBudget || 1800;
-  const zone3Cap = maxZone3Tokens ?? Math.max(2200, Math.min(3600, loreTokenBudget + 1200));
+  const stats: Zone3BuildStats = {
+    knownFactCount: xrayKnownFactCount,
+    blindSpotCount: xrayBlindSpotCount,
+    activeStoryletTitles: xrayStoryletTitles,
+    zone3ConstLoreTokens,
+    recalledCardPassageCount: recalledCardPassages.length,
+  };
+  // Generous modern Zone 3 cap (4,800 - 9,600 tokens)
+  const loreTokenBudget = state.loreTokenBudget || 4000;
+  const zone3Cap = maxZone3Tokens ?? Math.max(4800, Math.min(9600, loreTokenBudget + 3200));
   let totalTokens = sections.reduce((sum, s) => sum + estimateTokens(s.text), 0);
   if (totalTokens > zone3Cap) {
     const keepFlags = sections.map(() => true);
@@ -1031,13 +1083,16 @@ export function buildZone3TransientTail(options: {
         }
       }
     }
-    return sections
-      .filter((_, idx) => keepFlags[idx])
-      .map((s) => s.text)
-      .join("\n\n");
+    return {
+      text: sections
+        .filter((_, idx) => keepFlags[idx])
+        .map((s) => s.text)
+        .join("\n\n"),
+      stats,
+    };
   }
 
-  return sections.map((s) => s.text).join("\n\n");
+  return { text: sections.map((s) => s.text).join("\n\n"), stats };
 }
 
 /**

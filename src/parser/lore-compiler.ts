@@ -490,13 +490,13 @@ export function compileLoreBook(
 ): CompiledLoreBook {
   const warnings: string[] = [];
   if (!rawBook || typeof rawBook !== "object") {
-    return { tokenBudget: 1800, scanDepth: 4, entries: [], warnings };
+    return { tokenBudget: 4000, scanDepth: 4, entries: [], warnings };
   }
 
   const rawList = extractRawLoreEntries(rawBook);
   const rawBudget = toNumber(rawBook.token_budget, 0);
-  const tokenBudget = rawBudget > 0 ? rawBudget : 1800;
-  const scanDepth = Math.max(1, Math.min(toNumber(rawBook.scan_depth, 4), 20));
+  const tokenBudget = rawBudget > 0 ? rawBudget : 4000;
+  const scanDepth = Math.max(1, Math.min(toNumber(rawBook.scan_depth, 4), 50));
   const compiled: CompiledLoreEntry[] = [];
   const seenIds = new Set<string>();
 
@@ -585,15 +585,13 @@ export function compileLoreBook(
     const groupWeight = toNumber(raw.group_weight ?? raw.groupWeight ?? ext.group_weight, 100);
     const useGroupScoring = Boolean(raw.use_group_scoring ?? raw.useGroupScoring ?? ext.use_group_scoring ?? false);
 
-    const noGraphSpread = Boolean(
-      raw.prevent_recursion ??
-        raw.preventRecursion ??
-        ext.prevent_recursion ??
-        raw.exclude_recursion ??
-        raw.excludeRecursion ??
-        ext.exclude_recursion ??
-        false,
+    const preventRecursion = Boolean(
+      raw.prevent_recursion ?? raw.preventRecursion ?? ext.prevent_recursion ?? false,
     );
+    const excludeRecursion = Boolean(
+      raw.exclude_recursion ?? raw.excludeRecursion ?? ext.exclude_recursion ?? false,
+    );
+    const noGraphSpread = preventRecursion || excludeRecursion;
     const graphSecondHopOnly = Boolean(
       raw.delay_until_recursion ?? raw.delayUntilRecursion ?? ext.delay_until_recursion ?? false,
     );
@@ -669,6 +667,9 @@ export function compileLoreBook(
       groupWeight,
       useGroupScoring,
       noGraphSpread,
+      preventRecursion,
+      excludeRecursion,
+      revision: 1,
       graphSecondHopOnly,
       outletName,
       staticPrebound,

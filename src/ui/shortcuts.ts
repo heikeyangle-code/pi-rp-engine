@@ -24,6 +24,7 @@ export const RP_SHORTCUT_LIST: RpShortcutSpec[] = [
   { key: "alt+i", label: "代写回复", description: "帮我代写回复" },
   { key: "alt+q", label: "场外提问", description: "零污染场外提问" },
   { key: "alt+o", label: "导演指令", description: "管理导演指令" },
+  { key: "alt+x", label: "检索透视", description: "查看上下文与召回透视 (X-Ray)" },
 ];
 
 export interface RpShortcutHandlers {

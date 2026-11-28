@@ -1,11 +1,16 @@
 /**
  * Physical Era / Milestone Gates (NCP-Bench / TimeChara) & Epistemic Visibility Filter (FANToM).
- * Locked lore/facts are physically excluded in code before reaching the LLM payload.
+ * Upgraded with EntityRegistry alias canonicalization so nicknames/epithets never cause false blind spots or secret leaks!
  */
 
 import type { BiTemporalFact, GateCondition, SessionRpState } from "../types.js";
+import type { EntityRegistry } from "../memory/entity-registry.js";
 
-export function evaluateGate(gate: GateCondition | undefined, state: SessionRpState): boolean {
+export function evaluateGate(
+  gate: GateCondition | undefined,
+  state: SessionRpState,
+  registry?: EntityRegistry,
+): boolean {
   if (!gate) return true;
 
   if (gate.minTurn !== undefined && state.turn < gate.minTurn) {
@@ -40,8 +45,9 @@ export function evaluateGate(gate: GateCondition | undefined, state: SessionRpSt
     if (!matched) return false;
   }
   if (gate.requiredNpcPresent && gate.requiredNpcPresent.length > 0) {
-    const present = new Set(state.presentNpcs.map((n) => n.toLowerCase()));
-    const allPresent = gate.requiredNpcPresent.every((req) => present.has(req.toLowerCase()));
+    const norm = (n: string) => (registry ? registry.resolveCanonical(n).toLowerCase() : n.toLowerCase());
+    const present = new Set(state.presentNpcs.map(norm));
+    const allPresent = gate.requiredNpcPresent.every((req) => present.has(norm(req)));
     if (!allPresent) return false;
   }
   if (gate.statChecks && gate.statChecks.length > 0) {
@@ -49,9 +55,12 @@ export function evaluateGate(gate: GateCondition | undefined, state: SessionRpSt
       const targetKey = check.key.toLowerCase();
       let matchedVal: number | undefined;
       if (check.actorId) {
-        const targetActor = check.actorId.toLowerCase();
+        const targetActor = registry
+          ? registry.resolveCanonical(check.actorId).toLowerCase()
+          : check.actorId.toLowerCase();
         for (const [actor, stats] of Object.entries(state.stats)) {
-          if (actor.toLowerCase() !== targetActor) continue;
+          const actorNorm = registry ? registry.resolveCanonical(actor).toLowerCase() : actor.toLowerCase();
+          if (actorNorm !== targetActor && actor.toLowerCase() !== check.actorId.toLowerCase()) continue;
           for (const [k, v] of Object.entries(stats)) {
             if (k.toLowerCase() === targetKey && typeof v === "number") {
               matchedVal = v;
@@ -80,21 +89,29 @@ export function evaluateGate(gate: GateCondition | undefined, state: SessionRpSt
   return true;
 }
 
-/** Check whether a specific NPC can epistemically know a given fact. */
-export function isFactVisibleToActor(fact: BiTemporalFact, actorId: string): boolean {
+/** Check whether a specific NPC (or any of their aliases) can epistemically know a given fact. */
+export function isFactVisibleToActor(
+  fact: BiTemporalFact,
+  actorId: string,
+  registry?: EntityRegistry,
+): boolean {
   if (fact.witnessIds === "public") return true;
+  if (registry) {
+    return fact.witnessIds.some((w) => registry.sameEntity(w, actorId));
+  }
   const target = actorId.toLowerCase();
   return fact.witnessIds.some((w) => w.toLowerCase() === target);
 }
 
 /**
  * Partition active facts into:
- *  - `known`: public facts or facts witnessed by at least one present NPC
+ *  - `known`: public facts or facts witnessed by every present NPC (alias-aware!)
  *  - `blindSpots`: facts witnessed by someone else, annotated with which present NPCs DO NOT know them
  */
 export function partitionEpistemicFacts(
   facts: BiTemporalFact[],
   presentNpcs: string[],
+  registry?: EntityRegistry,
 ): {
   known: BiTemporalFact[];
   blindSpots: Array<{ fact: BiTemporalFact; ignorantNpcs: string[] }>;
@@ -107,7 +124,7 @@ export function partitionEpistemicFacts(
       known.push(fact);
       continue;
     }
-    const ignorant = presentNpcs.filter((npc) => !isFactVisibleToActor(fact, npc));
+    const ignorant = presentNpcs.filter((npc) => !isFactVisibleToActor(fact, npc, registry));
     if (ignorant.length === 0) {
       known.push(fact);
     } else {

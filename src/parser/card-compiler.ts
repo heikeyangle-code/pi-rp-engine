@@ -22,6 +22,7 @@ import {
   type StrippedRecord,
 } from "./sanitizer.js";
 import { rewriteEmbeddedAssetUri } from "./unpack.js";
+import { compileCardKnowledgeIndex } from "./card-knowledge.js";
 
 const WEB_ONLY_ASSET_TYPES = new Set(["live2d", "vrm", "x-risu-asset", "x-risu-bg", "video"]);
 
@@ -64,7 +65,7 @@ export function compileCharacterCard(
   const name = asString(data.name).trim() || "Unnamed Character";
   const nickname = asString(data.nickname).trim() || undefined;
   const slug = slugify(name);
-  const id = `${slug}-${crypto.createHash("sha1").update(name + asString(data.description).slice(0, 128)).digest("hex").slice(0, 6)}`;
+  const id = `${slug}-${crypto.createHash("sha1").update(name + "\0" + asString(data.description)).digest("hex").slice(0, 8)}`;
 
   const strippedAll: StrippedRecord[] = [];
   const warnings: string[] = [];
@@ -180,6 +181,7 @@ export function compileCharacterCard(
 
   // 4. Filter extensions.regex_scripts: respect official ST placement, promptOnly, markdownOnly, trimStrings, substituteRegex
   const displayRegexRules: CompiledRegexRule[] = [];
+  const promptRegexRules: CompiledRegexRule[] = [];
   if (Array.isArray(extensions.regex_scripts)) {
     for (const item of extensions.regex_scripts) {
       if (!item || typeof item !== "object") continue;
@@ -202,18 +204,13 @@ export function compileCharacterCard(
       const promptOnly = Boolean(rec.promptOnly);
       const markdownOnly = Boolean(rec.markdownOnly);
 
-      // Skip rules that never affect AI output display (e.g. USER_INPUT-only or promptOnly)
-      if (promptOnly || (placements.length > 0 && !placements.includes(2))) {
-        continue;
-      }
-
       const rawFind = asString(rec.findRegex);
       const replaceString = asString(rec.replaceString);
       const parsedRe = parseStRegexString(rawFind);
       if (parsedRe && isSafeRegexPattern(parsedRe.pattern)) {
         const subRaw = typeof rec.substituteRegex === "number" ? rec.substituteRegex : 0;
         const substituteRegex: 0 | 1 | 2 = subRaw === 1 ? 1 : subRaw === 2 ? 2 : 0;
-        displayRegexRules.push({
+        const compiledRule: CompiledRegexRule = {
           name: asString(rec.scriptName) || "regex",
           pattern: parsedRe.pattern,
           flags: parsedRe.flags,
@@ -225,7 +222,13 @@ export function compileCharacterCard(
           promptOnly,
           minDepth: typeof rec.minDepth === "number" ? rec.minDepth : undefined,
           maxDepth: typeof rec.maxDepth === "number" ? rec.maxDepth : undefined,
-        });
+        };
+        if (promptOnly || placements.includes(1) || placements.includes(5)) {
+          promptRegexRules.push(compiledRule);
+        }
+        if (!promptOnly && (placements.length === 0 || placements.includes(2))) {
+          displayRegexRules.push(compiledRule);
+        }
       } else if (rawFind) {
         warnings.push(`跳过非法或不安全的展示正则脚本「${asString(rec.scriptName) || rawFind.slice(0, 24)}」`);
       }
@@ -341,6 +344,19 @@ export function compileCharacterCard(
       source: asStringArray(data.source),
     },
     displayRegexRules,
+    promptRegexRules,
+    knowledgeIndex: compileCardKnowledgeIndex({
+      id,
+      identity: { name, nickname, aliases, avatarPath: options.avatarPath, talkativeness },
+      frozen: {
+        systemPrompt: finalSystemPrompt,
+        description: cleanedDescription,
+        personality: cleanedPersonality,
+        scenario: cleanedScenario,
+        mesExample: cleanedMesExample,
+        constantLoreIds,
+      },
+    }),
     salvagedStateSchema,
     worldProfile: inferHeuristicWorldProfile({
       description: cleanedDescription,
@@ -353,5 +369,80 @@ export function compileCharacterCard(
     }),
     loreBook,
     importReport,
+  };
+}
+
+/** Losslessly merge edited CompiledCard fields & loreBook back onto original rawJson as CCV3 JSON. */
+export function exportCardToCcv3Json(
+  rawJson: Record<string, unknown> | null,
+  card: CompiledCard,
+): Record<string, unknown> {
+  const baseRaw = rawJson && typeof rawJson === "object" ? JSON.parse(JSON.stringify(rawJson)) : {};
+  const baseData = (baseRaw.data && typeof baseRaw.data === "object" ? baseRaw.data : baseRaw) as Record<string, unknown>;
+  return {
+    spec: "chara_card_v3",
+    spec_version: "3.0",
+    data: {
+      ...baseData,
+      name: card.identity.name,
+      nickname: card.identity.nickname ?? baseData.nickname ?? "",
+      description: card.frozen.description,
+      personality: card.frozen.personality,
+      scenario: card.frozen.scenario,
+      mes_example: card.frozen.mesExample,
+      system_prompt: card.frozen.systemPrompt,
+      post_history_instructions: card.tailInstructions.postHistoryInstructions,
+      first_mes: card.greetings.firstMes,
+      alternate_greetings: card.greetings.alternates,
+      group_only_greetings: card.greetings.groupOnly,
+      tags: card.meta.tags,
+      creator: card.meta.creator ?? baseData.creator ?? "",
+      character_version: card.meta.version ?? baseData.character_version ?? "",
+      creator_notes: card.meta.creatorNotes ?? baseData.creator_notes ?? "",
+      modification_date: Math.floor(Date.now() / 1000),
+      character_book: {
+        name: card.loreBook.name ?? card.identity.name,
+        description: card.loreBook.description ?? "",
+        token_budget: card.loreBook.tokenBudget,
+        scan_depth: card.loreBook.scanDepth,
+        entries: card.loreBook.entries.map((e, idx) => ({
+          id: e.id,
+          comment: e.title,
+          name: e.title,
+          keys: e.keys,
+          secondary_keys: e.secondaryKeys,
+          content: e.content,
+          enabled: e.enabled,
+          constant: e.constant,
+          selective: e.selective,
+          use_regex: e.useRegex,
+          case_sensitive: e.caseSensitive,
+          insertion_order: e.priority,
+          priority: e.priority,
+          position: e.position,
+          extensions: {
+            selectiveLogic: e.selectiveLogic,
+            match_whole_words: e.matchWholeWords,
+            prevent_recursion: e.preventRecursion ?? false,
+            exclude_recursion: e.excludeRecursion ?? false,
+            delay_until_recursion: e.graphSecondHopOnly,
+            depth: e.depthHint,
+            role: e.role,
+            sticky: e.stickyTurns,
+            cooldown: e.cooldownTurns,
+            probability: e.probability,
+            useProbability: e.useProbability,
+            group: e.group,
+            group_override: e.groupOverride,
+            group_weight: e.groupWeight,
+            use_group_scoring: e.useGroupScoring,
+            ignore_budget: e.pinned,
+            outlet_name: e.outletName,
+            ...(e.gate ? { gate: e.gate } : {}),
+          },
+          _order: idx,
+        })),
+      },
+    },
   };
 }
