@@ -13,6 +13,7 @@ import * as crypto from "node:crypto";
 import type { CardSpecOrigin, CompiledCard, CompiledRegexRule, ImportAuditReport } from "../types.js";
 import { compileLoreBook, extractRawLoreEntries, isSafeRegexPattern } from "./lore-compiler.js";
 import { salvageMvuVariables } from "./mvu-salvage.js";
+import { extractPlainTextStats, inferHeuristicWorldProfile } from "./world-profile.js";
 import {
   deduplicateBoilerplateAcrossFields,
   isFrontendRegexScript,
@@ -102,7 +103,7 @@ export function compileCharacterCard(
     .map((entry) => asString(entry.content))
     .filter(Boolean);
 
-  const salvagedStateSchema = salvageMvuVariables({
+  const mvuSalvaged = salvageMvuVariables({
     firstMes: rawFirstMes,
     description: rawDescription,
     systemPrompt: rawSystemPrompt,
@@ -110,6 +111,12 @@ export function compileCharacterCard(
     extensions,
     rawConstantLoreContents,
   });
+  const plainStats = extractPlainTextStats(`${rawScenario}\n${rawFirstMes}`);
+  const salvagedByKey = new Map(mvuSalvaged.map((v) => [v.key, v]));
+  for (const ps of plainStats) {
+    if (!salvagedByKey.has(ps.key)) salvagedByKey.set(ps.key, ps);
+  }
+  const salvagedStateSchema = Array.from(salvagedByKey.values());
 
   // 1. Surgically strip frontend HTML/JS shells while keeping 100% of narrative, mes_example, and jailbreaks
   const cleanedSystemPrompt = sanitizeField("system_prompt", rawSystemPrompt);
@@ -314,6 +321,15 @@ export function compileCharacterCard(
     },
     displayRegexRules,
     salvagedStateSchema,
+    worldProfile: inferHeuristicWorldProfile({
+      description: cleanedDescription,
+      personality: cleanedPersonality,
+      scenario: cleanedScenario,
+      firstMes: cleanedFirstMes,
+      loreEntries: loreBook.entries,
+      salvagedVariables: salvagedStateSchema,
+      hasGroupGreetings: asStringArray(data.group_only_greetings).length > 0,
+    }),
     loreBook,
     importReport,
   };

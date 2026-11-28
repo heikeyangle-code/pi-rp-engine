@@ -49,17 +49,21 @@ import {
 import { applyDisplayRegexRules, stripDisplayResiduals } from "./parser/sanitizer.js";
 import { RP_TOOL_NAMES, registerRpTools } from "./tools/rp-tools.js";
 import { clearRpHud, renderRpHud } from "./ui/hud.js";
-import { registerRpMessageRenderers } from "./ui/renderers.js";
+import { registerRpEntryRenderer, registerRpMessageRenderers } from "./ui/renderers.js";
 import {
   type RpRuntimeHandle,
+  actionBookmarkGoto,
   actionBookmarkSave,
   actionContinue,
+  actionCyclePacing,
   actionDirectorNote,
   actionExitRp,
   actionIdeas,
   actionManualRoll,
   actionOoc,
+  actionReroll,
   actionSetHud,
+  actionSkipMontage,
 } from "./ui/actions.js";
 import { makeDashboardRuntime, openRpMenu, registerRpCommands } from "./ui/commands.js";
 import { openRpDashboard } from "./ui/dashboard.js";
@@ -149,6 +153,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     resetTransientTurnBuffers();
     restoreCodingTools();
     clearRpHud(ctx);
+    ctx.ui.setWorkingMessage?.(undefined);
+    ctx.ui.setTitle?.("Pi");
   }
 
   function refreshHud(ctx?: PiExtensionContext): void {
@@ -245,23 +251,28 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     refreshHud,
   });
 
-  // Register custom editorial TUI message renderers
+  // Register custom editorial TUI message renderers & /tree entry renderer
   registerRpMessageRenderers(pi);
+  registerRpEntryRenderer(pi);
 
   // Register `/rp` command palette & subcommands
   registerRpCommands(pi, runtime);
 
-  // Register 10 ergonomic, terminal-safe shortcuts
+  // Register 14 ergonomic, terminal-safe shortcuts
   registerRpShortcuts(pi, {
     isActive: () => state.active,
     openMenu: (ctx) => openRpMenu(runtime, ctx),
     openDashboard: (ctx) => openRpDashboard(makeDashboardRuntime(runtime), ctx),
+    rerollLast: (ctx) => actionReroll(runtime, ctx, ""),
     continueStory: (ctx) => actionContinue(runtime, ctx),
     actionIdeas: (ctx) => actionIdeas(runtime, ctx),
     directorNote: (ctx) => actionDirectorNote(runtime, ctx, ""),
+    cyclePacing: (ctx) => actionCyclePacing(runtime, ctx),
     oocChat: (ctx) => actionOoc(runtime, ctx, ""),
     quickRoll: (ctx) => actionManualRoll(runtime, ctx, ""),
+    skipTime: (ctx) => actionSkipMontage(runtime, ctx, ""),
     saveBookmark: (ctx) => actionBookmarkSave(runtime, ctx, ""),
+    gotoBookmark: (ctx) => actionBookmarkGoto(runtime, ctx, ""),
     cycleHud: (ctx) => actionSetHud(runtime, ctx, ""),
     exitRp: (ctx) => actionExitRp(runtime, ctx, true),
   });
@@ -283,7 +294,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
         }
         return out;
       },
-      { messageTypes: ["assistant", "rp:greeting"] },
+      { messageTypes: ["assistant", "custom"] },
     );
   }
 
@@ -299,17 +310,33 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     reloadRuntime(ctx);
   });
 
-  pi.on("session_switch", (_event, ctx) => {
-    reloadRuntime(ctx);
+  // Zero-friction inline OOC shorthand: `((...))` or `（（...））` automatically marks OOC turn without advancing story/clock
+  pi.on("input", (event) => {
+    if (!state.active || !activeCard) return { action: "continue" };
+    const raw = typeof event?.text === "string" ? event.text.trim() : "";
+    const oocMatch = /^(?:\(\(([\s\S]+?)\)\)|（（([\s\S]+?)））)$/.exec(raw);
+    if (oocMatch) {
+      const inner = (oocMatch[1] ?? oocMatch[2] ?? "").trim();
+      if (inner) {
+        isOocTurn = true;
+        return {
+          action: "transform",
+          text: `[OOC - Out of Character Discussion; do NOT advance the story or modify world state]\n${inner}`,
+        };
+      }
+    }
+    return { action: "continue" };
   });
 
   // Zone 1 Frozen Prefix (KV-Cache 100% byte-identical across turns)
-  pi.on("before_agent_start", (event) => {
+  pi.on("before_agent_start", (event, ctx) => {
     if (!state.active || !activeCard) return;
 
     if (typeof event?.prompt === "string") {
       lastUserText = event.prompt;
     }
+    const charLabel = activeCard.identity.nickname || activeCard.identity.name;
+    ctx?.ui?.setWorkingMessage?.(isOocTurn ? "OOC 讨论思考中…" : `${charLabel} 正在回应…`);
 
     const initialPersona = state.initialPersona ?? state.currentPersona;
     const zone1 = buildZone1FrozenPrefix({
@@ -427,6 +454,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
+    ctx?.ui?.setWorkingMessage?.(undefined);
     await triggerSidecarOnce(ctx);
   });
 

@@ -58,7 +58,7 @@ export function buildMemSceneCompactionSummary(
   },
 ): string {
   const lines: string[] = [
-    `# MemScene 幕间记忆归并 (${state.era} · ${state.worldTimeLabel} · Turn ${state.turn})`,
+    `# MemScene 幕间记忆归并 (${[state.era, state.worldTimeLabel, `Turn ${state.turn}`].filter(Boolean).join(" · ")})`,
   ];
 
   if (state.location) {

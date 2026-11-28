@@ -26,11 +26,14 @@ import type {
 } from "../types.js";
 import { unpackFile } from "../parser/unpack.js";
 import { compileCharacterCard } from "../parser/card-compiler.js";
+import { analyzeCardWithModel, applyAnalyzedProfileToCard } from "../parser/analyzer.js";
 import { compileLoreBook } from "../parser/lore-compiler.js";
 import { compileSillyTavernPreset } from "../parser/preset.js";
 import { evaluateMacros } from "../parser/macros.js";
 import { rollDiceCheck } from "../engine/dice.js";
 import { computeMessageFingerprint } from "../engine/state-replay.js";
+import { getActiveFacts } from "../memory/bitemporal.js";
+import { canCompleteWithRegistry } from "../engine/llm-helper.js";
 import {
   getGlobalLibraryDir,
   getProjectRpDir,
@@ -166,6 +169,35 @@ export async function bindCardToCurrentSession(
     persona,
   });
 
+  // Seed universal WorldProfile (archetype, enabled modules, initial anchors & inventory)
+  if (card.worldProfile) {
+    const wp = card.worldProfile;
+    rt.commitTx({
+      kind: "profile_apply",
+      archetype: wp.archetype,
+      modules: wp.modules,
+      initialStage: wp.modules.stages ? wp.initialStage : undefined,
+      initialTime: wp.initialTime,
+    });
+    if (wp.initialLocation || wp.initialPresentNpcs.length > 0) {
+      rt.commitTx({
+        kind: "location_set",
+        location: wp.initialLocation ?? "",
+        presentNpcs: wp.initialPresentNpcs,
+      });
+    }
+    if (wp.modules.inventory) {
+      for (const inv of wp.initialInventory) {
+        if (inv.item && inv.count > 0) {
+          rt.commitTx({ kind: "inventory_patch", actorId: "player", item: inv.item, delta: inv.count, note: "profile_init" });
+        }
+      }
+    }
+    for (const ax of wp.suggestedCfsmAxes) {
+      rt.commitTx({ kind: "cfsm_define", actorId: card.identity.name, def: ax });
+    }
+  }
+
   // Seed salvaged MVU/YAML/macro variables into deterministic L1 stats
   for (const v of card.salvagedStateSchema) {
     rt.commitTx({
@@ -183,6 +215,8 @@ export async function bindCardToCurrentSession(
   rt.reloadRuntime(ctx);
   rt.activateRpTools();
   rt.refreshHud(ctx);
+  rt.pi.setSessionName?.(`🎭 ${card.identity.name}`);
+  ctx.ui.setTitle?.(`◆ ${card.identity.name} · Pi RP`);
 
   const state = rt.getState();
   const allGreetings = [card.greetings.firstMes, ...card.greetings.alternates];
@@ -520,9 +554,10 @@ export async function actionContinue(rt: RpRuntimeHandle, ctx: PiExtensionContex
   const nudge =
     rt.getPreset()?.utilityPrompts.continueNudge ||
     "[Continue the scene seamlessly from the exact point where the narrative left off, maintaining voice, atmosphere, and momentum without repeating prior paragraphs.]";
+  const busy = ctx.isIdle?.() === false;
   rt.pi.sendMessage(
     { customType: "rp:event", content: nudge, display: false, details: { kind: "continue" } },
-    { triggerTurn: true },
+    busy ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: true },
   );
 }
 
@@ -800,7 +835,7 @@ export async function actionBookmarkSave(rt: RpRuntimeHandle, ctx: PiExtensionCo
     ctx.ui.notify("当前会话尚无可标记的历史节点。", "warning");
     return;
   }
-  const suggested = `${state.era}${state.location ? ` · ${state.location}` : ""} · T${state.turn}`;
+  const suggested = [state.era, state.worldTimeLabel, state.location, `T${state.turn}`].filter(Boolean).join(" · ");
   let label = argsText.trim();
   if (!label) {
     const entered = await ctx.ui.input("🔖 输入剧情书签名称（回车使用默认）", suggested);
@@ -862,7 +897,8 @@ export async function actionBookmarkGoto(rt: RpRuntimeHandle, ctx: PiExtensionCo
       ctx.ui.notify(`已回溯至书签「${target.label}」，所有数值与事实账本已同步还原。`, "info");
     }
   } else {
-    ctx.ui.notify("当前环境不支持 navigateTree，请使用 Pi 原生 /tree 选择节点。", "info");
+    ctx.ui.setEditorText?.(`/rp goto ${target.label}`);
+    ctx.ui.notify(`已将跳转命令填入输入框，按回车即可回溯/分叉至「${target.label}」（或用 /tree 切换）。`, "info");
   }
 }
 
@@ -1034,22 +1070,26 @@ export async function actionSkipMontage(rt: RpRuntimeHandle, ctx: PiExtensionCon
     desc = entered.trim();
   }
   const dayMatch = /(\d+)\s*(天|日|days?)/i.exec(desc);
-  const dayDelta = dayMatch ? Number(dayMatch[1]) : 1;
-  const nextEra = /幕|章|Act/i.test(desc) ? desc : state.era;
+  const dayDelta = dayMatch ? Number(dayMatch[1]) : /次日|明天|隔日|翌/i.test(desc) ? 1 : 0;
+  const isStageChange = /(?:第[一二三四五六七八九十0-9]+[幕章篇卷]|纪元|Act\s+[IVX0-9]+|Chapter)/i.test(desc);
+  const nextEra = isStageChange ? desc : state.era;
 
-  rt.commitTx({
-    kind: "era_advance",
-    fromEra: state.era,
-    toEra: nextEra,
-    milestoneUnlocked: [],
-    montageSummary: desc,
-    turn: state.turn,
-  });
+  if (isStageChange && nextEra !== state.era) {
+    rt.commitTx({
+      kind: "era_advance",
+      fromEra: state.era,
+      toEra: nextEra,
+      milestoneUnlocked: [],
+      montageSummary: desc,
+      turn: state.turn,
+    });
+  }
+  const nextTimeLabel = dayDelta > 0 && !/第\s*\d+\s*天/.test(desc) ? `第 ${state.day + dayDelta} 天 · ${desc}` : desc;
   rt.commitTx({
     kind: "clock_tick",
     beatDelta: 0,
     dayDelta,
-    worldTimeLabel: `Day ${state.day + dayDelta} (${desc})`,
+    worldTimeLabel: nextTimeLabel,
   });
   rt.refreshHud(ctx);
   rt.pi.sendMessage(
@@ -1221,6 +1261,9 @@ export async function actionToggleRawPassthrough(
     const recompiled = compileCharacterCard(rawJson, currentCard.specOrigin, {
       rawPassthrough: next,
     });
+    if (currentCard.worldProfile?.source === "llm-analyzed") {
+      applyAnalyzedProfileToCard(recompiled, currentCard.worldProfile, true);
+    }
     saveCompiledCard({ baseDir: state.worldDir, card: recompiled, rawJson });
   }
   rt.commitTx({ kind: "config_patch", rawPassthrough: next });
@@ -1236,5 +1279,295 @@ export async function actionShowShortcuts(ctx: PiExtensionContext): Promise<void
   await ctx.ui.select(
     "⌨️ RP 快捷键速查（Pi 原生 /hotkeys 也可查看全部绑定）",
     [...RP_SHORTCUT_LIST.map((s) => `${s.key.padEnd(14)}  ${s.label} — ${s.description}`), "✕ 关闭"],
+  );
+}
+
+/** L1 One-Click AI Deep Card Analyzer (`/rp analyze`): extracts universal WorldProfile and caches it to card.compiled.json. */
+export async function actionAnalyzeCard(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("请先加载一张角色卡再执行 /rp analyze 智能建档。", "warning");
+    return;
+  }
+  if (!canCompleteWithRegistry(ctx)) {
+    ctx.ui.notify("当前环境不支持模型调用，无法执行智能建档。", "warning");
+    return;
+  }
+
+  ctx.ui.notify(`🔍 正在智能分析「${card.identity.name}」的卡型、初态与隐藏门禁…`, "info");
+  let res;
+  try {
+    res = await analyzeCardWithModel(ctx, card);
+  } catch (err) {
+    ctx.ui.notify(`智能建档失败：${(err as Error).message}`, "error");
+    return;
+  }
+  if (!res) {
+    ctx.ui.notify("未能解析模型返回的结构化画像，请稍后重试。", "warning");
+    return;
+  }
+
+  const { profile, initialStats } = res;
+  const enabledMods = Object.entries(profile.modules)
+    .filter(([, on]) => on)
+    .map(([k]) => k)
+    .join(", ") || "仅基础叙事";
+  const preview = [
+    `卡型判定：${profile.archetype}（启用模块：${enabledMods}）`,
+    `初始时空：${[profile.initialStage, profile.initialTime, profile.initialLocation].filter(Boolean).join(" · ") || "无显式初态"}`,
+    profile.initialPresentNpcs.length ? `在场人物：${profile.initialPresentNpcs.join("、")}` : null,
+    profile.initialInventory.length ? `初始物品：${profile.initialInventory.map((i) => `${i.item}×${i.count}`).join("、")}` : null,
+    initialStats.length ? `初始数值：${initialStats.map((s) => `${s.key}=${s.initialValue}`).join("、")}` : null,
+    profile.suggestedCfsmAxes.length ? `关系/状态轴：${profile.suggestedCfsmAxes.map((a) => `${a.axis}(${a.states.join("→")})`).join("；")}` : null,
+    Object.keys(profile.entityAliases).length ? `实体别名：${Object.keys(profile.entityAliases).length} 组` : null,
+    profile.suggestedLoreGates.length ? `建议防剧透门禁：${profile.suggestedLoreGates.length} 条世界书` : null,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const ok = await ctx.ui.confirm("应用并永久缓存智能建档结果？", preview);
+  if (!ok) {
+    ctx.ui.notify("已取消应用建档结果。", "info");
+    return;
+  }
+
+  applyAnalyzedProfileToCard(card, profile, true);
+  if (state.worldDir) {
+    const rawJson = loadRawCardJson(state.worldDir, card.slug) ?? {};
+    saveCompiledCard({ baseDir: state.worldDir, card, rawJson });
+  }
+
+  rt.commitTx({
+    kind: "profile_apply",
+    archetype: profile.archetype,
+    modules: profile.modules,
+    initialStage: profile.modules.stages ? profile.initialStage : undefined,
+    initialTime: profile.initialTime,
+  });
+  if (profile.initialLocation || profile.initialPresentNpcs.length > 0) {
+    rt.commitTx({
+      kind: "location_set",
+      location: profile.initialLocation ?? state.location,
+      presentNpcs: profile.initialPresentNpcs.length ? profile.initialPresentNpcs : state.presentNpcs,
+    });
+  }
+  for (const s of initialStats) {
+    rt.commitTx({
+      kind: "stat_patch",
+      actorId: card.identity.name,
+      key: s.key,
+      op: "set",
+      value: s.initialValue,
+      min: s.min,
+      max: s.max,
+      reason: "llm_analyze",
+    });
+  }
+  if (profile.modules.inventory) {
+    for (const inv of profile.initialInventory) {
+      rt.commitTx({ kind: "inventory_patch", actorId: "player", item: inv.item, delta: inv.count, note: "llm_analyze" });
+    }
+  }
+  for (const ax of profile.suggestedCfsmAxes) {
+    rt.commitTx({ kind: "cfsm_define", actorId: card.identity.name, def: ax });
+  }
+
+  rt.reloadRuntime(ctx);
+  rt.refreshHud(ctx);
+  ctx.ui.notify(`✅ 已完成「${card.identity.name}」智能建档并永久缓存，后续新开局 0 Token 复用！`, "info");
+}
+
+
+/** True SillyTavern-style Swipe / Reroll (`/rp reroll` & `Alt+W`): branches on Pi's native Session Tree or hides+regenerates cleanly. */
+export async function actionReroll(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const branch = ctx.sessionManager.getBranch();
+  let lastAssistantIdx = -1;
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const e = branch[i]!;
+    if (e.type === "message" && e.message?.role === "assistant") {
+      lastAssistantIdx = i;
+      break;
+    }
+  }
+  if (lastAssistantIdx < 0) {
+    ctx.ui.notify("当前分支还没有可重摇的回复。", "info");
+    return;
+  }
+
+  let lastUserIdx = -1;
+  for (let i = lastAssistantIdx - 1; i >= 0; i--) {
+    const e = branch[i]!;
+    if (e.type === "message" && e.message?.role === "user") {
+      lastUserIdx = i;
+      break;
+    }
+  }
+
+  let steerHint = argsText.trim();
+  if (!steerHint) {
+    const pick = await ctx.ui.select("🎲 重摇上一条回复 (Swipe / Reroll)", [
+      "🎲 直接重摇（换一种演绎，原分支保留在 /tree 中）",
+      "✨ 带微调方向重摇（如：语气更克制 / 细节更细腻 / 推进冲突）",
+      "✕ 取消",
+    ]);
+    if (!pick || pick.startsWith("✕")) return;
+    if (pick.startsWith("✨")) {
+      const entered = (await ctx.ui.input("输入本次重摇的微调提示（仅生效 1 轮）", "语气更细腻，增加微表情与环境细节"))?.trim();
+      if (!entered) return;
+      steerHint = entered;
+    }
+  }
+
+  const assistantEntry = branch[lastAssistantIdx]!;
+  const userEntry = lastUserIdx >= 0 ? branch[lastUserIdx]! : undefined;
+  const userText = userEntry ? extractMsgPlain(userEntry.message) : "";
+
+  // Preferred path: true tree-branching Swipe via navigateTree so old swipe stays intact in Pi /tree!
+  if (typeof ctx.navigateTree === "function" && userEntry && userEntry.parentId) {
+    const nav = await ctx.navigateTree(userEntry.parentId);
+    if (nav?.cancelled) return;
+    rt.reloadRuntime(ctx);
+    if (steerHint) {
+      rt.commitTx({
+        kind: "note_set",
+        note: { id: `reroll_${Date.now().toString(36)}`, text: `[重摇微调] ${steerHint}`, remainingTurns: 1 },
+      });
+    }
+    rt.refreshHud(ctx);
+    if (userText && typeof rt.pi.sendUserMessage === "function") {
+      rt.pi.sendUserMessage(userText);
+    } else {
+      rt.pi.sendMessage(
+        {
+          customType: "rp:event",
+          content: userText || "[Please respond to the current scene with a fresh take.]",
+          display: false,
+          details: { kind: "reroll" },
+        },
+        { triggerTurn: true },
+      );
+    }
+    ctx.ui.notify("🎲 已分叉重摇上一条回复（旧版本仍可在 /tree 中随时切回）。", "info");
+    return;
+  }
+
+  // Fallback path: non-destructively hide the rejected assistant floor & trigger a fresh generation
+  const fp = computeMessageFingerprint(assistantEntry.message!);
+  rt.commitTx({ kind: "hide_toggle", entryIds: [assistantEntry.id], fingerprints: [fp], hidden: true });
+  if (steerHint) {
+    rt.commitTx({
+      kind: "note_set",
+      note: { id: `reroll_${Date.now().toString(36)}`, text: `[重摇微调] ${steerHint}`, remainingTurns: 1 },
+    });
+  }
+  rt.refreshHud(ctx);
+  rt.pi.sendMessage(
+    {
+      customType: "rp:event",
+      content:
+        "[Regenerate the previous assistant response with a fresh, distinct narrative angle while staying faithful to the current scene and established facts.]",
+      display: false,
+      details: { kind: "reroll" },
+    },
+    { triggerTurn: true },
+  );
+  ctx.ui.notify("🎲 已隐藏旧回复并重新生成（非破坏性，随时可在 /rp unhide 恢复）。", "info");
+}
+
+/** 1-keypress pacing cycle (`Alt+P`): relaxed → balanced → dramatic. */
+export async function actionCyclePacing(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  const order: PacingMode[] = ["relaxed", "balanced", "dramatic"];
+  const next = order[(order.indexOf(state.pacingMode) + 1) % order.length]!;
+  const zh: Record<PacingMode, string> = {
+    relaxed: "舒缓细腻（侧重氛围与日常互动）",
+    balanced: "均衡自然（默认）",
+    dramatic: "紧张强冲突（积极推进时钟与悬念）",
+  };
+  rt.commitTx({ kind: "config_patch", pacingMode: next });
+  rt.refreshHud(ctx);
+  ctx.ui.notify(`🎚 叙事节奏已切换：${zh[next]}`, "info");
+}
+
+/** 0-Token Instant Story Recap (`/rp recap`): synthesizes current state, facts, beliefs, clocks & foresights into an editorial card. */
+export async function actionRecap(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const lines: string[] = [];
+  const header = [card.identity.name, state.era, state.worldTimeLabel, `第 ${state.turn} 轮`].filter(Boolean).join(" · ");
+  lines.push(`当前进度：${header}`);
+  if (state.location || state.presentNpcs.length > 0) {
+    lines.push(
+      `当前场景：${state.location || "(未设定)"}${state.presentNpcs.length ? `  │  在场：${state.presentNpcs.join("、")}` : ""}`,
+    );
+  }
+
+  const cfsmPairs: string[] = [];
+  for (const [actor, axes] of Object.entries(state.cfsmStates)) {
+    for (const [axis, rec] of Object.entries(axes)) {
+      cfsmPairs.push(`${actor}.${axis}=${rec.state}`);
+    }
+  }
+  if (cfsmPairs.length > 0) {
+    lines.push(`角色心态：${cfsmPairs.slice(0, 4).join(" · ")}`);
+  }
+
+  const activeClocks = Object.values(state.clocks).filter((c) => !c.completed);
+  if (activeClocks.length > 0) {
+    lines.push(`进行时钟：${activeClocks.map((c) => `${c.label} (${c.value}/${c.max})`).join(" · ")}`);
+  }
+
+  const facts = getActiveFacts(state).slice(-5).reverse();
+  if (facts.length > 0) {
+    lines.push("", "【近期有效事实】");
+    for (const f of facts) {
+      lines.push(`· [T${f.validFromTurn}] ${f.statement}`);
+    }
+  }
+
+  const latestBeliefs = state.beliefs.slice(-3).reverse();
+  if (latestBeliefs.length > 0) {
+    lines.push("", "【人物最新信念】");
+    for (const b of latestBeliefs) {
+      lines.push(`· ${b.actorId} → ${b.target}：${b.belief}（因：${b.activatingEvent}）`);
+    }
+  }
+
+  const openHooks = Array.from(state.foresights.values()).filter((h) => h.status === "open").slice(0, 4);
+  if (openHooks.length > 0) {
+    lines.push("", "【未回收伏笔】");
+    for (const h of openHooks) {
+      lines.push(`· ${h.summary}${h.triggerHint ? `（线索：${h.triggerHint}）` : ""}`);
+    }
+  }
+
+  rt.pi.sendMessage(
+    {
+      customType: "rp:event",
+      content: lines.join("\n"),
+      display: true,
+      details: {
+        kind: "recap",
+        title: `${card.identity.name} · 前情提要`,
+        subtitle: `T${state.turn} · 0 Token 瞬时合成`,
+      },
+    },
+    { triggerTurn: false },
   );
 }

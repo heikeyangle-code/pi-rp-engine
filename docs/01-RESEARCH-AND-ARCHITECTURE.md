@@ -166,3 +166,52 @@ RP 最大的体验杀手是“每说一句话模型都要先调 3 个工具，�
 - **重度前端卡是 1.0 时代的畸形补丁**：酒馆缺乏原生状态机与 UI 扩展框架，迫使作者把 HTML/CSS/JS、`JS-Slash-Runner` 与数千 Token 的格式教条塞进 Prompt，既严重消耗上下文、拉低模型文笔与推理智商，又把业务逻辑死耦在浏览器 DOM 中。
 - **纯文字卡 + 新时代引擎 = 彻底解耦**：纯文字卡 100% Token 服务于人设、对话示例（`mes_example`）、文风与世界观；数值、物品、好感、进度时钟和状态面板全部由代码引擎接管，通过 Pi 官方通用扩展 UI 稳定渲染——**永不崩格式、不污染历史上下文、释放 100% 模型文笔**。
 - **中度前端卡（纯文字 + HTML 状态栏/MVU 变量表）**：剥离前端壳、抢救变量 Schema 转入原生引擎后，实际体验会显著优于原版酒馆；而把聊天框改造成 H5 点击小游戏的重度前端卡则明确标记为不兼容。
+
+
+---
+
+## 六、2026 下半年最新前沿论文增补与通用抽取/防停滞演进
+
+在前述 9 大理论支柱基础上，结合 2026 年 3 月至 11 月角色扮演 Agent 与互动叙事领域的最新论文，引擎进一步补齐了**全卡型自适应三层抽取（L0/L1/L2）**、**列表优先认知边界隔离**、**防剧情停滞控制**与**记忆到决策长程推理**：
+
+### 10. ReverieMem & The Curse of Knowledge — 视角受限三层记忆与「列表优先」防泄密（2026.06 / 2026.10）
+- **来源**：
+  - *Staying In Character: Role-Playing Agents with Perspective-Bounded Memory (ReverieMem)* ([arXiv:2606.25632](https://arxiv.org/abs/2606.25632), Jun 2026)
+  - *The Curse of Knowledge in Role-Playing Language Models* ([arXiv:2610.17327](https://arxiv.org/pdf/2610.17327), Oct 2026)
+- **核心发现**：
+  - ReverieMem 将角色记忆拆为第一人称情景层、可见性标记语义层与情境化人格层，在 KBF-QA（4,386 题）上将知识边界保真度提升 **+34.6 个百分点**，并在 BookWorld 对决中取得 **78.86%** 胜率。
+  - *The Curse of Knowledge* 证明：输入格式与**列表优先的视角过滤（List-First Character View）**对防止角色说出“不可能知道的事实”起决定性作用。
+- **落地机制**：
+  - Zone 3 盲区提示升级为列表优先隔离格式（`- [HIDDEN FROM: NPC] <fact>`）；
+  - `/rp panel` 双时态事实编辑器支持直接录入「公开事实 / 私密事实（指定知情者 `witnessIds`）」。
+
+### 11. SKT Tri-Agent Epistemic Pacing — 结构化知识树与认知节奏门禁（2026.09）
+- **来源**：*Enforcing Narrative Reliability and Epistemic Pacing in LLM-Driven Detective Games* ([arXiv:2609.23043v1](https://arxiv.org/html/2609.23043v1), Sep 2026)
+- **核心发现**：将故事前置条件编码为结构化知识树（SKT）并把“逻辑检索 / 表演生成 / 事实验证”解耦，可在悬疑与多幕剧情中彻底杜绝提前剧透与过早招供。
+- **落地机制**：
+  - `/rp analyze`（L1 一次性建档）自动扫描世界书条目，为后期真相/剧透条目生成可审核的 `GateCondition` 并永久缓存至 `card.compiled.json`。
+
+### 12. NARRA-Gym & SENSE — 防剧情停滞控制与多轨情绪节奏导航（2026.05 / 2026.10）
+- **来源**：
+  - *NARRA-Gym for Evaluating Interactive Narrative Agents* ([arXiv:2605.08503v1](https://arxiv.org/html/2605.08503v1), May 2026)
+  - *SENSE: State-aware Emotion Navigation Storytelling Engine* ([arXiv:2610.07666](https://arxiv.org/abs/2610.07666), Oct 2026)
+- **核心发现**：纯自由对话长程极易陷入原地打转（Stagnation）；将状态感知、防停滞控制（Anti-Stagnation Control）与情绪/张力轨迹解耦到外部引擎可显著改善长程体验。
+- **落地机制**：
+  - `Alt+P` 一键循环切换叙事节奏（`relaxed` / `balanced` / `dramatic`）；
+  - 对非陪伴/非日常卡在均衡模式下每 5 轮自动在 Zone 3 注入极轻量防停滞提示，陪伴与日常治愈卡保持 0 侵入。
+
+### 13. MemRole & MRPrompt/MREval — 从记忆到长程决策与分阶段记忆利用（2026.03 / 2026.11）
+- **来源**：
+  - *MemRole: From Memories to Decisions for Long-Horizon Reasoning in Role-Playing Agents* ([arXiv:2611.01778](https://arxiv.org/html/2611.01778), Nov 2026)
+  - *Memory-Driven Role-Playing: Evaluation and Enhancement of Long-Term Memory* ([ACL 2026 Findings](https://aclanthology.org/2026.findings-acl.1175.pdf) / [arXiv:2603.19313v1](https://arxiv.org/html/2603.19313v1), Mar 2026)
+- **核心发现**：单纯把旧片段塞进上下文不足以支撑角色做出一致的长程决策；需要把历史事件按角色视角与时间线组织，并在关键决策点显式激活相关信念与记忆（LHMT / MRPrompt）。
+- **落地机制**：
+  - 结合 `DREAM ABC` 信念边与 `CFSM` 心态轴，在 Zone 3 中优先排序在场 NPC 的最新信念与状态，并用 `/rp recap` 提供 0-Token 瞬时局势前情提要。
+
+### 14. 全卡型通用三层抽取体系（L0 / L1 / L2）与无硬编码时空语义
+- **来源参考**：*Reconstructing Persistent Worlds from Narratives* ([arXiv:2608.04037](https://arxiv.org/html/2608.04037), Aug 2026)、*MemTX* ([arXiv:2607.23929v2](https://arxiv.org/html/2607.23929v2), Jul 2026)、*Mem0 State of AI Agent Memory 2026* ([Mem0 Blog](https://mem0.ai/blog/state-of-ai-agent-memory-2026))
+- **落地机制**：
+  - **彻底移除硬编码 `Act I` / `Day 1`**：只有当角色卡本身或剧情显式声明阶段/时间时才在状态栏与 `<rp_state_frame>` 展示；
+  - **L0（0ms, 0 Token）**：导入时确定性提取纯文字卡中的显式锚点（地点/时间/阶段）与有界数值，并自动推断卡型（`CardArchetype`）与模块开关（`WorldProfileModules`）；
+  - **L1（`/rp analyze`, 1 次 LLM 调用永久缓存）**：通过 Pi 官方 `ctx.modelRegistry.streamSimple().result()` 提取完整世界画像、实体别名（反哺世界书 PPR 召回）与建议防剧透门禁；
+  - **L2（`sidecar-light` 闭环结算）**：回合后将现行事实 ID 喂给边车模型，实现非破坏性旧事实失效（`invalidatedFactIds`）、时空锚点刷新与按模块门控的数值/物品/时钟更新。

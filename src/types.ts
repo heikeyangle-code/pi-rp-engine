@@ -73,6 +73,8 @@ export interface PiUiContext {
   ): void;
   setHeader?(factory: ((tui: unknown, theme: unknown) => unknown) | undefined): void;
   setFooter?(factory: ((tui: unknown, theme: unknown) => unknown) | undefined): void;
+  setTitle?(title: string): void;
+  setWorkingMessage?(message?: string): void;
   select(title: string, options: string[]): Promise<string | undefined>;
   confirm(title: string, message: string): Promise<boolean>;
   input(title: string, placeholder?: string): Promise<string | undefined>;
@@ -87,22 +89,30 @@ export interface PiUiContext {
 export interface PiModelRegistry {
   getAvailable?(): unknown[];
   find?(provider: string, modelId: string): unknown;
+  streamSimple?(
+    model: unknown,
+    context: { systemPrompt?: string; messages: Array<{ role: string; content: string | PiContentBlock[]; timestamp?: number }> },
+    options?: Record<string, unknown>,
+  ): { result(): Promise<{ content?: PiContentBlock[]; text?: string } | null> };
   complete?(
     model: unknown,
-    context: { systemPrompt?: string; messages: Array<{ role: string; content: string | PiContentBlock[] }> },
+    context: { systemPrompt?: string; messages: Array<{ role: string; content: string | PiContentBlock[]; timestamp?: number }> },
     options?: Record<string, unknown>,
   ): Promise<{ content?: PiContentBlock[]; text?: string } | null>;
 }
 
 export interface PiExtensionContext {
   cwd: string;
+  mode?: "tui" | "rpc" | "print" | string;
   model?: unknown;
   ui: PiUiContext;
   sessionManager: PiSessionManager;
   modelRegistry?: PiModelRegistry;
   hasUI?: boolean;
+  signal?: AbortSignal;
   isIdle?(): boolean;
   abort?(): Promise<void> | void;
+  getContextUsage?(): { tokens: number | null; contextWindow: number; percent: number | null } | undefined;
   fork?(entryId: string, options?: Record<string, unknown>): Promise<{ cancelled?: boolean }>;
   navigateTree?(targetId: string, options?: Record<string, unknown>): Promise<{ cancelled?: boolean }>;
 }
@@ -158,8 +168,14 @@ export interface PiExtensionAPI {
   appendEntry(customType: string, data: unknown): void;
   sendMessage(
     message: { customType: string; content: string | PiContentBlock[]; display: boolean; details?: unknown },
-    options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" },
+    options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
   ): void;
+  sendUserMessage?(
+    content: string | PiContentBlock[],
+    options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+  ): void;
+  setSessionName?(name: string): void;
+  getSessionName?(): string | undefined;
   setLabel?(entryId: string, label: string | undefined): void;
   registerMarkdownTransformer?(
     fn: (markdown: string, ctx?: { messageType?: string; isStreaming?: boolean }) => string,
@@ -222,6 +238,35 @@ export interface ImportAuditReport {
   warnings: string[];
 }
 
+export type CardArchetype =
+  | "companion"
+  | "slice-of-life"
+  | "rpg-sandbox"
+  | "mystery"
+  | "epic-saga"
+  | "ensemble";
+
+export interface WorldProfileModules {
+  stats: boolean;
+  inventory: boolean;
+  clocks: boolean;
+  stages: boolean;
+}
+
+export interface CardWorldProfile {
+  archetype: CardArchetype;
+  modules: WorldProfileModules;
+  initialLocation?: string;
+  initialTime?: string;
+  initialStage?: string;
+  initialPresentNpcs: string[];
+  initialInventory: Array<{ item: string; count: number }>;
+  suggestedCfsmAxes: CfsmAxisDef[];
+  entityAliases: Record<string, string[]>;
+  suggestedLoreGates: Array<{ entryId: string; title: string; gate: GateCondition; reason: string }>;
+  source: "heuristic" | "llm-analyzed";
+}
+
 export interface CompiledCard {
   id: string;
   slug: string;
@@ -266,6 +311,7 @@ export interface CompiledCard {
   /** Pure-text display regex rules (AI_OUTPUT, zero HTML/JS) */
   displayRegexRules: CompiledRegexRule[];
   salvagedStateSchema: SalvagedVariable[];
+  worldProfile?: CardWorldProfile;
   loreBook: CompiledLoreBook;
   importReport: ImportAuditReport;
 }
@@ -507,6 +553,13 @@ export type RpTxEntry =
       montageSummary: string;
       turn: number;
     }
+  | {
+      kind: "profile_apply";
+      archetype: CardArchetype;
+      modules: WorldProfileModules;
+      initialStage?: string;
+      initialTime?: string;
+    }
   | { kind: "lore_runtime"; sticky: Record<string, number>; cooldown: Record<string, number>; consumedOneShots: string[] };
 
 export interface SessionRpState {
@@ -527,6 +580,8 @@ export interface SessionRpState {
   initialPersona: PersonaProfile | null;
   currentPersona: PersonaProfile;
   personaChangedMidSession: boolean;
+  archetype: CardArchetype;
+  modules: WorldProfileModules;
   turn: number;
   beat: number;
   day: number;

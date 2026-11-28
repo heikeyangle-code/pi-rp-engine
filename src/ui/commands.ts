@@ -7,6 +7,7 @@ import type { PiExtensionAPI, PiExtensionContext } from "../types.js";
 import { listAllCardSummaries, listPresetIds } from "../storage/workspace-store.js";
 import {
   type RpRuntimeHandle,
+  actionAnalyzeCard,
   actionBookmarkGoto,
   actionBookmarkSave,
   actionContinue,
@@ -21,6 +22,8 @@ import {
   actionOoc,
   actionPersona,
   actionPreset,
+  actionRecap,
+  actionReroll,
   actionSelectPacing,
   actionSetHud,
   actionSetSettlementMode,
@@ -34,23 +37,26 @@ import { openRpDashboard, type DashboardRuntime } from "./dashboard.js";
 const SUBCOMMANDS: Array<{ value: string; description: string }> = [
   { value: "import", description: "打开文件浏览器导入角色卡 / 世界书 / 预设（支持批量）" },
   { value: "load", description: "从角色库加载角色卡（仅绑定当前会话）" },
-  { value: "panel", description: "打开实时世界面板与状态/世界书编辑器" },
+  { value: "panel", description: "打开实时世界面板与状态/世界书编辑器 (Ctrl+Shift+R)" },
+  { value: "analyze", description: "一键 AI 智能建档：识别卡型、初态、别名与防剧透门禁（永久缓存）" },
+  { value: "reroll", description: "重摇上一条回复，旧分支保留在 /tree (Alt+W)" },
   { value: "continue", description: "让角色无缝续写剧情 (Alt+K)" },
   { value: "act", description: "生成 3 个符合当下情境的行动建议 (Alt+A)" },
+  { value: "recap", description: "0 Token 瞬时合成前情提要与当前局势摘要" },
   { value: "roll", description: "打开快捷掷骰检定器，支持优势/劣势/DC (Alt+G)" },
   { value: "note", description: "管理导演指令 (Alt+N)" },
   { value: "ooc", description: "发起场外 OOC 讨论，不推进剧情 (Alt+O)" },
-  { value: "pace", description: "切换叙事节奏 (relaxed / balanced / dramatic)" },
+  { value: "pace", description: "切换叙事节奏 (relaxed / balanced / dramatic · Alt+P)" },
   { value: "save", description: "保存剧情书签 (Alt+B)" },
-  { value: "goto", description: "跳转或分叉至已保存的剧情书签" },
+  { value: "goto", description: "跳转或分叉至已保存的剧情书签 (Alt+J)" },
   { value: "hide", description: "交互式隐藏对话楼层（不发给模型，不删记录）" },
   { value: "unhide", description: "恢复已隐藏的对话楼层" },
   { value: "persona", description: "切换或新建玩家人设（不破坏缓存）" },
   { value: "greet", description: "切换/重发角色开场白" },
   { value: "cast", description: "交互式管理多角色同场共演" },
-  { value: "skip", description: "时间推进 / 幕间蒙太奇" },
+  { value: "skip", description: "时间推进 / 幕间蒙太奇 (Alt+T)" },
   { value: "preset", description: "加载或关闭酒馆预设" },
-  { value: "hud", description: "切换 HUD 显示模式 (minimal / full / off)" },
+  { value: "hud", description: "切换 HUD 显示模式 (minimal / full / off · Alt+H)" },
   { value: "mode", description: "切换后台结算模式 (tool-assisted / sidecar-light / off)" },
   { value: "raw", description: "切换原味直通模式（跳过酒馆前端壳剥离）" },
   { value: "keys", description: "查看全部 RP 快捷键速查表" },
@@ -88,17 +94,19 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
   }
 
   const card = rt.getCard();
-  const title = `🎭 ${card?.identity.name ?? state.cardSlug ?? "RP"} · ${state.era} · T${state.turn}（Alt+R）`;
+  const title = `🎭 ${[card?.identity.name ?? state.cardSlug ?? "RP", state.era, state.worldTimeLabel, `T${state.turn}`].filter(Boolean).join(" · ")}（Alt+R）`;
   const pick = await ctx.ui.select(title, [
     "📊 打开世界面板 & 实时状态/世界书编辑器 (Ctrl+Shift+R)",
-    "▶ 续写剧情 (Alt+K)    /    💡 行动建议 (Alt+A)",
+    "🔄 重摇上一条回复 (Alt+W)  /  ▶ 续写 (Alt+K)  /  💡 行动建议 (Alt+A)",
+    "📜 前情提要 · 0 Token 瞬时局势回顾 (/rp recap)",
     "🎲 快捷掷骰检定 (Alt+G)",
-    "🎬 导演指令与叙事节奏 (Alt+N)",
+    "🎬 导演指令与叙事节奏 (Alt+N / Alt+P)",
     "💬 OOC 场外讨论 (Alt+O)",
-    "🔖 剧情书签：保存 / 跳转 / 分叉 (Alt+B)",
-    "⏳ 幕间蒙太奇 / 推进时间 (/rp skip)",
+    "🔖 剧情书签：保存 (Alt+B) / 跳转分叉 (Alt+J)",
+    "⏳ 幕间蒙太奇 / 推进时间 (Alt+T)",
     "🙈 隐藏或恢复对话楼层 (/rp hide)",
     "🧑 切换玩家人设 / 👥 同场共演 / 🎭 切换角色或开场白",
+    "🔍 一键 AI 智能建档（识别初态 / 物品 / 别名 / 防剧透门禁）",
     "📥 导入新的角色卡 / 世界书 / 预设",
     "⚙ 引擎设置（HUD / 预设 / 结算模式 / 原味直通 / 快捷键）",
     "🚪 彻底退出本会话 RP 模式 (Alt+Shift+X)",
@@ -108,20 +116,36 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
 
   if (pick.startsWith("📊")) {
     await openRpDashboard(makeDashboardRuntime(rt), ctx);
-  } else if (pick.startsWith("▶")) {
-    const sub = await ctx.ui.select("剧情推进", ["▶ 无缝续写 (Alt+K)", "💡 生成 3 个行动建议 (Alt+A)", "← 返回"]);
-    if (sub?.startsWith("▶")) await actionContinue(rt, ctx);
+  } else if (pick.startsWith("🔄")) {
+    const sub = await ctx.ui.select("剧情推进与重摇", [
+      "🔄 重摇上一条回复 (Alt+W)",
+      "▶ 无缝续写 (Alt+K)",
+      "💡 生成 3 个行动建议 (Alt+A)",
+      "← 返回",
+    ]);
+    if (sub?.startsWith("🔄")) await actionReroll(rt, ctx, "");
+    else if (sub?.startsWith("▶")) await actionContinue(rt, ctx);
     else if (sub?.startsWith("💡")) await actionIdeas(rt, ctx);
+  } else if (pick.startsWith("📜")) {
+    await actionRecap(rt, ctx);
   } else if (pick.startsWith("🎲")) {
     await actionManualRoll(rt, ctx, "");
   } else if (pick.startsWith("🎬")) {
-    const sub = await ctx.ui.select("导演台", ["📝 管理导演指令", "🎚 切换叙事节奏 (relaxed/balanced/dramatic)", "← 返回"]);
+    const sub = await ctx.ui.select("导演台", [
+      "📝 管理导演指令 (Alt+N)",
+      "🎚 切换叙事节奏 (relaxed/balanced/dramatic · Alt+P)",
+      "← 返回",
+    ]);
     if (sub?.startsWith("📝")) await actionDirectorNote(rt, ctx, "");
     else if (sub?.startsWith("🎚")) await actionSelectPacing(rt, ctx, "");
   } else if (pick.startsWith("💬")) {
     await actionOoc(rt, ctx, "");
   } else if (pick.startsWith("🔖")) {
-    const sub = await ctx.ui.select("剧情书签与时间线", ["🔖 保存当前节点为书签 (Alt+B)", "⏪ 跳转 / 分叉至已有书签 (/rp goto)", "← 返回"]);
+    const sub = await ctx.ui.select("剧情书签与时间线", [
+      "🔖 保存当前节点为书签 (Alt+B)",
+      "⏪ 跳转 / 分叉至已有书签 (Alt+J)",
+      "← 返回",
+    ]);
     if (sub?.startsWith("🔖")) await actionBookmarkSave(rt, ctx, "");
     else if (sub?.startsWith("⏪")) await actionBookmarkGoto(rt, ctx, "");
   } else if (pick.startsWith("⏳")) {
@@ -140,6 +164,8 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     else if (sub?.startsWith("👥")) await actionManageCast(rt, ctx, "");
     else if (sub?.startsWith("💬")) await actionGreeting(rt, ctx);
     else if (sub?.startsWith("🎭")) await actionLoadCard(rt, ctx, "");
+  } else if (pick.startsWith("🔍")) {
+    await actionAnalyzeCard(rt, ctx);
   } else if (pick.startsWith("📥")) {
     await actionImportFile(rt, ctx, "");
   } else if (pick.startsWith("⚙")) {
@@ -220,11 +246,23 @@ export function registerRpCommands(pi: PiExtensionAPI, rt: RpRuntimeHandle): voi
         case "load":
           await actionLoadCard(rt, ctx, rest);
           return;
+        case "analyze":
+          await actionAnalyzeCard(rt, ctx);
+          return;
         case "panel":
         case "info":
         case "stats":
         case "report":
           await openRpDashboard(makeDashboardRuntime(rt), ctx);
+          return;
+        case "reroll":
+        case "swipe":
+        case "retry":
+          await actionReroll(rt, ctx, rest);
+          return;
+        case "recap":
+        case "summary":
+          await actionRecap(rt, ctx);
           return;
         case "c":
         case "continue":

@@ -295,3 +295,18 @@ export interface ForesightHook {
 ### 4. 手机友好的双轨交互入口（`pi.registerCommand("rp", ...)` + `getArgumentCompletions`）
 - **零记忆成本（手机党主入口）**：直接输入 **`/rp`** 回车 → 弹出 `ctx.ui.select()` 交互式快捷菜单（覆盖全部高频功能：续写 / 帮我想行动 / 导演便签 / 场外 OOC / 切换马甲 / 开场白 / 书签回档 / 屏蔽楼层 / 状态总控台 / 换卡 / 退出 RP），彻底取代酒馆杂乱的 Quick Replies 按钮栏与数十个一级命令；
 - **熟手快敲（带自动补全）**：支持 `/rp import <path>`、`/rp load [slug]`、`/rp new`、`/rp greet`、`/rp persona`、`/rp note`、`/rp c`、`/rp act`、`/rp ooc`、`/rp hide`、`/rp save`、`/rp goto`、`/rp roll`、`/rp skip`、`/rp cast`、`/rp panel`（快捷键 `ctrl+shift+r`）、`/rp hud [minimal|full|off]`、`/rp mode [off|tool-assisted|sidecar-light]`、`/rp raw [on|off]`、`/rp off`。
+
+
+---
+
+## 附：对照最新版 `badlogic/pi-mono` 官方扩展 API 深度对齐清单
+
+| 官方 Pi 机制 / API | 本扩展落地用法 | 避免的坑 |
+| :--- | :--- | :--- |
+| `ctx.modelRegistry.streamSimple(model, ctx, opts).result()` | `/rp analyze` 与 `sidecar-light` 统一走 `src/engine/llm-helper.ts`，附带 `UserMessage.timestamp` 与 `ctx.signal` | 兼容所有 `/login` 与自定义 Provider，并支持用户随时 `Esc` 中断 |
+| `pi.on("session_start")` | 覆盖 `startup / reload / new / resume / fork` 全 5 种会话切换场景 | 移除旧版不存在的 `session_switch` 幻影事件 |
+| `pi.registerMarkdownTransformer(..., { messageTypes: ["assistant", "custom"] })` | 仅清洗展示层 HTML 残渣与酒馆 `AI_OUTPUT` 正则 | 避免非法 `messageTypes` 值导致自定义开场白未命中 |
+| `pi.registerEntryRenderer("rp:tx", ...)` | 在原生 `/tree` 会话树中将 `rp:tx` 事务渲染为可读中文标签（场景/数值/时钟/事实/阶段） | 告别 `/tree` 中满屏原始 JSON |
+| `pi.on("input", ...)` | RP 模式下输入 `((...))` 或 `（（...））` 自动无感转为 OOC 讨论 | 不打断输入流，无需手动敲 `/rp ooc` |
+| `ExtensionCommandContext` vs `ExtensionContext` | `/rp reroll` 与 `/rp goto` 直接调用 `navigateTree` / `fork` + `pi.sendUserMessage`；快捷键触发无 `navigateTree` 时自动降级（隐藏重摇或预填命令至编辑器） | 避免在快捷键处理器里调 `undefined` 报错 |
+| `pi.setSessionName` + `ctx.ui.setTitle` + `ctx.ui.setWorkingMessage` + `ctx.getContextUsage` | 开局自动命名会话（`/resume` 一眼识别）、展示角色思考态文案、面板内实时展示上下文窗口占用率 | RPC/移动端（`pi-android`）自动安全降级，0 报错 |

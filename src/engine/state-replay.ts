@@ -66,12 +66,14 @@ export function createInitialRpState(): SessionRpState {
     initialPersona: null,
     currentPersona: { ...DEFAULT_PERSONA },
     personaChangedMidSession: false,
+    archetype: "companion",
+    modules: { stats: true, inventory: true, clocks: true, stages: false },
     turn: 0,
     beat: 0,
     day: 1,
-    worldTimeLabel: "Day 1",
-    phase: "opening",
-    era: "Act I",
+    worldTimeLabel: "",
+    phase: "",
+    era: "",
     milestones: new Set<string>(),
     flags: {},
     location: "",
@@ -195,15 +197,17 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       break;
 
     case "clock_tick":
-      state.turn += 1;
-      state.beat += tx.beatDelta;
+      if (tx.beatDelta > 0) {
+        state.turn += 1;
+        state.beat += tx.beatDelta;
+        state.notes = state.notes
+          .map((n) => (n.remainingTurns === null ? n : { ...n, remainingTurns: n.remainingTurns - 1 }))
+          .filter((n) => n.remainingTurns === null || n.remainingTurns > 0);
+      }
       if (tx.dayDelta) state.day += tx.dayDelta;
       if (tx.worldTimeLabel !== undefined) state.worldTimeLabel = tx.worldTimeLabel;
-      else if (tx.dayDelta) state.worldTimeLabel = `Day ${state.day}`;
+      else if (tx.dayDelta) state.worldTimeLabel = `第 ${state.day} 天`;
       if (tx.phase !== undefined) state.phase = tx.phase;
-      state.notes = state.notes
-        .map((n) => (n.remainingTurns === null ? n : { ...n, remainingTurns: n.remainingTurns - 1 }))
-        .filter((n) => n.remainingTurns === null || n.remainingTurns > 0);
       break;
 
     case "location_set":
@@ -313,9 +317,17 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
 
     case "era_advance":
       state.era = tx.toEra;
+      state.modules.stages = true;
       for (const m of tx.milestoneUnlocked) {
         state.milestones.add(m);
       }
+      break;
+
+    case "profile_apply":
+      state.archetype = tx.archetype;
+      state.modules = { ...tx.modules };
+      if (tx.initialStage && !state.era) state.era = tx.initialStage;
+      if (tx.initialTime && !state.worldTimeLabel) state.worldTimeLabel = tx.initialTime;
       break;
 
     case "lore_runtime":

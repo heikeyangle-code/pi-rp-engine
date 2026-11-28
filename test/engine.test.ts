@@ -429,7 +429,7 @@ test("Zone 1 stays 100% byte-identical across 20 turns while Zone 3 carries beli
   assert.ok(String(out[0]!.content).includes("<rp_state_frame>"));
 });
 
-test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, renderers & 10 shortcuts", async () => {
+test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, renderers & 14 shortcuts", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-rp-sdk-"));
   try {
     const rawCard = { spec: "chara_card_v2", data: { name: "诺亚", description: "星舰领航员" } };
@@ -441,7 +441,7 @@ test("Official Pi SDK contracts: compaction result, getLabel bookmarks, CFSM, re
     rpEngineExtension(h.pi);
 
     // 10 shortcuts registered + 4 message renderers + 6 tools (all defaultActive: false)
-    assert.equal(h.shortcuts.size, 10);
+    assert.equal(h.shortcuts.size, 14);
     assert.ok(h.shortcuts.has("alt+r"));
     assert.ok(h.shortcuts.has("alt+shift+x"));
     assert.equal(h.messageRenderers.size, 4);

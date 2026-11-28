@@ -263,9 +263,9 @@ export function buildZone3TransientTail(options: {
   const sortedMilestones = Array.from(state.milestones).sort();
 
   const compactState: Record<string, unknown> = {
-    era: state.era,
+    stage: state.era || undefined,
     turn: state.turn,
-    time: state.worldTimeLabel,
+    time: state.worldTimeLabel || undefined,
     location: state.location || undefined,
     presentNpcs: state.presentNpcs.length > 0 ? state.presentNpcs : undefined,
     milestones: sortedMilestones.length > 0 ? sortedMilestones : undefined,
@@ -333,8 +333,8 @@ export function buildZone3TransientTail(options: {
     }
     if (blindSpots.length > 0) {
       recalledSections.push(
-        `## Epistemic Blind Spots (DO NOT leak to ignorant NPCs)\n${blindSpots
-          .map((b) => `- ${b.fact.statement} [Unaware: ${b.ignorantNpcs.join(", ")}]`)
+        `## Epistemic Access Boundaries (List-First Isolation: characters listed below CANNOT know, hear, or act on these facts)\n${blindSpots
+          .map((b) => `- [HIDDEN FROM: ${b.ignorantNpcs.join(", ")}] ${b.fact.statement}`)
           .join("\n")}`,
       );
     }
@@ -371,10 +371,20 @@ export function buildZone3TransientTail(options: {
     parts.push(`<rp_recalled_context>\n${recalledSections.join("\n\n")}\n</rp_recalled_context>`);
   }
 
-  // 4. Optional Director Pacing & Active Director Notes (/rp note)
+  // 4. Optional Director Pacing, NARRA-Gym Anti-Stagnation Guard & Active Director Notes (/rp note)
   const pacingCue = PACING_HINTS[state.pacingMode];
+  const needsAntiStagnation =
+    state.pacingMode === "balanced" &&
+    state.archetype !== "companion" &&
+    state.archetype !== "slice-of-life" &&
+    state.turn > 0 &&
+    state.turn % 5 === 0;
+  const antiStagnationCue = needsAntiStagnation
+    ? "Anti-stagnation cue: Introduce a concrete sensory detail, subtle consequence, or small narrative shift so the scene keeps organic forward momentum."
+    : null;
   const noteLines = [
     ...(pacingCue ? [`- ${pacingCue}`] : []),
+    ...(antiStagnationCue ? [`- ${antiStagnationCue}`] : []),
     ...state.notes.map((n) => `- ${n.text}`),
   ];
   if (noteLines.length > 0) {
