@@ -63,6 +63,41 @@ function registerExtendedTool(pi: PiExtensionAPI, tool: ExtendedPiToolDefinition
   pi.registerTool(tool);
 }
 
+/**
+ * Unwrap DeepSeek / OpenAI-compatible vLLM proxy quirk where tool arguments arrive
+ * nested as `{ arguments: "{\"action\":\"read\"...}" }` or `{ arguments: { ... } }`.
+ */
+export function unwrapNestedArgs(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  let current = raw as Record<string, unknown>;
+  for (let depth = 0; depth < 2; depth++) {
+    const keys = Object.keys(current);
+    if (keys.length !== 1 || keys[0] !== "arguments") break;
+    const inner = current.arguments;
+    if (typeof inner === "string") {
+      const trimmed = inner.trim();
+      if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+            current = parsed as Record<string, unknown>;
+            continue;
+          }
+        } catch {
+          break;
+        }
+      }
+      break;
+    }
+    if (inner && typeof inner === "object" && !Array.isArray(inner)) {
+      current = inner as Record<string, unknown>;
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
 /** Monotonic module-level sequence counter so multiple `rp_fact_commit` calls in the same turn never collide. */
 let nextCommitSeq = 0;
 
@@ -141,22 +176,22 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
   registerExtendedTool(pi, {
     name: "rp_roll_check",
     label: "RP 掷骰检定",
-    description:
-      "Execute a deterministic dice roll or skill check (supports e.g. '1d20+3', 'd20', '2d20kh1', '2d20kl1', '2d6', '1d100'). Use ONLY when an outcome is genuinely uncertain or contested.",
-    promptSnippet: "Roll dice or resolve an uncertain skill/combat check deterministically.",
+    description: "Deterministic dice/skill check ('1d20+3', '2d20kh1', '2d6', '1d100'). Use only when uncertain.",
+    promptSnippet: "Roll dice for uncertain skill/combat checks.",
     defaultActive: false,
     annotations: { readOnlyHint: true },
     parameters: {
       type: "object",
       properties: {
-        expression: { type: "string", description: "Dice formula like '1d20+3', '2d20kh1', '2d6+1', '1d100'" },
-        dc: { type: "number", description: "Optional difficulty target number" },
-        reason: { type: "string", description: "What is being attempted" },
-        actor: { type: "string", description: "Actor performing the check" },
+        expression: { type: "string", description: "Dice formula, e.g. '1d20+3', '2d20kh1'" },
+        dc: { type: "number", description: "Optional target DC" },
+        reason: { type: "string", description: "Action attempted" },
+        actor: { type: "string", description: "Actor name" },
       },
       required: ["expression"],
     },
-    renderCall(args, theme) {
+    renderCall(rawArgs, theme) {
+      const args = unwrapNestedArgs(rawArgs);
       const expr = String(args.expression ?? "1d20");
       const dc = typeof args.dc === "number" ? ` vs DC ${args.dc}` : "";
       const reason = args.reason ? ` · ${String(args.reason)}` : "";
@@ -196,7 +231,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         (badge ? ` · ${styleFg(theme, badge.color, badge.label)}` : "");
       return createLinesComponent(() => [summary]);
     },
-    async execute(_id, params) {
+    async execute(_id, rawParams) {
+      const params = unwrapNestedArgs(rawParams);
       const expr = String(params.expression ?? "1d20");
       const dc = typeof params.dc === "number" ? params.dc : undefined;
       const reason = typeof params.reason === "string" ? params.reason : undefined;
@@ -235,15 +271,15 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
     name: "rp_state_patch",
     label: "RP 状态账本更新",
     description:
-      "Commit deterministic world state updates (stats, inventory, location, present NPCs, flags, progress clocks, CFSM axis definitions & transitions). All numeric bounds and CFSM transitions are code-validated atomically before commit.",
-    promptSnippet: "Update authoritative world stats, inventory, location, flags, clocks, or CFSM states.",
+      "Atomically update world state (location, NPCs, stats, inventory, flags, clocks, CFSM, physical/spatial notes).",
+    promptSnippet: "Patch world stats, inventory, location, flags, clocks, CFSM.",
     defaultActive: false,
     executionMode: "sequential",
     parameters: {
       type: "object",
       properties: {
-        location: { type: "string", description: "New scene location" },
-        present_npcs: { type: "array", items: { type: "string" }, description: "NPC names currently present" },
+        location: { type: "string", description: "Scene location" },
+        present_npcs: { type: "array", items: { type: "string" }, description: "Present NPC names" },
         stats: {
           type: "array",
           items: {
@@ -252,7 +288,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               actor: { type: "string" },
               key: { type: "string" },
               op: { type: "string", enum: ["set", "add"] },
-              value: { anyOf: [{ type: "number" }, { type: "string" }, { type: "boolean" }], description: "Numeric, string, or boolean value" },
+              value: { anyOf: [{ type: "number" }, { type: "string" }, { type: "boolean" }], description: "Number, string, or boolean" },
               min: { type: "number" },
               max: { type: "number" },
               reason: { type: "string" },
@@ -276,7 +312,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         flags: {
           type: "object",
           additionalProperties: { type: "boolean" },
-          description: "Map of boolean flags to set",
+          description: "Boolean flags map",
         },
         clocks: {
           type: "array",
@@ -303,7 +339,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               transitions: {
                 type: "object",
                 additionalProperties: { type: "array", items: { type: "string" } },
-                description: "Optional allowed state transition map",
+                description: "Allowed transitions map",
               },
             },
             required: ["actor", "axis", "states", "initial"],
@@ -336,10 +372,11 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
             required: ["actor"],
           },
         },
-        spatial_notes: { type: "string", description: "Room layout, visibility, or audio occlusion notes" },
+        spatial_notes: { type: "string", description: "Layout/visibility/occlusion notes" },
       },
     },
-    renderCall(args, theme) {
+    renderCall(rawArgs, theme) {
+      const args = unwrapNestedArgs(rawArgs);
       const tags: string[] = [];
       if (typeof args.location === "string") tags.push(`地点→${args.location}`);
       if (Array.isArray(args.stats) && args.stats.length > 0) tags.push(`数值×${args.stats.length}`);
@@ -365,7 +402,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         return lines;
       });
     },
-    async execute(_id, params, _sig, _onUpdate, ctx) {
+    async execute(_id, rawParams, _sig, _onUpdate, ctx) {
+      const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
         return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
@@ -573,8 +611,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
     name: "rp_fact_commit",
     label: "RP 事实与伏笔归档",
     description:
-      "Commit bi-temporal facts (with witnesses for epistemic isolation), invalidate outdated facts, update DREAM ABC character beliefs, or plant/resolve foresight hooks.",
-    promptSnippet: "Record durable world facts, invalidate superseded facts, update character beliefs, or manage foresights.",
+      "Commit/invalidate bi-temporal facts (with witnesses), DREAM beliefs, foresights, agendas, or pair bonds.",
+    promptSnippet: "Commit/invalidate facts, beliefs, foresights, or agendas.",
     defaultActive: false,
     executionMode: "sequential",
     parameters: {
@@ -591,7 +629,7 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               witnesses: {
                 type: "array",
                 items: { type: "string" },
-                description: "Array of witness names (use [\"public\"] for public facts visible to everyone)",
+                description: "Witness names or [\"public\"]",
               },
               causeEvent: { type: "string" },
             },
@@ -619,8 +657,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
               target: { type: "string" },
               activatingEvent: { type: "string" },
               belief: { type: "string" },
-              subjectiveInsight: { type: "string", description: "Optional character-subjective inner subtext (DualMem)" },
-              emotionalTone: { type: "string", description: "Optional emotional tone label" },
+              subjectiveInsight: { type: "string", description: "Character inner subtext" },
+              emotionalTone: { type: "string", description: "Emotional tone" },
             },
             required: ["actor", "target", "activatingEvent", "belief"],
           },
@@ -669,7 +707,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         },
       },
     },
-    renderCall(args, theme) {
+    renderCall(rawArgs, theme) {
+      const args = unwrapNestedArgs(rawArgs);
       const counts: string[] = [];
       if (Array.isArray(args.add_facts) && args.add_facts.length) counts.push(`+事实×${args.add_facts.length}`);
       if (Array.isArray(args.invalidate_facts) && args.invalidate_facts.length) counts.push(`失效×${args.invalidate_facts.length}`);
@@ -695,7 +734,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         ),
       );
     },
-    async execute(_id, params) {
+    async execute(_id, rawParams) {
+      const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
         return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
@@ -838,21 +878,22 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
     name: "rp_recall",
     label: "RP 深度世界书检索",
     description:
-      "Query the compiled worldbook (action='search' default, action='list' to browse paginated entry titles, action='read' to read a specific entry by title/keyword), plus memory books, bi-temporal facts, and open foresights.",
-    promptSnippet: "Search, list, or read worldbook entries, memory books, facts, and open foresights.",
+      "Search/list/read worldbook entries (action='search'|'list'|'read'), plus memory books, facts, and open foresights.",
+    promptSnippet: "Search, list, or read worldbook, memory books & facts.",
     defaultActive: false,
     annotations: { readOnlyHint: true },
     parameters: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["search", "list", "read"], description: "Operation mode: search (default), list (browse titles), or read (exact entry full text)" },
-        query: { type: "string", description: "Keywords, entry title, or entity name (required for search/read)" },
-        offset: { type: "number", description: "Pagination offset for list or char offset for read (default 0)" },
-        limit: { type: "number", description: "Max titles for list (default 30, max 100)" },
-        token_budget: { type: "number", description: "Max tokens to return in search mode (default 900)" },
+        action: { type: "string", enum: ["search", "list", "read"], description: "'search' (default), 'list', or 'read'" },
+        query: { type: "string", description: "Keywords or entry title (for search/read)" },
+        offset: { type: "number", description: "List/read offset (default 0)" },
+        limit: { type: "number", description: "Max list titles (default 30, max 100)" },
+        token_budget: { type: "number", description: "Max search tokens (default 900)" },
       },
     },
-    renderCall(args, theme) {
+    renderCall(rawArgs, theme) {
+      const args = unwrapNestedArgs(rawArgs);
       const act = String(args.action ?? "search");
       const label = act === "list" ? "浏览目录" : act === "read" ? `读取「${String(args.query ?? "")}」` : `“${String(args.query ?? "")}”`;
       return createLinesComponent(() => [
@@ -868,7 +909,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         styleFg(theme, "muted", `📜 检索命中 ${d.loreCount ?? 0} 条设定 · ${d.factCount ?? 0} 条事实`),
       ]);
     },
-    async execute(_id, params) {
+    async execute(_id, rawParams) {
+      const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       const card = rt.getCard();
       if (!state.active || !card) {
@@ -1056,20 +1098,21 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
     name: "rp_history_recall",
     label: "RP 历史原文召回",
     description:
-      "Search or read committed story history verbatim (including older compacted or hidden floors) using CJK Bigram-BM25. Provide EITHER `query` (keywords for entities/promises/numbers) OR `turn` (1-indexed round number + optional `radius` 0..3). Max 6 calls per turn; full reads have a 10-turn cooldown.",
-    promptSnippet: "Recall exact past dialogue/details by BM25 keyword search or round number.",
+      "Search/read past story turns verbatim via BM25. Pass `query` (keywords) OR `turn` (1-indexed) + optional `radius` (0-3). Max 6/turn.",
+    promptSnippet: "Recall verbatim past turns by keyword or round #.",
     defaultActive: false,
     annotations: { readOnlyHint: true },
     parameters: {
       type: "object",
       properties: {
-        query: { type: "string", description: "Keywords for characters, items, promises, or events to search (space-separated)." },
-        turn: { type: "number", description: "1-indexed story round number to read verbatim." },
-        radius: { type: "number", description: "Neighboring rounds before/after `turn` (0-3, default 1)." },
-        limit: { type: "number", description: "Max search matches to return (1-8, default 5)." },
+        query: { type: "string", description: "Search keywords (space-separated)" },
+        turn: { type: "number", description: "1-indexed round to read verbatim" },
+        radius: { type: "number", description: "Neighboring rounds (0-3, default 1)" },
+        limit: { type: "number", description: "Max matches (1-8, default 5)" },
       },
     },
-    renderCall(args, theme) {
+    renderCall(rawArgs, theme) {
+      const args = unwrapNestedArgs(rawArgs);
       const detail = typeof args.query === "string" && args.query.trim()
         ? `搜索 “${args.query.trim()}”`
         : `读取第 ${String(args.turn ?? "?")} 轮`;
@@ -1082,7 +1125,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       const label = d.mode === "read" ? `读取 ${d.roundCount ?? 0} 轮原文` : `命中 ${d.matchCount ?? 0} 处历史片段`;
       return createLinesComponent(() => [styleFg(theme, "muted", `🕰 ${label}`)]);
     },
-    async execute(_id, params, _sig, _onUpdate, ctx) {
+    async execute(_id, rawParams, _sig, _onUpdate, ctx) {
+      const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
         return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
@@ -1165,7 +1209,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       },
       required: ["to_era"],
     },
-    renderCall(args, theme) {
+    renderCall(rawArgs, theme) {
+      const args = unwrapNestedArgs(rawArgs);
       return createLinesComponent(() => [
         `${styleFg(theme, "warning", "⏳ 幕次跃迁")} → ${styleBold(theme, String(args.to_era ?? ""))}`,
       ]);
@@ -1177,7 +1222,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         styleFg(theme, "warning", `⏳ ${d.fromEra ?? ""} → ${d.toEra ?? ""}${ms}`),
       ]);
     },
-    async execute(_id, params, _sig, _onUpdate, ctx) {
+    async execute(_id, rawParams, _sig, _onUpdate, ctx) {
+      const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
         return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };
@@ -1251,7 +1297,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
       },
       required: ["actor"],
     },
-    renderCall(args, theme) {
+    renderCall(rawArgs, theme) {
+      const args = unwrapNestedArgs(rawArgs);
       return createLinesComponent(() => [
         `${styleFg(theme, "accent", "👁 视角隔离")} ${styleBold(theme, String(args.actor ?? ""))}`,
       ]);
@@ -1262,7 +1309,8 @@ export function registerRpTools(pi: PiExtensionAPI, rt: RpToolRuntime): void {
         styleFg(theme, "muted", `👁 ${d.actor ?? "NPC"} 可见事实 ${d.visibleFacts ?? 0} 条 · 信念 ${d.beliefs ?? 0} 条`),
       ]);
     },
-    async execute(_id, params) {
+    async execute(_id, rawParams) {
+      const params = unwrapNestedArgs(rawParams);
       const state = rt.getState();
       if (!state.active) {
         return { isError: true, content: [{ type: "text", text: "RP mode is not active." }] };

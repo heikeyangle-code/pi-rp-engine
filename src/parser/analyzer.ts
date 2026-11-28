@@ -694,7 +694,7 @@ export async function analyzeCardWithModel(
   const raw = await completeWithRegistry(ctx, model, {
     systemPrompt,
     userPrompt,
-    maxTokens: 2800,
+    maxTokens: 4096,
     signal: ctx.signal,
   });
   return parseAnalyzeResponse(raw, card);

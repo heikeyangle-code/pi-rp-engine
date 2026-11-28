@@ -837,7 +837,9 @@ export type RpTxEntry =
   | { kind: "agenda_delete"; actorId: string }
   | { kind: "pair_bond_upsert"; bond: NpcPairBond }
   | { kind: "pair_bond_delete"; id: string }
-  | { kind: "lore_runtime"; sticky: Record<string, number>; cooldown: Record<string, number>; consumedOneShots: string[] };
+  | { kind: "lore_runtime"; sticky: Record<string, number>; cooldown: Record<string, number>; consumedOneShots: string[] }
+  | { kind: "anti_godmoding_set"; enabled: boolean }
+  | { kind: "tension_set"; value: number; reason?: string };
 
 export interface SessionRpState {
   active: boolean;
@@ -902,4 +904,8 @@ export interface SessionRpState {
   npcAgendas: Record<string, NpcAgenda>;
   pairBonds: Record<string, NpcPairBond>;
   auditLog: TxAuditRecord[];
+  antiGodmoding?: boolean;
+  sceneTension?: number;
+  lastSidecarStatus?: { turn: number; ok: boolean; summary: string };
+  slopCounts?: Record<string, number>;
 }

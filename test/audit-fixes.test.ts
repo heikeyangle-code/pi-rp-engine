@@ -345,8 +345,7 @@ test("audit-7: dashboard cancel safety, OOC isIdle guard, pickGreeting cancel & 
         notify() {},
         select: async (_title: string, opts: string[]) => {
           selectStep += 1;
-          if (selectStep === 1) return opts.find((o) => o.startsWith("4."));
-          if (selectStep === 2) return opts.find((o) => o.includes("导出纯净 Markdown 小说"));
+          if (selectStep === 1) return opts.find((o) => o.includes("导出纯净 Markdown 小说"));
           return undefined;
         },
         input: async () => undefined,
@@ -417,4 +416,27 @@ test("audit-8: Pi v1.7.0 session_shutdown & session_compact lifecycle hooks", as
     });
   }
   assert.ok(workingCalls.includes(undefined), "session_shutdown must clear workingMessage");
+});
+
+test("audit-9: v5 Prose-First default, Anti-Godmoding/Anti-Sycophancy/Spotlight & Runtime SlopTracker", async () => {
+  const { detectRuntimeSlop } = await import("../src/engine/stagnation.js");
+  const state = createInitialRpState();
+  assert.equal(state.settlementMode, "sidecar-light", "Default settlementMode must be Prose-First sidecar-light");
+  assert.equal(state.antiGodmoding, true, "Anti-Godmoding must default to enabled");
+
+  state.active = true;
+  state.presentNpcs = ["林秋", "账房先生"];
+  state.cfsmStates["林秋"] = { trust: { actorId: "林秋", axis: "trust", state: "guarded", updatedTurn: 1 } };
+  const card = makeCard();
+  const z3 = buildZone3TransientTail({ card, state, recentText: "我们继续往前走。", recalledLore: [] });
+  assert.ok(z3.includes("Player Agency") || z3.includes("NEVER speak"), "Zone 3 must include Anti-Godmoding guard");
+  assert.ok(z3.includes("Character Resistance") || z3.includes("guarded"), "Zone 3 must include Anti-Sycophancy resistance");
+  assert.ok(z3.includes("Spotlight") || z3.includes("林秋"), "Zone 3 must include Multi-NPC Spotlight cue");
+
+  const slop = detectRuntimeSlop([
+    "他眼底闪过一丝冷意，转身看向窗外。",
+    "她眼底闪过一丝犹豫，手指轻轻敲击桌面。",
+    "众人沉默不语，眼底闪过一丝不易察觉的慌乱。",
+  ]);
+  assert.ok(slop.phrases.length >= 1, "Runtime SlopTracker must detect repeated CJK clichés across recent turns");
 });

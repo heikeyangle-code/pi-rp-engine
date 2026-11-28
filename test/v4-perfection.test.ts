@@ -593,20 +593,20 @@ test("v4-8: Bulletproof KV-Cache: deterministic Zone 1 macros, tail-only toolRes
   await runTurn([m0, m1, m2]);
   // Turn 2: prefix_hit (streak 2)
   await runTurn([m0, m1, m2, m3, m4]);
-  assert.ok(lastHudStatus.includes("⚡KV×2"), `Expected ⚡KV×2 in HUD status, got: ${lastHudStatus}`);
+  assert.ok(lastHudStatus.includes("T2") && !lastHudStatus.includes("⚡KV"), `Expected clean mobile HUD status without internal KV tag, got: ${lastHudStatus}`);
 
   // Turn 3: mutate tools -> MUST detect tools_changed & reset streak to 1!
   activeTools = ["rp_roll_check", "bash"];
   await runTurn([m0, m1, m2, m3, m4, { role: "assistant", content: "风吹过" }, { role: "user", content: "继续" }]);
-  assert.ok(lastHudStatus.includes("⚠KV刷新"), `Expected ⚠KV刷新 after tools change, got: ${lastHudStatus}`);
+  assert.ok(lastHudStatus.includes("T3") && !lastHudStatus.includes("⚠KV"), `Expected clean mobile HUD status without internal KV tag, got: ${lastHudStatus}`);
 
   // Turn 4: stable tools again -> prefix_hit (streak 2)
   await runTurn([m0, m1, m2, m3, m4, { role: "assistant", content: "风吹过" }, { role: "user", content: "继续" }, { role: "assistant", content: "嗯" }, { role: "user", content: "再继续" }]);
-  assert.ok(lastHudStatus.includes("⚡KV×2"), `Expected ⚡KV×2 when stable again, got: ${lastHudStatus}`);
+  assert.ok(lastHudStatus.includes("T4") && !lastHudStatus.includes("⚡KV"), `Expected clean mobile HUD status without internal KV tag, got: ${lastHudStatus}`);
 
   // Turn 5: mutate earlier history (e.g. floor hidden or edited) -> MUST detect history_mutated!
   await runTurn([m0, { id: "m1", role: "assistant", content: "被篡改的历史" }, m2, m3, m4, { role: "assistant", content: "风吹过" }, { role: "user", content: "继续" }, { role: "assistant", content: "嗯" }, { role: "user", content: "再继续" }, { role: "assistant", content: "好" }, { role: "user", content: "最后" }]);
-  assert.ok(lastHudStatus.includes("⚠KV刷新"), `Expected ⚠KV刷新 after history mutation, got: ${lastHudStatus}`);
+  assert.ok(lastHudStatus.includes("T5") && !lastHudStatus.includes("⚠KV"), `Expected clean mobile HUD status without internal KV tag, got: ${lastHudStatus}`);
   void capturedXRay;
 
   // Also test v4-9 right inside this live extension: session_before_compact MUST persist MemScene into memoryBooks!

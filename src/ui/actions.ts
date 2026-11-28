@@ -642,7 +642,7 @@ async function importSingleFile(
   });
   saveCompiledPreset(targetDir, preset);
   ctx.ui.notify(
-    `已导入酒馆预设「${preset.name}」：Zone1 ${preset.zone1Prompts.length} 段 / Zone3 ${preset.zone3Prompts.length} 段`,
+    `已导入酒馆预设「${preset.name}」：静态设定 ${preset.zone1Prompts.length} 段 / 动态提示 ${preset.zone3Prompts.length} 段`,
     "info",
   );
   if (rt.getState().active) {
@@ -725,7 +725,7 @@ export async function actionImportFile(rt: RpRuntimeHandle, ctx: PiExtensionCont
   const alreadyActive = rt.getState().active;
   const canAiAnalyze = card.worldProfile?.source !== "llm-analyzed" && canCompleteWithRegistry(ctx);
   const nextOpts = [
-    ...(canAiAnalyze ? ["✨ 用 AI 深度建档后立即开玩（推荐纯文字卡 · 提取 7 维变量/秘密/伏笔/剧情卡并永久缓存）"] : []),
+    ...(canAiAnalyze ? ["✨ AI 深度建档后开玩（推荐纯文字卡）"] : []),
     "▶ 立即在本会话开启角色扮演（进入此角色）",
     ...(alreadyActive ? ["👥 加入当前同场共演阵容（保留当前主卡）"] : []),
     "📚 仅存入角色库，稍后再玩",
@@ -1278,8 +1278,8 @@ export async function actionBookmarkGoto(rt: RpRuntimeHandle, ctx: PiExtensionCo
   }
 
   const modePick = await ctx.ui.select(`跳转到「${target.label}」的方式`, [
-    "⏪ 原地回溯到该书签（navigateTree，世界状态自动精确还原）",
-    ...(typeof ctx.fork === "function" ? ["🌿 从该书签分叉出新剧情线（fork，保留当前分支）"] : []),
+    "⏪ 原地回溯到该书签（自动还原状态）",
+    ...(typeof ctx.fork === "function" ? ["🌿 从该书签分叉新剧情线（保留原分支）"] : []),
     "✕ 取消",
   ]);
   if (!modePick || modePick.startsWith("✕")) return;
@@ -1976,8 +1976,8 @@ export async function actionToggleRawPassthrough(
 
 export async function actionShowShortcuts(ctx: PiExtensionContext): Promise<void> {
   await ctx.ui.select(
-    "⌨️ RP 快捷键速查（Pi 原生 /hotkeys 也可查看全部绑定）",
-    [...RP_SHORTCUT_LIST.map((s) => `${s.key.padEnd(14)}  ${s.label} — ${s.description}`), "✕ 关闭"],
+    `⌨️ RP 核心快捷键（共 ${RP_SHORTCUT_LIST.length} 项）`,
+    [...RP_SHORTCUT_LIST.map((s) => `${s.key.padEnd(8)}  ${s.label} — ${s.description}`), "✕ 关闭"],
   );
 }
 
@@ -2026,8 +2026,8 @@ export async function actionAnalyzeCard(rt: RpRuntimeHandle, ctx: PiExtensionCon
     initialStats.length ? `2. 数值变量 (${initialStats.length})：${initialStats.slice(0, 6).map((s) => `${s.actorId ?? card.identity.name}.${s.key}=${s.initialValue}`).join("、")}` : null,
     profile.initialInventory.length ? `   初始物品 (${profile.initialInventory.length})：${profile.initialInventory.map((i) => `${i.actorId ?? "player"}:${i.item}×${i.count}`).join("、")}` : null,
     profile.suggestedCfsmAxes.length ? `3. 角色心态轴 (${profile.suggestedCfsmAxes.length})：${profile.suggestedCfsmAxes.map((a) => `${a.actorId ?? card.identity.name}.${a.axis}(${a.states.join("→")})`).join("；")}` : null,
-    profile.initialBeliefs?.length ? `4. 初始信念 DualMem：${profile.initialBeliefs.length} 条人物潜台词` : null,
-    profile.initialFacts?.length ? `5. 初始事实与秘密 FANToM：${profile.initialFacts.length} 条（含 ${secretCount} 条隐藏秘密/盲区）` : null,
+    profile.initialBeliefs?.length ? `4. 初始人物信念：${profile.initialBeliefs.length} 条人物潜台词` : null,
+    profile.initialFacts?.length ? `5. 初始事实与秘密：${profile.initialFacts.length} 条（含 ${secretCount} 条隐藏秘密/盲区）` : null,
     profile.initialForesights?.length ? `6. 初始伏笔与悬念：${profile.initialForesights.length} 条` : null,
     profile.initialStorylets?.length || profile.initialClocks?.length
       ? `7. 动态剧情卡与时钟：Storylets ${profile.initialStorylets?.length ?? 0} 张 · 时钟 ${profile.initialClocks?.length ?? 0} 个`
@@ -2311,7 +2311,7 @@ export async function actionRecap(rt: RpRuntimeHandle, ctx: PiExtensionContext):
       details: {
         kind: "recap",
         title: `${card.identity.name} · 前情提要`,
-        subtitle: `T${state.turn} · 0 Token 瞬时合成`,
+        subtitle: `T${state.turn} · 即时摘要`,
       },
     },
     { triggerTurn: false },
@@ -2483,7 +2483,7 @@ export async function actionSidePrompt(rt: RpRuntimeHandle, ctx: PiExtensionCont
     `You have the COMPLETE live world state, memory ledger, beliefs, foresights, agendas, and extension feature map below. ` +
     `Answer the user's question directly, accurately, and concisely in the user's language. Do NOT write roleplay prose. ` +
     `Extension UI map (if the user asks how to manage or edit anything): ` +
-    `世界面板(Ctrl+Shift+R) has 5 sections: 1.本局动态一览(近期写入/一键撤销/Flags/事实/信念/伏笔), 2.场景与世界(地点/时间/目标/Flags/时钟/剧情卡/幕间推演/镜头聚焦/幕后插叙), ` +
+    `世界面板(/rp panel) has 5 sections: 1.本局动态(近期变更/一键撤销/标记/事实/信念/伏笔/物理与空间), 2.场景与世界(地点/时间/目标/标记/时钟/剧情卡/幕间推演/镜头聚焦/幕后插叙), ` +
     `3.人物与关系(按角色一站式档案:心态/数值/外貌伤势站位/口癖底线/看法/背包/日程 + 关系网/马甲/共演), ` +
     `4.记忆、伏笔与世界书(世界书/记忆书/秘密盲区/信念/事实/伏笔/前情提要/隐藏恢复楼层/导出小说至rp-exports), ` +
     `5.导演台与设置(节奏/篇幅视角/禁词表/局部改写/导演指令/内心独白/快捷回复/AI建档/高级设置含Sidecar与语义向量Embedding).`;
@@ -2922,23 +2922,22 @@ export async function actionXRay(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
 
   const totalTokens = xray.zone1Tokens + xray.zone2Tokens + xray.zone3Tokens;
   const kvReasonMap: Record<string, string> = {
-    prefix_hit: "✅ 三层前缀全命中",
+    prefix_hit: "✅ 前缀缓存命中",
     first_turn: "🆕 首轮建立缓存",
     tools_changed: "⚠ 工具列表变更导致刷新",
-    zone1_changed: "⚠ Zone 1 冻结前缀变更导致刷新",
-    history_mutated: "⚠ Zone 2 历史前缀变更（隐藏/压缩/回溯）",
+    zone1_changed: "⚠ 常驻设定变更导致刷新",
+    history_mutated: "⚠ 对话历史变更（隐藏/压缩/回溯）",
   };
   const kvReason = kvReasonMap[xray.cacheInvalidationReason ?? ""] ?? "已监控";
   const repPct = Math.round((xray.repetitionScore ?? 0) * 100);
   const stagTurns = xray.stagnantTurns ?? 0;
 
   const lines: string[] = [
-    `三层 KV-Cache: ${kvReason}  │  连续命中 ×${xray.cacheHitStreak}`,
-    `前缀指纹: Tools=${xray.toolsHash ?? "—"}  │  Zone1=${xray.zone1Hash}  │  Zone2前缀=${xray.zone2PrefixMatch === false ? "✗断开" : "✓连续"}`,
-    `Token 分布: Zone1 ~${xray.zone1Tokens}t · Zone2 ~${xray.zone2Tokens}t · Zone3 ~${xray.zone3Tokens}t · 总计 ~${totalTokens}t`,
+    `缓存状态: ${kvReason}  │  连续命中 ×${xray.cacheHitStreak}`,
+    `Token 分布: 常驻设定 ~${xray.zone1Tokens}t · 对话历史 ~${xray.zone2Tokens}t · 动态上下文 ~${xray.zone3Tokens}t · 总计 ~${totalTokens}t`,
     `世界书预算: ${xray.loreTokens}/${xray.loreBudget}t  │  已隐藏楼层: ${xray.hiddenFloorCount} 楼`,
     `叙事健康度: 复读重叠率 ${repPct}%${repPct >= 42 ? " (⚠触发去重)" : " (正常)"}  │  距上次世界推进 ${stagTurns} 轮${stagTurns >= 4 ? " (⚠停滞)" : ""}`,
-    `记忆与隔离: 有效事实 ${xray.activeFactCount} 条 · FANToM 盲区保护 ${xray.blindSpotCount} 处 · 激活剧情卡 ${xray.activeStoryletTitles.length} 张`,
+    `记忆与隔离: 有效事实 ${xray.activeFactCount} 条 · 认知盲区保护 ${xray.blindSpotCount} 处 · 激活剧情卡 ${xray.activeStoryletTitles.length} 张`,
   ];
 
   if (xray.activeStoryletTitles.length > 0) {
@@ -2953,7 +2952,7 @@ export async function actionXRay(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
       lines.push(`· [${src}/${r.reason}] ${r.title}${key} (分:${r.score} · ~${r.tokens}t)`);
     }
   } else {
-    lines.push("", "【本轮召回条目】无动态召回（仅 Zone 1 常驻设定生效）");
+    lines.push("", "【本轮召回条目】无动态召回（仅常驻设定生效）");
   }
 
   if (xray.gatedOut.length > 0) {
@@ -2976,8 +2975,8 @@ export async function actionXRay(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
       display: true,
       details: {
         kind: "xray",
-        title: `${card.identity.name} · 上下文 X-Ray 透视`,
-        subtitle: `T${xray.turn} · KV×${xray.cacheHitStreak} · ~${totalTokens}t`,
+        title: `${card.identity.name} · 上下文透视`,
+        subtitle: `T${xray.turn} · ~${totalTokens}t`,
       },
     },
     { triggerTurn: false },
@@ -3582,4 +3581,451 @@ export async function actionExportNovel(rt: RpRuntimeHandle, ctx: PiExtensionCon
   }
 
   ctx.ui.notify(`📖 已导出纯净小说（${msgCount} 段，约 ${fullText.length} 字）：${outPath}`, "info");
+}
+
+
+// ---------------------------------------------------------------------------
+// 6. Anti-Godmoding Guard & Portable World Save Snapshot (`.rp-save.json`)
+// ---------------------------------------------------------------------------
+
+interface PortableWorldSaveV1 {
+  version: 1;
+  exportedAt: string;
+  cardSlug: string | null;
+  cardName: string;
+  turn: number;
+  state: {
+    stats: SessionRpState["stats"];
+    statBounds: SessionRpState["statBounds"];
+    inventory: SessionRpState["inventory"];
+    flags: SessionRpState["flags"];
+    clocks: SessionRpState["clocks"];
+    cfsmDefs: SessionRpState["cfsmDefs"];
+    cfsmStates: SessionRpState["cfsmStates"];
+    facts: Array<SessionRpState["facts"] extends Map<string, infer V> ? V : never>;
+    beliefs: SessionRpState["beliefs"];
+    foresights: Array<SessionRpState["foresights"] extends Map<string, infer V> ? V : never>;
+    memoryBooks: Array<SessionRpState["memoryBooks"] extends Map<string, infer V> ? V : never>;
+    storylets: Array<SessionRpState["storylets"] extends Map<string, infer V> ? V : never>;
+    physicalState: SessionRpState["physicalState"];
+    spatialNotes: string;
+    agendas: SessionRpState["npcAgendas"];
+    pairBonds: SessionRpState["pairBonds"];
+    voiceAnchors: SessionRpState["voiceAnchors"];
+    era: string;
+    day: number;
+    worldTimeLabel: string;
+    location: string;
+    presentNpcs: string[];
+    sceneObjective: string;
+    pacingMode: PacingMode;
+    antiGodmoding: boolean;
+  };
+}
+
+/** Toggle strict anti-godmoding guard (`/rp godmode`): prevents characters from acting or speaking on behalf of the player. */
+export async function actionToggleAntiGodmoding(rt: RpRuntimeHandle, ctx: PiExtensionContext): Promise<void> {
+  const state = rt.getState();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  const cur = Boolean((state as SessionRpState & { antiGodmoding?: boolean }).antiGodmoding);
+  const next = !cur;
+  rt.commitTx({ kind: "anti_godmoding_set", enabled: next } as unknown as RpTxEntry);
+  rt.refreshHud(ctx);
+  ctx.ui.notify(
+    next ? "🛡 防抢戏守卫已开启（严禁角色代演玩家的动作与台词）。" : "🛡 防抢戏守卫已关闭。",
+    "info",
+  );
+}
+
+/** Export portable `.rp-save.json` world snapshot to `cwd/rp-saves/<slug>-<date>.rp-save.json`. */
+export async function actionExportWorldSave(
+  rt: RpRuntimeHandle,
+  ctx: PiExtensionContext,
+  argsText: string,
+): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+
+  const slug = (card?.slug || state.cardSlug || "world").replace(/[^a-zA-Z0-9一-龥_-]+/g, "_");
+  const stamp = new Date().toISOString().slice(0, 10);
+  const customRaw = argsText.trim().replace(/[^a-zA-Z0-9一-龥_.-]+/g, "_");
+  const fileName = customRaw
+    ? customRaw.endsWith(".rp-save.json")
+      ? customRaw
+      : `${customRaw}.rp-save.json`
+    : `${slug}-${stamp}.rp-save.json`;
+
+  const saveDir = path.join(ctx.cwd || state.worldDir || getGlobalLibraryDir(), "rp-saves");
+  const outPath = path.join(saveDir, fileName);
+
+  const payload: PortableWorldSaveV1 = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    cardSlug: state.cardSlug,
+    cardName: card?.identity.name ?? state.cardSlug ?? "RP",
+    turn: state.turn,
+    state: {
+      stats: state.stats,
+      statBounds: state.statBounds,
+      inventory: state.inventory,
+      flags: state.flags,
+      clocks: state.clocks,
+      cfsmDefs: state.cfsmDefs,
+      cfsmStates: state.cfsmStates,
+      facts: Array.from(state.facts.values()),
+      beliefs: state.beliefs,
+      foresights: Array.from(state.foresights.values()),
+      memoryBooks: Array.from(state.memoryBooks.values()),
+      storylets: Array.from(state.storylets.values()),
+      physicalState: state.physicalState,
+      spatialNotes: state.spatialNotes,
+      agendas: state.npcAgendas,
+      pairBonds: state.pairBonds,
+      voiceAnchors: state.voiceAnchors,
+      era: state.era,
+      day: state.day,
+      worldTimeLabel: state.worldTimeLabel,
+      location: state.location,
+      presentNpcs: state.presentNpcs,
+      sceneObjective: state.sceneObjective,
+      pacingMode: state.pacingMode,
+      antiGodmoding: Boolean((state as SessionRpState & { antiGodmoding?: boolean }).antiGodmoding),
+    },
+  };
+
+  try {
+    fs.mkdirSync(saveDir, { recursive: true });
+    fs.writeFileSync(outPath, JSON.stringify(payload, null, 2), "utf-8");
+  } catch (err) {
+    ctx.ui.notify(`导出世界存档失败：${(err as Error).message}`, "error");
+    return;
+  }
+
+  ctx.ui.notify(
+    `💾 已导出世界存档（事实 ${payload.state.facts.length} · 伏笔 ${payload.state.foresights.length} · 记忆书 ${payload.state.memoryBooks.length}）：${outPath}`,
+    "info",
+  );
+}
+
+/** Import portable `.rp-save.json` world snapshot into the current active RP session. */
+export async function actionImportWorldSave(
+  rt: RpRuntimeHandle,
+  ctx: PiExtensionContext,
+  argsText: string,
+): Promise<void> {
+  const curState = rt.getState();
+  if (!curState.active) {
+    ctx.ui.notify("请先加载一张角色卡再导入世界存档。", "warning");
+    return;
+  }
+
+  const saveDir = path.join(ctx.cwd || curState.worldDir || getGlobalLibraryDir(), "rp-saves");
+  let targetPath = "";
+
+  const arg = argsText.trim();
+  if (arg) {
+    const direct = normalizeUserFilePath(arg, ctx.cwd);
+    const inSaveDir = path.join(saveDir, arg.endsWith(".rp-save.json") ? arg : `${arg}.rp-save.json`);
+    if (fs.existsSync(direct) && fs.statSync(direct).isFile()) {
+      targetPath = direct;
+    } else if (fs.existsSync(inSaveDir) && fs.statSync(inSaveDir).isFile()) {
+      targetPath = inSaveDir;
+    } else {
+      ctx.ui.notify(`找不到存档文件：${arg}`, "error");
+      return;
+    }
+  } else {
+    const candidates: Array<{ name: string; fullPath: string; mtimeMs: number }> = [];
+    if (fs.existsSync(saveDir)) {
+      for (const entry of fs.readdirSync(saveDir)) {
+        if (!entry.endsWith(".rp-save.json")) continue;
+        const fullPath = path.join(saveDir, entry);
+        try {
+          const st = fs.statSync(fullPath);
+          if (st.isFile()) candidates.push({ name: entry, fullPath, mtimeMs: st.mtimeMs });
+        } catch {
+          // ignore unreadable files
+        }
+      }
+    }
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const opts = [
+      ...candidates.map((c) => `💾 ${c.name}`),
+      "✏️ 手动输入存档文件路径",
+      "✕ 取消",
+    ];
+    const pick = await ctx.ui.select(`📂 选择要导入的世界存档（${candidates.length} 个）`, opts);
+    if (!pick || pick.startsWith("✕")) return;
+    if (pick.startsWith("✏️")) {
+      const entered = (await ctx.ui.input("输入 .rp-save.json 文件路径", ""))?.trim();
+      if (!entered) return;
+      targetPath = normalizeUserFilePath(entered, ctx.cwd);
+    } else {
+      const chosen = candidates[opts.indexOf(pick)];
+      if (!chosen) return;
+      targetPath = chosen.fullPath;
+    }
+  }
+
+  if (!targetPath || !fs.existsSync(targetPath)) {
+    ctx.ui.notify(`存档文件不存在：${targetPath}`, "error");
+    return;
+  }
+
+  let parsed: Partial<PortableWorldSaveV1>;
+  try {
+    parsed = JSON.parse(fs.readFileSync(targetPath, "utf-8")) as Partial<PortableWorldSaveV1>;
+  } catch (err) {
+    ctx.ui.notify(`解析存档 JSON 失败：${(err as Error).message}`, "error");
+    return;
+  }
+
+  const snap = parsed.state;
+  if (!snap || typeof snap !== "object") {
+    ctx.ui.notify("存档格式无效：缺少 state 字段。", "error");
+    return;
+  }
+
+  const factsArr = Array.isArray(snap.facts) ? snap.facts : [];
+  const beliefsArr = Array.isArray(snap.beliefs) ? snap.beliefs : [];
+  const foresightsArr = Array.isArray(snap.foresights) ? snap.foresights : [];
+  const booksArr = Array.isArray(snap.memoryBooks) ? snap.memoryBooks : [];
+  const storyletsArr = Array.isArray(snap.storylets) ? snap.storylets : [];
+
+  const summary = [
+    `来源角色：${parsed.cardName || parsed.cardSlug || "未知"}（第 ${parsed.turn ?? 0} 轮）`,
+    `导出时间：${(parsed.exportedAt || "未知").slice(0, 16).replace("T", " ")}`,
+    `包含数据：事实 ${factsArr.length} · 信念 ${beliefsArr.length} · 伏笔 ${foresightsArr.length} · 记忆书 ${booksArr.length} · 剧情卡 ${storyletsArr.length}`,
+  ].join("\n");
+
+  const ok = await ctx.ui.confirm("确认导入世界存档快照？", summary);
+  if (!ok) return;
+
+  // Apply spatio-temporal & pacing configuration
+  if (typeof snap.era === "string" && snap.era !== curState.era) {
+    rt.commitTx({
+      kind: "era_advance",
+      fromEra: curState.era,
+      toEra: snap.era,
+      milestoneUnlocked: [],
+      montageSummary: "import_save",
+      turn: curState.turn,
+    });
+  }
+  const dayDelta = typeof snap.day === "number" && Number.isFinite(snap.day) ? snap.day - curState.day : 0;
+  if (dayDelta !== 0 || (typeof snap.worldTimeLabel === "string" && snap.worldTimeLabel !== curState.worldTimeLabel)) {
+    rt.commitTx({
+      kind: "clock_tick",
+      beatDelta: 0,
+      dayDelta: dayDelta !== 0 ? dayDelta : undefined,
+      worldTimeLabel: typeof snap.worldTimeLabel === "string" ? snap.worldTimeLabel : curState.worldTimeLabel,
+    });
+  }
+  if (typeof snap.location === "string" || Array.isArray(snap.presentNpcs)) {
+    rt.commitTx({
+      kind: "location_set",
+      location: typeof snap.location === "string" ? snap.location : curState.location,
+      presentNpcs: Array.isArray(snap.presentNpcs) ? snap.presentNpcs.filter((x): x is string => typeof x === "string") : curState.presentNpcs,
+    });
+  }
+  if (typeof snap.sceneObjective === "string") {
+    rt.commitTx({ kind: "scene_objective_set", objective: snap.sceneObjective });
+  }
+  if (snap.pacingMode === "relaxed" || snap.pacingMode === "balanced" || snap.pacingMode === "dramatic") {
+    rt.commitTx({ kind: "config_patch", pacingMode: snap.pacingMode });
+  }
+  if (typeof snap.antiGodmoding === "boolean") {
+    rt.commitTx({ kind: "anti_godmoding_set", enabled: snap.antiGodmoding } as unknown as RpTxEntry);
+  }
+
+  // Flags
+  if (snap.flags && typeof snap.flags === "object") {
+    for (const [flag, value] of Object.entries(snap.flags)) {
+      rt.commitTx({ kind: "flag_set", flag, value: Boolean(value) });
+    }
+  }
+
+  // Stats & bounds
+  const boundsMap = snap.statBounds && typeof snap.statBounds === "object" ? snap.statBounds : {};
+  if (snap.stats && typeof snap.stats === "object") {
+    for (const [actorId, actorStats] of Object.entries(snap.stats)) {
+      if (!actorStats || typeof actorStats !== "object") continue;
+      for (const [key, value] of Object.entries(actorStats)) {
+        const b = boundsMap[actorId]?.[key];
+        rt.commitTx({
+          kind: "stat_patch",
+          actorId,
+          key,
+          op: "set",
+          value,
+          min: b?.min,
+          max: b?.max,
+          reason: "import_save",
+        });
+      }
+    }
+  }
+
+  // Inventory (exact target quantity via delta)
+  if (snap.inventory && typeof snap.inventory === "object") {
+    for (const [actorId, bag] of Object.entries(snap.inventory)) {
+      if (!bag || typeof bag !== "object") continue;
+      for (const [item, qty] of Object.entries(bag)) {
+        if (typeof qty !== "number" || !Number.isFinite(qty)) continue;
+        const curQty = rt.getState().inventory[actorId]?.[item] ?? 0;
+        const delta = qty - curQty;
+        if (delta !== 0) {
+          rt.commitTx({ kind: "inventory_patch", actorId, item, delta, note: "import_save" });
+        }
+      }
+    }
+  }
+
+  // Clocks
+  if (snap.clocks && typeof snap.clocks === "object") {
+    for (const clk of Object.values(snap.clocks)) {
+      if (!clk || !clk.clockId) continue;
+      const curVal = rt.getState().clocks[clk.clockId]?.value ?? 0;
+      rt.commitTx({
+        kind: "progress_clock",
+        clockId: clk.clockId,
+        label: clk.label || clk.clockId,
+        delta: (clk.value ?? 0) - curVal,
+        max: Math.max(1, clk.max ?? 4),
+        completed: Boolean(clk.completed),
+      });
+    }
+  }
+
+  // CFSM definitions & states
+  if (snap.cfsmDefs && typeof snap.cfsmDefs === "object") {
+    for (const [actorId, axes] of Object.entries(snap.cfsmDefs)) {
+      if (!axes || typeof axes !== "object") continue;
+      for (const def of Object.values(axes)) {
+        if (def?.axis && Array.isArray(def.states)) {
+          rt.commitTx({ kind: "cfsm_define", actorId, def });
+        }
+      }
+    }
+  }
+  if (snap.cfsmStates && typeof snap.cfsmStates === "object") {
+    for (const [actorId, axes] of Object.entries(snap.cfsmStates)) {
+      if (!axes || typeof axes !== "object") continue;
+      for (const [axis, rec] of Object.entries(axes)) {
+        if (!rec?.state) continue;
+        const curAxisState = rt.getState().cfsmStates[actorId]?.[axis]?.state ?? "";
+        if (curAxisState !== rec.state) {
+          rt.commitTx({
+            kind: "cfsm_transition",
+            actorId,
+            axis,
+            from: curAxisState || rec.state,
+            to: rec.state,
+            reason: rec.reason || "import_save",
+            turn: rec.updatedTurn ?? curState.turn,
+          });
+        }
+      }
+    }
+  }
+
+  // Facts
+  for (const fact of factsArr) {
+    if (!fact?.id || !fact.statement) continue;
+    const exists = rt.getState().facts.has(fact.id);
+    if (!exists) {
+      rt.commitTx({ kind: "fact_add", fact });
+    } else {
+      rt.commitTx({
+        kind: "fact_update",
+        factId: fact.id,
+        statement: fact.statement,
+        witnessIds: fact.witnessIds,
+        entities: fact.entities,
+      });
+    }
+    if (fact.validUntilTurn !== null && fact.validUntilTurn !== undefined) {
+      rt.commitTx({
+        kind: "fact_invalidate",
+        factId: fact.id,
+        validUntilTurn: fact.validUntilTurn,
+        supersededBy: fact.supersededBy,
+        reason: "import_save",
+      });
+    }
+  }
+
+  // Beliefs
+  for (const b of beliefsArr) {
+    if (!b?.actorId || !b.belief) continue;
+    const already = b.id && rt.getState().beliefs.some((x) => x.id === b.id);
+    if (!already) {
+      rt.commitTx({
+        kind: "belief_update",
+        id: b.id,
+        actorId: b.actorId,
+        target: b.target || curState.currentPersona.name,
+        activatingEvent: b.activatingEvent || "存档导入",
+        belief: b.belief,
+        subjectiveInsight: b.subjectiveInsight,
+        emotionalTone: b.emotionalTone,
+        turn: b.turn ?? curState.turn,
+      });
+    }
+  }
+
+  // Foresights, Memory Books, Storylets
+  for (const hook of foresightsArr) {
+    if (hook?.id && hook.summary) rt.commitTx({ kind: "foresight_upsert", hook });
+  }
+  for (const entry of booksArr) {
+    if (entry?.id && entry.title) rt.commitTx({ kind: "memory_book_upsert", entry });
+  }
+  for (const storylet of storyletsArr) {
+    if (storylet?.id && storylet.title) rt.commitTx({ kind: "storylet_upsert", storylet });
+  }
+
+  // Physical state & spatial notes
+  if (snap.physicalState && typeof snap.physicalState === "object") {
+    for (const ps of Object.values(snap.physicalState)) {
+      if (ps?.actorId) {
+        rt.commitTx({ kind: "physical_patch", snapshot: ps, reason: "import_save" });
+      }
+    }
+  }
+  if (typeof snap.spatialNotes === "string" && snap.spatialNotes !== rt.getState().spatialNotes) {
+    rt.commitTx({
+      kind: "physical_patch",
+      snapshot: { actorId: "", updatedTurn: curState.turn },
+      spatialNotes: snap.spatialNotes,
+      reason: "import_save",
+    });
+  }
+
+  // Agendas, Pair Bonds, Voice Anchors
+  if (snap.agendas && typeof snap.agendas === "object") {
+    for (const agenda of Object.values(snap.agendas)) {
+      if (agenda?.actorId && agenda.goal) rt.commitTx({ kind: "agenda_upsert", agenda });
+    }
+  }
+  if (snap.pairBonds && typeof snap.pairBonds === "object") {
+    for (const bond of Object.values(snap.pairBonds)) {
+      if (bond?.id && bond.actorA && bond.actorB) rt.commitTx({ kind: "pair_bond_upsert", bond });
+    }
+  }
+  if (snap.voiceAnchors && typeof snap.voiceAnchors === "object") {
+    for (const anchor of Object.values(snap.voiceAnchors)) {
+      if (anchor?.actorId && anchor.backbone) rt.commitTx({ kind: "voice_anchor_upsert", anchor });
+    }
+  }
+
+  rt.refreshHud(ctx);
+  ctx.ui.notify(`📂 已导入世界存档：${path.basename(targetPath)}`, "info");
 }
