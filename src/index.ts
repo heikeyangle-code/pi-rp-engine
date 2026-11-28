@@ -128,6 +128,38 @@ export function isReasoningOnlyOrEmptyStop(msg: PiMessage | undefined): boolean 
   return extractMessageText(msg).trim().length === 0;
 }
 
+export const SIDECAR_READ_TOOLS = ["rp_roll_check", "rp_recall", "rp_history_recall"] as const;
+export const TOOL_ASSISTED_CORE_TOOLS = [
+  "rp_roll_check",
+  "rp_state_patch",
+  "rp_fact_commit",
+  "rp_recall",
+  "rp_history_recall",
+] as const;
+
+/**
+ * Prose-First Dual-Track Tool Exposure:
+ * - "off": 0 tools (pure literary prose, max KV-cache & zero TTFT overhead)
+ * - "sidecar-light": 0 tools for companion/slice-of-life without explicit RPG modules;
+ *   otherwise 3 lean read/dice tools (rp_roll_check, rp_recall, rp_history_recall)
+ * - "tool-assisted": 5 core tools (excludes rp_npc_deliberate & rp_era_advance by default)
+ */
+export function getDesiredRpTools(state: SessionRpState, card: CompiledCard | null): string[] {
+  if (state.settlementMode === "off") {
+    return [];
+  }
+  if (state.settlementMode === "sidecar-light") {
+    const archetype = state.archetype || card?.worldProfile?.archetype || "companion";
+    const modules = state.modules ?? card?.worldProfile?.modules;
+    const hasRpgModules = Boolean(modules?.stats || modules?.inventory || modules?.clocks);
+    if ((archetype === "companion" || archetype === "slice-of-life") && !hasRpgModules) {
+      return [];
+    }
+    return [...SIDECAR_READ_TOOLS];
+  }
+  return [...TOOL_ASSISTED_CORE_TOOLS];
+}
+
 export default function rpEngineExtension(pi: PiExtensionAPI): void {
   let state: SessionRpState = createInitialRpState();
   let activeCard: CompiledCard | null = null;
@@ -199,22 +231,12 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     applyRpTx(state, tx);
   }
 
-  function getDesiredRpTools(): string[] {
-    // In sidecar-light or off mode, the main narrative model does not need state/fact write tools;
-    // omitting them saves tool-schema tokens and prevents XML-style `<rp_state_patch">` leaks.
-    if (state.settlementMode === "sidecar-light" || state.settlementMode === "off") {
-      return RP_TOOL_NAMES.filter((t) => t !== "rp_state_patch" && t !== "rp_fact_commit");
-    }
-    return [...RP_TOOL_NAMES];
-  }
-
   function activateRpTools(): void {
     const current = pi.getActiveTools();
-    const desired = getDesiredRpTools();
-    const isAlreadyPureRp = current.length > 0 && current.every((t) => rpToolSet.has(t));
-    if (!isAlreadyPureRp) {
-      const nonRp = current.filter((t) => !rpToolSet.has(t));
-      savedCodingTools = nonRp;
+    const desired = getDesiredRpTools(state, activeCard);
+    const hasNonRpTools = current.some((t) => !rpToolSet.has(t));
+    if (savedCodingTools === null && hasNonRpTools) {
+      savedCodingTools = current.filter((t) => !rpToolSet.has(t));
     }
     pi.setActiveTools(desired);
   }
@@ -331,7 +353,46 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     renderRpHud(ctx, state, activeCard, lastXRay);
   }
 
-  const runtime: RpRuntimeHandle = {
+  async function retrySidecarSettlement(ctx: PiExtensionContext): Promise<number> {
+    if (!state.active || !activeCard || state.settlementMode !== "sidecar-light") return 0;
+    let userText = lastUserText;
+    let assistantText = lastAssistantText;
+    if (!assistantText.trim()) {
+      const branch = ctx?.sessionManager?.getBranch?.() ?? [];
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const e = branch[i]!;
+        if (e.type === "message" && e.message) {
+          if (!assistantText && e.message.role === "assistant") {
+            assistantText = extractMessageText(e.message);
+          } else if (assistantText && !userText && e.message.role === "user") {
+            userText = extractMessageText(e.message);
+            break;
+          }
+        }
+      }
+    }
+    if (!assistantText.trim()) return 0;
+    try {
+      const committed = await runSidecarLightSettlement({
+        pi,
+        ctx,
+        state,
+        lastUserText: userText,
+        lastAssistantText: assistantText,
+      });
+      lastSidecarSettledTurn = state.turn;
+      const sidecarStatus = (state as SessionRpState & { lastSidecarStatus?: unknown }).lastSidecarStatus;
+      if (lastXRay && sidecarStatus !== undefined) {
+        (lastXRay as ContextXRaySnapshot & { lastSidecarStatus?: unknown }).lastSidecarStatus = sidecarStatus;
+      }
+      renderRpHud(ctx, state, activeCard, lastXRay);
+      return committed;
+    } catch {
+      return 0;
+    }
+  }
+
+  const runtime: RpRuntimeHandle & { retrySidecarSettlement?: (ctx: PiExtensionContext) => Promise<number> } = {
     pi,
     getState: () => state,
     getCard: () => activeCard,
@@ -347,6 +408,7 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       isOocTurn = true;
     },
     teardownSessionRuntime,
+    retrySidecarSettlement,
   };
 
   // Register tools (defaultActive: false -> 0 tokens in coding sessions)
@@ -494,12 +556,15 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     }
 
     const initialPersona = state.initialPersona ?? state.currentPersona;
-    const zone1 = buildZone1FrozenPrefix({
+    const activeToolNames = pi.getActiveTools();
+    const zone1Options = {
       card: activeCard,
       extraCastCards,
       preset: activePreset,
       initialPersona,
-    });
+      activeToolNames,
+    };
+    const zone1 = buildZone1FrozenPrefix(zone1Options);
 
     const hash = computeZone1Hash(zone1);
     const activeToolsSorted = [...pi.getActiveTools()].sort().join(",");
@@ -644,7 +709,8 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
     const zone3Tokens = estimateTokens(zone3);
     const zone2Tokens = Math.max(0, computeMessagesTokens(outMessages) - zone3Tokens);
 
-    lastXRay = {
+    const sidecarStatus = (state as SessionRpState & { lastSidecarStatus?: unknown }).lastSidecarStatus;
+    const nextXRay: ContextXRaySnapshot & { lastSidecarStatus?: unknown } = {
       turn: state.turn,
       timestamp: Date.now(),
       toolsHash: currentToolsHash,
@@ -666,7 +732,9 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
       hiddenFloorCount: state.hiddenEntryIds.size,
       repetitionScore: narrativeHealth.repetitionScore,
       stagnantTurns: narrativeHealth.stagnantTurns,
+      ...(sidecarStatus !== undefined ? { lastSidecarStatus: sidecarStatus } : {}),
     };
+    lastXRay = nextXRay;
 
     return { messages: outMessages };
   });
@@ -896,7 +964,11 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
         lastUserText,
         lastAssistantText,
       });
-      if (committed > 0) {
+      const sidecarStatus = (state as SessionRpState & { lastSidecarStatus?: unknown }).lastSidecarStatus;
+      if (lastXRay && sidecarStatus !== undefined) {
+        (lastXRay as ContextXRaySnapshot & { lastSidecarStatus?: unknown }).lastSidecarStatus = sidecarStatus;
+      }
+      if (committed > 0 || sidecarStatus !== undefined) {
         renderRpHud(ctx, state, activeCard, lastXRay);
       }
     } catch {

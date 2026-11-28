@@ -81,6 +81,37 @@ export function runDeterministicTurnSettlement(options: {
  * Single-pass extraction over BOTH player actions and assistant-established world details.
  * Fails silently on any error so narrative UX is never interrupted.
  */
+
+const STAT_SYNONYM_GROUPS: string[][] = [
+  ["好感度", "好感", "affection", "favor", "favorability", "love"],
+  ["信任度", "信任", "trust"],
+  ["警戒度", "警戒", "警惕", "alert", "suspicion", "疑心"],
+  ["生命值", "生命", "血量", "体力", "hp", "health"],
+  ["理智值", "理智", "san", "sanity"],
+  ["银两", "金钱", "金币", "钱财", "货币", "gold", "silver", "money"],
+  ["声望", "名望", "reputation", "fame"],
+];
+
+/** Prevent duplicate synonym keys (e.g., creating "好感" when "好感度" already exists on actor). */
+function resolveCanonicalStatKey(state: SessionRpState, actorId: string, rawKey: string): string {
+  const existing = Object.keys(state.stats[actorId] ?? {});
+  if (existing.length === 0) return rawKey;
+  const lower = rawKey.toLowerCase();
+  const exact = existing.find((k) => k.toLowerCase() === lower);
+  if (exact) return exact;
+  for (const group of STAT_SYNONYM_GROUPS) {
+    if (group.includes(lower)) {
+      const matched = existing.find((k) => group.includes(k.toLowerCase()));
+      if (matched) return matched;
+    }
+  }
+  const fuzzy = existing.find((k) => {
+    const kl = k.toLowerCase();
+    return (kl.length >= 2 && lower.length >= 2) && (kl.startsWith(lower) || lower.startsWith(kl));
+  });
+  return fuzzy ?? rawKey;
+}
+
 export async function runSidecarLightSettlement(options: {
   pi: PiExtensionAPI;
   ctx: PiExtensionContext;
@@ -101,43 +132,73 @@ export async function runSidecarLightSettlement(options: {
   const startTurn = state.turn;
   const startCardSlug = state.cardSlug;
 
+  const isLightArchetype = state.archetype === "companion" || state.archetype === "slice-of-life";
+  const hasRpgModules = state.modules.clocks || state.modules.inventory || state.modules.stages;
+  const includeExtendedFields = !isLightArchetype || hasRpgModules;
+
   const schemaFields: string[] = [
     `"location": string|null`,
     `"presentNpcs": string[]|null`,
     `"worldTimeLabel": string|null`,
-    `"sceneObjective": string|null`,
     `"facts": [{"statement":"...","entities":["..."],"public":true,"witnesses":["..."]}]`,
     `"invalidatedFactIds": [{"id":"...","reason":"..."}]`,
     `"beliefs": [{"actorId":"...","target":"...","activatingEvent":"...","belief":"...","subjectiveInsight":"how this character emotionally interprets it","emotionalTone":"..."}]`,
-    `"foresights": [{"summary":"...","triggerHint":"...","entities":["..."]}]`,
-    `"paidOffForesightIds": ["hook_id"]`,
-    `"completedStoryletIds": ["storylet_id"]`,
-    `"newStorylets": [{"title":"...","triggerPrompt":"...","requiredFlags":["..."],"minTurn":number|null}]`,
     `"cfsm": [{"actorId":"...","axis":"...","to":"...","reason":"..."}]`,
     `"physical": [{"actorId":"...","attire":"...","condition":"...","holding":"...","position":"..."}]`,
-    `"spatialNotes": string|null`,
-    `"agendas": [{"actorId":"...","goal":"...","currentActivity":"...","etaTurns":number|null}]`,
-    `"pairBonds": [{"actorA":"...","actorB":"...","stance":"...","tension":number,"note":"..."}]`,
   ];
+  if (includeExtendedFields || state.sceneObjective.trim()) {
+    schemaFields.push(`"sceneObjective": string|null`);
+  }
+  if (includeExtendedFields || state.spatialNotes.trim()) {
+    schemaFields.push(`"spatialNotes": string|null`);
+  }
+  if (includeExtendedFields || state.foresights.size > 0) {
+    schemaFields.push(
+      `"foresights": [{"summary":"...","triggerHint":"...","entities":["..."]}]`,
+      `"paidOffForesightIds": ["hook_id"]`,
+    );
+  }
+  if (includeExtendedFields || state.storylets.size > 0) {
+    schemaFields.push(
+      `"completedStoryletIds": ["storylet_id"]`,
+      `"newStorylets": [{"title":"...","triggerPrompt":"...","requiredFlags":["..."],"minTurn":number|null}]`,
+    );
+  }
+  if (includeExtendedFields || Object.keys(state.npcAgendas).length > 0) {
+    schemaFields.push(`"agendas": [{"actorId":"...","goal":"...","currentActivity":"...","etaTurns":number|null}]`);
+  }
+  if (includeExtendedFields || Object.keys(state.pairBonds).length > 0) {
+    schemaFields.push(`"pairBonds": [{"actorA":"...","actorB":"...","stance":"...","tension":number,"note":"..."}]`);
+  }
   if (state.modules.stats) {
     schemaFields.push(`"stats": [{"actorId":"...","key":"...","op":"set"|"add","value":number|string|boolean,"reason":"..."}]`);
   }
-  if (state.modules.inventory) {
+  if (state.modules.inventory && (!isLightArchetype || Object.keys(state.inventory).length > 0 || state.modules.inventory)) {
     schemaFields.push(`"inventory": [{"actorId":"...","item":"...","delta":integer,"note":"..."}]`);
   }
   if (state.modules.clocks) {
     schemaFields.push(`"clocks": [{"clockId":"...","label":"...","delta":integer,"max":integer}]`);
   }
 
+  const promptRules: string[] = [
+    `- Only include fields that genuinely changed this turn; omit unchanged fields or leave arrays empty.`,
+    `- If a new development contradicts or supersedes an active fact listed below, include its exact id in invalidatedFactIds.`,
+    `- For beliefs, capture BOTH the objective activatingEvent and the character's persona-conditioned subjectiveInsight.`,
+  ];
+  if (includeExtendedFields || state.foresights.size > 0) {
+    promptRules.push(`- If an open foresight listed below was resolved/fulfilled this turn, include its id in paidOffForesightIds.`);
+  }
+  if (includeExtendedFields || state.storylets.size > 0) {
+    promptRules.push(
+      `- If an active Storylet listed below was clearly played out / resolved this turn, include its exact id in completedStoryletIds.`,
+      `- Only add newStorylets when the narrative plants a concrete deferred turning point or confrontation.`,
+    );
+  }
+
   const systemPrompt =
-    `You are a silent RP world-state ledger extractor (PDVA + RoleMemo DualMem + QBN Storylets). Extract durable changes established by EITHER the player OR the narrative.\n` +
+    `You are a silent RP world-state ledger extractor (PDVA + RoleMemo DualMem). Extract durable changes established by EITHER the player OR the narrative.\n` +
     `Output ONLY strict JSON with optional fields:\n{${schemaFields.join(", ")}}\n` +
-    `- Only include fields that genuinely changed this turn; omit unchanged fields or leave arrays empty.\n` +
-    `- If a new development contradicts or supersedes an active fact listed below, include its exact id in invalidatedFactIds.\n` +
-    `- If an open foresight listed below was resolved/fulfilled this turn, include its id in paidOffForesightIds.\n` +
-    `- If an active Storylet listed below was clearly played out / resolved this turn, include its exact id in completedStoryletIds.\n` +
-    `- Only add newStorylets when the narrative plants a concrete deferred turning point or confrontation.\n` +
-    `- For beliefs, capture BOTH the objective activatingEvent and the character's persona-conditioned subjectiveInsight.`;
+    promptRules.join("\n");
 
   const conflictCandidates = selectFactsForConflictCheck(
     state,
@@ -183,10 +244,13 @@ export async function runSidecarLightSettlement(options: {
     const rawText = await completeWithRegistry(ctx, model, {
       systemPrompt,
       userPrompt,
-      maxTokens: 1200,
+      maxTokens: 2048,
       signal: ctx.signal,
     });
-    if (!rawText) return 0;
+    if (!rawText) {
+      state.lastSidecarStatus = { turn: state.turn, ok: false, summary: "empty sidecar response" };
+      return 0;
+    }
 
     const parsed = extractJsonObject<{
       location?: string | null;
@@ -216,7 +280,10 @@ export async function runSidecarLightSettlement(options: {
       agendas?: Array<{ actorId?: string; goal?: string; currentActivity?: string; etaTurns?: number | null }>;
       pairBonds?: Array<{ actorA?: string; actorB?: string; stance?: string; tension?: number; note?: string }>;
     }>(rawText);
-    if (!parsed) return 0;
+    if (!parsed) {
+      state.lastSidecarStatus = { turn: state.turn, ok: false, summary: "failed to parse sidecar JSON" };
+      return 0;
+    }
 
     // Stale-branch guard (strict CAS): if user exited RP, switched cards, rewound, moved to another branch,
     // or advanced the leaf while sidecar ran, discard cleanly!
@@ -403,8 +470,9 @@ export async function runSidecarLightSettlement(options: {
     if (state.modules.stats) {
       for (const s of parsed.stats ?? []) {
         const actorId = s.actorId?.trim() || "player";
-        const key = s.key?.trim();
-        if (!key || s.value === undefined) continue;
+        const rawKey = s.key?.trim();
+        if (!rawKey || s.value === undefined) continue;
+        const key = resolveCanonicalStatKey(state, actorId, rawKey);
         const op = s.op === "add" ? "add" : "set";
         const check = computeCheckedStatValue(state, actorId, key, op, s.value);
         if (!check.ok) continue;
@@ -506,8 +574,19 @@ export async function runSidecarLightSettlement(options: {
       });
     }
 
+    state.lastSidecarStatus = {
+      turn: state.turn,
+      ok: true,
+      summary: committed > 0 ? `committed ${committed} update(s)` : "no state changes",
+    };
     return committed;
-  } catch {
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    state.lastSidecarStatus = {
+      turn: state.turn,
+      ok: false,
+      summary: `error: ${msg.slice(0, 120)}`,
+    };
     return 0;
   }
 }

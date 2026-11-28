@@ -37,7 +37,7 @@ import { selectFactsForZone3 } from "../memory/bitemporal.js";
 import { evaluateGate, partitionEpistemicFacts } from "../engine/gates.js";
 import { selectActiveForesights } from "../memory/foresight.js";
 import { selectRelevantBeliefs } from "../memory/graph-ppr.js";
-import { detectRepeatedCliches, type NarrativeHealthReport } from "../engine/stagnation.js";
+import { detectRepeatedCliches, detectRuntimeSlop, type NarrativeHealthReport } from "../engine/stagnation.js";
 import { estimateTokens } from "./token-budget.js";
 import { extractHeuristicVoiceAnchor } from "../parser/analyzer.js";
 
@@ -55,6 +55,11 @@ const ENGINE_PROTOCOL_COMPACT = `[RP Engine Protocol]
 - Authoritative world state (stats, inventory, clocks, era gates, flags, bi-temporal facts, character beliefs) is maintained deterministically by code and provided in <rp_state_frame> & <rp_recalled_context> at the end of the turn. Never fabricate impossible stat/item changes or print legacy HTML status bars.
 - Regular dialogue/emotional turns require ZERO tool calls — write the narrative directly.
 - Invoke tools ONLY when genuinely needed: \`rp_roll_check\` for uncertain checks, \`rp_state_patch\` when items/stats/location/clocks/CFSM materially change, \`rp_fact_commit\` for major new/invalidated facts, DREAM belief shifts, or foresights, \`rp_recall\` for deep archive lookups, \`rp_era_advance\` for major act transitions, and \`rp_npc_deliberate\` only for strict hidden-information NPC plotting.`;
+
+const ENGINE_PROTOCOL_PROSE_FIRST = `[RP Engine Protocol · Prose-First]
+- You are the sole narrative writer for this interactive world. Write pure, immersive literary prose with consistent character psychology, concrete sensory grounding, and organic pacing.
+- Authoritative world state (location, time, stats, inventory, clocks, facts, character beliefs) is maintained automatically in the background and provided in <rp_state_frame> & <rp_recalled_context> at the end of the turn.
+- NEVER output raw XML/JSON state tags, markdown status bars, HTML widgets, or meta commentary in your narrative reply.`;
 
 const PACING_HINTS: Record<PacingMode, string | null> = {
   relaxed: "Pacing cue: Keep scenes gentle, atmospheric, and character-driven; let quiet moments breathe without forcing artificial conflict.",
@@ -159,8 +164,9 @@ export function buildZone1FrozenPrefix(options: {
   preset?: CompiledPreset | null;
   initialPersona: PersonaProfile;
   loreOverrides?: Record<string, boolean>;
+  activeToolNames?: string[];
 }): string {
-  const { card, extraCastCards = [], preset, initialPersona, loreOverrides } = options;
+  const { card, extraCastCards = [], preset, initialPersona, loreOverrides, activeToolNames } = options;
   const charName = card.identity.nickname || card.identity.name;
   const groupMembers = [charName, ...extraCastCards.map((c) => c.identity.nickname || c.identity.name)];
   // Stable per-session deterministic seed ensures {{random}} / {{roll}} in Zone 1 NEVER break KV-Cache!
@@ -191,8 +197,12 @@ export function buildZone1FrozenPrefix(options: {
 
   const sections: string[] = [];
 
-  // 1. Compact engine protocol
-  sections.push(ENGINE_PROTOCOL_COMPACT);
+  // 1. Compact engine protocol (synced with active tools: Prose-First when write tools are hidden)
+  const hasWriteTools =
+    !activeToolNames ||
+    activeToolNames.includes("rp_state_patch") ||
+    activeToolNames.includes("rp_fact_commit");
+  sections.push(hasWriteTools ? ENGINE_PROTOCOL_COMPACT : ENGINE_PROTOCOL_PROSE_FIRST);
 
   // 2. Preset Zone 1 prompts (before chatHistory)
   if (preset && preset.zone1Prompts.length > 0) {
@@ -407,7 +417,7 @@ export function buildZone3TransientTail(options: {
   // 1b. Last-round state delta highlight (ported from dsh-tavern foreground-variable-changes.js)
   const recentAudit = state.auditLog
     .filter((a) => a.turn >= Math.max(0, state.turn - 1) && a.summary.trim().length > 0)
-    .slice(-8);
+    .slice(-3);
   if (recentAudit.length > 0) {
     pushSection(
       `<rp_recent_changes>\nRecent state changes (write this turn respecting these latest values):\n${recentAudit
@@ -559,6 +569,8 @@ export function buildZone3TransientTail(options: {
   }
 
   // 3d. Living World: Off-Screen NPC Agendas & NPC<->NPC Pair Bonds (narrator-only awareness)
+  const isLivingWorldArchetype =
+    state.archetype === "ensemble" || state.archetype === "epic-saga" || state.archetype === "mystery";
   const agendaList = Object.values(state.npcAgendas).slice(0, 5);
   const relevantBonds = Object.values(state.pairBonds)
     .filter(
@@ -568,7 +580,9 @@ export function buildZone3TransientTail(options: {
         presentLowerSet.has(b.actorB.toLowerCase()),
     )
     .slice(0, 5);
-  if (agendaList.length > 0 || relevantBonds.length > 0) {
+  const allowLivingWorld =
+    isLivingWorldArchetype || extraCastCards.length > 0 || agendaList.length > 0 || relevantBonds.length > 0;
+  if (allowLivingWorld && (agendaList.length > 0 || relevantBonds.length > 0)) {
     const lwLines: string[] = [];
     for (const ag of agendaList) {
       const etaTag =
@@ -595,7 +609,21 @@ export function buildZone3TransientTail(options: {
       presentLowerSet.has(a.actorId.toLowerCase()) ||
       a.actorId.toLowerCase() === charName.toLowerCase(),
   );
-  if (anchorEntries.length === 0) {
+  const profileVoiceAnchors = card.worldProfile?.voiceAnchors ?? [];
+  if (anchorEntries.length === 0 && profileVoiceAnchors.length > 0) {
+    for (const a of profileVoiceAnchors) {
+      if (
+        state.presentNpcs.length === 0 ||
+        presentLowerSet.has(a.actorId.toLowerCase()) ||
+        a.actorId.toLowerCase() === charName.toLowerCase()
+      ) {
+        anchorEntries.push(a);
+      }
+    }
+  }
+  const hasExplicitVoiceAnchors =
+    Object.keys(state.voiceAnchors).length > 0 || profileVoiceAnchors.length > 0;
+  if (anchorEntries.length === 0 && (state.turn >= 12 || hasExplicitVoiceAnchors)) {
     const fallbackAnchor = extractHeuristicVoiceAnchor(card);
     if (fallbackAnchor) anchorEntries.push(fallbackAnchor);
   }
@@ -627,8 +655,13 @@ export function buildZone3TransientTail(options: {
         : state.narrativePov === "first_char"
           ? "POV cue: Narrate from the character's first-person perspective."
           : null;
+  const runtimeSlopHits =
+    narrativeHealth?.runtimeSlopPhrases ??
+    (recentText ? detectRuntimeSlop(recentText.split(/\n{2,}/)).phrases : []);
   const autoSlopHits = detectRepeatedCliches(recentText);
-  const combinedBans = Array.from(new Set([...(state.bannedPhrases ?? []), ...autoSlopHits])).slice(0, 12);
+  const combinedBans = Array.from(
+    new Set([...(state.bannedPhrases ?? []), ...runtimeSlopHits, ...autoSlopHits]),
+  ).slice(0, 12);
   const banCue =
     combinedBans.length > 0
       ? `Avoid repeating these overused phrases/clichés: ${combinedBans.join(" / ")}.`
@@ -648,7 +681,78 @@ export function buildZone3TransientTail(options: {
       ? "Mobile brief-input cue: The player sent a short cue; maintain full literary prose depth, sensory grounding, and proactive scene momentum rather than mirroring brevity."
       : null;
 
+  // Anti-Godmoding Guard (default ON)
+  const antiGodmodingCue =
+    state.antiGodmoding !== false
+      ? evaluateMacros(
+          "Player Agency: NEVER speak, think, decide, or perform decisive actions for {{user}}; leave clear space for {{user}} to react.",
+          macroCtx,
+        )
+      : null;
+
+  // Anti-Sycophancy Friction Rule (fires when any present NPC is guarded/hostile in CFSM or has negative affinity)
+  const activeNpcLowerSet = new Set(
+    (state.presentNpcs.length > 0 ? state.presentNpcs : [charName]).map((n) => n.toLowerCase()),
+  );
+  const GUARDED_CFSM_RE = /guarded|wary|hostile|suspicious|cold|distrust|antagonistic|戒备|敌对|冷淡|警惕|怀疑|敌意|防备/i;
+  const AFFINITY_STAT_RE = /affection|affinity|trust|favor|favour|bond|relation|liking|loyalty|friendship|respect|好感|信任|亲密|关系|友善|信赖|忠诚/i;
+  let hasGuardedPresentNpc = false;
+  for (const [actor, axes] of Object.entries(state.cfsmStates)) {
+    if (!activeNpcLowerSet.has(actor.toLowerCase())) continue;
+    for (const rec of Object.values(axes)) {
+      if (GUARDED_CFSM_RE.test(rec.state)) {
+        hasGuardedPresentNpc = true;
+        break;
+      }
+    }
+    if (hasGuardedPresentNpc) break;
+  }
+  if (!hasGuardedPresentNpc) {
+    for (const [actor, statMap] of Object.entries(state.stats)) {
+      if (!activeNpcLowerSet.has(actor.toLowerCase())) continue;
+      for (const [k, v] of Object.entries(statMap)) {
+        if (typeof v === "number" && v < 0 && AFFINITY_STAT_RE.test(k)) {
+          hasGuardedPresentNpc = true;
+          break;
+        }
+      }
+      if (hasGuardedPresentNpc) break;
+    }
+  }
+  const antiSycophancyCue = hasGuardedPresentNpc
+    ? "Character Resistance: Present character(s) remain guarded/hostile — do NOT soften prematurely or agree easily; require earned trust or tangible leverage."
+    : null;
+
+  // Multi-NPC Spotlight Director (avoids "polite conference call" syndrome when 2+ NPCs are present)
+  const hasManualSpotlight = state.notes.some((n) => /spotlight|焦点|聚焦/i.test(n.text));
+  let spotlightCue: string | null = null;
+  if (state.presentNpcs.length >= 2 && !hasManualSpotlight) {
+    const talkMap = new Map<string, number>();
+    for (const c of [card, ...extraCastCards]) {
+      const t = typeof c.identity.talkativeness === "number" ? c.identity.talkativeness : 0.5;
+      talkMap.set(c.identity.name.toLowerCase(), t);
+      if (c.identity.nickname) talkMap.set(c.identity.nickname.toLowerCase(), t);
+      for (const al of c.identity.aliases ?? []) {
+        talkMap.set(al.toLowerCase(), t);
+      }
+    }
+    const n = state.presentNpcs.length;
+    const ranked = state.presentNpcs.map((npc, idx) => {
+      const talk = talkMap.get(npc.toLowerCase()) ?? 0.5;
+      const slot = (idx + state.turn) % n;
+      const rotBoost = slot === 0 ? 0.45 : slot === 1 ? 0.2 : 0;
+      return { npc, score: talk + rotBoost, idx };
+    });
+    ranked.sort((a, b) => b.score - a.score || a.idx - b.idx);
+    const focalCount = n >= 3 ? 2 : 1;
+    const focalNpcs = ranked.slice(0, focalCount).map((r) => r.npc);
+    spotlightCue = `Spotlight Director: Focus active dialogue and reactions primarily on ${focalNpcs.join(" & ")} this turn; keep other present NPCs brief or reactive rather than taking equal turns.`;
+  }
+
   const noteLines = [
+    ...(antiGodmodingCue ? [`- ${antiGodmodingCue}`] : []),
+    ...(antiSycophancyCue ? [`- ${antiSycophancyCue}`] : []),
+    ...(spotlightCue ? [`- ${spotlightCue}`] : []),
     ...(pointInTimeOverride ? [`- ${pointInTimeOverride}`] : []),
     ...(shortInputCue ? [`- ${shortInputCue}`] : []),
     ...(state.sceneObjective ? [`- Scene Objective: ${state.sceneObjective}`] : []),
@@ -690,7 +794,8 @@ export function buildZone3TransientTail(options: {
   }
 
   // Enforce a total Zone 3 token budget cap by dropping lower-priority optional sections first
-  const zone3Cap = maxZone3Tokens ?? Math.max(6000, (state.loreTokenBudget || 1800) * 2 + 2400);
+  const loreTokenBudget = state.loreTokenBudget || 1800;
+  const zone3Cap = maxZone3Tokens ?? Math.max(2200, Math.min(3600, loreTokenBudget + 1200));
   let totalTokens = sections.reduce((sum, s) => sum + estimateTokens(s.text), 0);
   if (totalTokens > zone3Cap) {
     const keepFlags = sections.map(() => true);
@@ -744,13 +849,23 @@ export function attachZone3ToMessages(
   const targetIdx = out.length - 1;
   const target = out[targetIdx]!;
 
+  // When trailing message is a toolResult, attach only the compact <rp_state_frame> snapshot
+  // instead of duplicating full <rp_director_note> / <rp_voice_anchors> inside tool output.
+  let payloadToAttach = zone3Text;
+  if (target.role === "toolResult") {
+    const frameMatch = zone3Text.match(/<rp_state_frame>[\s\S]*?<\/rp_state_frame>/);
+    if (frameMatch) {
+      payloadToAttach = frameMatch[0];
+    }
+  }
+
   if (typeof target.content === "string") {
     out[targetIdx] = {
       ...target,
-      content: `${target.content}\n\n${zone3Text}`,
+      content: `${target.content}\n\n${payloadToAttach}`,
     };
   } else if (Array.isArray(target.content)) {
-    const blocks: PiContentBlock[] = [...target.content, { type: "text", text: `\n\n${zone3Text}` }];
+    const blocks: PiContentBlock[] = [...target.content, { type: "text", text: `\n\n${payloadToAttach}` }];
     out[targetIdx] = {
       ...target,
       content: blocks,

@@ -260,6 +260,78 @@ export function selectRelevantBeliefs(
   return scored.slice(0, limit).map((s) => s.belief);
 }
 
+interface CachedLoreEntryIndex {
+  tokens: string[];
+  tf: Map<string, number>;
+  uniqueTokens: string[];
+  baseEntities: string[];
+  lowerContent: string;
+  matchedCorpusEntities: string[];
+}
+
+interface CachedLoreCorpus {
+  length: number;
+  fingerprint: string;
+  byId: Map<string, CachedLoreEntryIndex>;
+}
+
+const loreCorpusCache = new WeakMap<CompiledLoreEntry[], CachedLoreCorpus>();
+
+function computeEntriesFingerprint(entries: CompiledLoreEntry[]): string {
+  if (entries.length === 0) return "0";
+  const first = entries[0]!;
+  const last = entries[entries.length - 1]!;
+  return `${entries.length}:${first.id}:${first.content.length}:${last.id}:${last.content.length}`;
+}
+
+function getOrBuildLoreCorpus(entries: CompiledLoreEntry[]): CachedLoreCorpus {
+  const fp = computeEntriesFingerprint(entries);
+  const existing = loreCorpusCache.get(entries);
+  if (existing && existing.length === entries.length && existing.fingerprint === fp) {
+    return existing;
+  }
+
+  const byId = new Map<string, CachedLoreEntryIndex>();
+  const allCorpusEntities = new Set<string>();
+
+  for (const e of entries) {
+    const tokens = tokenizeHybrid(`${e.title} ${e.keys.join(" ")} ${e.content}`);
+    const tf = new Map<string, number>();
+    for (const t of tokens) {
+      tf.set(t, (tf.get(t) ?? 0) + 1);
+    }
+    const baseEntities = Array.from(new Set(e.entities.map((ent) => ent.toLowerCase())));
+    for (const ent of baseEntities) {
+      if (ent.length >= 2) allCorpusEntities.add(ent);
+    }
+    byId.set(e.id, {
+      tokens,
+      tf,
+      uniqueTokens: Array.from(tf.keys()),
+      baseEntities,
+      lowerContent: e.content.toLowerCase(),
+      matchedCorpusEntities: [],
+    });
+  }
+
+  const entityList = Array.from(allCorpusEntities);
+  for (const e of entries) {
+    if (e.noGraphSpread) continue;
+    const item = byId.get(e.id)!;
+    const matched: string[] = [];
+    for (const ent of entityList) {
+      if (item.lowerContent.includes(ent)) {
+        matched.push(ent);
+      }
+    }
+    item.matchedCorpusEntities = matched;
+  }
+
+  const built: CachedLoreCorpus = { length: entries.length, fingerprint: fp, byId };
+  loreCorpusCache.set(entries, built);
+  return built;
+}
+
 export interface RecallResult {
   selected: CompiledLoreEntry[];
   activatedIds: string[];
@@ -341,17 +413,15 @@ export function recallLoreWithGraphPpr(options: {
     };
   }
 
-  // 2. Build local BM25 index over eligible entries
-  const docTokens = new Map<string, string[]>();
+  // 2. Local BM25 index over eligible entries (using WeakMap pre-tokenized corpus cache)
+  const corpus = getOrBuildLoreCorpus(entries);
   const df = new Map<string, number>();
   let totalLen = 0;
 
   for (const e of eligible) {
-    const toks = tokenizeHybrid(`${e.title} ${e.keys.join(" ")} ${e.content}`);
-    docTokens.set(e.id, toks);
-    totalLen += toks.length;
-    const uniq = new Set(toks);
-    for (const t of uniq) {
+    const idxEntry = corpus.byId.get(e.id)!;
+    totalLen += idxEntry.tokens.length;
+    for (const t of idxEntry.uniqueTokens) {
       df.set(t, (df.get(t) ?? 0) + 1);
     }
   }
@@ -364,16 +434,16 @@ export function recallLoreWithGraphPpr(options: {
   const b = 0.75;
 
   for (const e of eligible) {
-    const toks = docTokens.get(e.id)!;
-    const tf = new Map<string, number>();
-    for (const t of toks) tf.set(t, (tf.get(t) ?? 0) + 1);
+    const idxEntry = corpus.byId.get(e.id)!;
+    const tf = idxEntry.tf;
+    const docLen = idxEntry.tokens.length;
     let score = 0;
     for (const qt of queryTokens) {
       const f = tf.get(qt) ?? 0;
       if (f === 0) continue;
       const docFreq = df.get(qt) ?? 1;
       const idf = Math.log(1 + (N - docFreq + 0.5) / (docFreq + 0.5));
-      score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + b * (toks.length / avgLen))));
+      score += idf * ((f * (k1 + 1)) / (f + k1 * (1 - b + b * (docLen / avgLen))));
     }
     bm25Scores.set(e.id, score);
   }
@@ -384,9 +454,9 @@ export function recallLoreWithGraphPpr(options: {
   const eligibleById = new Map(eligible.map((e) => [e.id, e]));
 
   for (const e of eligible) {
+    const idxEntry = corpus.byId.get(e.id)!;
     const ents = new Set<string>();
-    for (const ent of e.entities) {
-      const norm = ent.toLowerCase();
+    for (const norm of idxEntry.baseEntities) {
       ents.add(norm);
       if (!entityToEntries.has(norm)) entityToEntries.set(norm, new Set());
       entityToEntries.get(norm)!.add(e.id);
@@ -397,10 +467,10 @@ export function recallLoreWithGraphPpr(options: {
   const allEntityNames = Array.from(entityToEntries.keys());
   for (const e of eligible) {
     if (e.noGraphSpread) continue;
-    const lowerContent = e.content.toLowerCase();
+    const idxEntry = corpus.byId.get(e.id)!;
     const ents = entryToEntities.get(e.id)!;
-    for (const ent of allEntityNames) {
-      if (ent.length >= 2 && lowerContent.includes(ent)) {
+    for (const ent of idxEntry.matchedCorpusEntities) {
+      if (entityToEntries.has(ent)) {
         ents.add(ent);
         entityToEntries.get(ent)!.add(e.id);
       }

@@ -73,7 +73,7 @@ export function createInitialRpState(): SessionRpState {
     presetId: null,
     rawPassthrough: false,
     hudMode: "minimal",
-    settlementMode: "tool-assisted",
+    settlementMode: "sidecar-light",
     pacingMode: "balanced",
     responseLength: "standard",
     narrativePov: "auto",
@@ -124,6 +124,9 @@ export function createInitialRpState(): SessionRpState {
     npcAgendas: {},
     pairBonds: {},
     auditLog: [],
+    antiGodmoding: true,
+    sceneTension: 3,
+    slopCounts: {},
   };
 }
 
@@ -722,6 +725,16 @@ export function applyRpTx(state: SessionRpState, tx: RpTxEntry): void {
       state.loreSticky = { ...tx.sticky };
       state.loreCooldown = { ...tx.cooldown };
       state.loreConsumedOneShots = new Set(tx.consumedOneShots);
+      break;
+
+    case "anti_godmoding_set":
+      state.antiGodmoding = Boolean(tx.enabled);
+      break;
+
+    case "tension_set":
+      if (typeof tx.value === "number" && Number.isFinite(tx.value)) {
+        state.sceneTension = Math.max(0, Math.min(10, Math.round(tx.value)));
+      }
       break;
   }
 }

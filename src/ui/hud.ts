@@ -1,12 +1,10 @@
 /**
- * Smart Context-Adaptive Minimal & Full HUD renderer using Pi official `ctx.ui.setStatus` and `ctx.ui.setWidget`.
+ * Mobile-First Context-Adaptive Minimal & Full HUD renderer using Pi official `ctx.ui.setStatus` and `ctx.ui.setWidget`.
  *
- * v4 Enhancements:
- *  - Smart visibility: only renders rows relevant to the current card & live world state
- *    (objective, triggered storylets, epistemic blind spots, CFSM, bipolar-aware stats,
- *    inventory when active/non-empty, clocks when active, narrative health warnings).
- *  - Honest 3-layer KV-Cache status badge (`⚡KV×N` vs `⚠KV刷新`).
- *  - TUI mode uses width-aware component factory; RPC/mobile mode uses width-clamped `string[]`.
+ * v5 Mobile-First Enhancements:
+ *  - Display-column aware clamping (`<= 44` cols) so 36–48 col mobile screens never clip or wrap awkwardly.
+ *  - Zero internal implementation noise (no KV-Cache counters or command-spam footers).
+ *  - Unobtrusive `⚠同步` indicator when background Sidecar sync fails.
  */
 
 import type {
@@ -19,6 +17,7 @@ import type {
 import { evaluateActiveStorylets } from "../context/zone-builder.js";
 import {
   createLinesComponent,
+  displayWidth,
   renderProgressBar,
   renderSmartStatBar,
   styleBold,
@@ -27,50 +26,71 @@ import {
   truncateDisplayLine,
 } from "./renderers.js";
 
+const MOBILE_MAX_COLS = 44;
+
 const PACING_LABEL: Record<PacingMode, string> = {
   relaxed: "舒缓",
   balanced: "均衡",
   dramatic: "紧张",
 };
 
-function formatKvBadge(xray?: ContextXRaySnapshot | null): string | null {
-  if (!xray) return null;
-  if (
-    xray.cacheInvalidationReason === "tools_changed" ||
-    xray.cacheInvalidationReason === "zone1_changed" ||
-    xray.cacheInvalidationReason === "history_mutated"
-  ) {
-    return "⚠KV刷新";
-  }
-  if (xray.cacheHitStreak >= 2) return `⚡KV×${xray.cacheHitStreak}`;
-  if (xray.cacheHitStreak === 1) return "⚡KV×1";
-  return null;
+type StateWithSidecarStatus = SessionRpState & {
+  lastSidecarStatus?: { ok: boolean; error?: string };
+};
+
+function getSidecarFailed(state: SessionRpState): boolean {
+  const status = (state as StateWithSidecarStatus).lastSidecarStatus;
+  return Boolean(status && !status.ok);
 }
 
-function clampSeg(text: string, maxChars: number): string {
+function clampSeg(text: string, maxCols: number): string {
   const clean = text.replace(/\s+/g, " ").trim();
-  const chars = Array.from(clean);
-  return chars.length > maxChars ? chars.slice(0, maxChars - 1).join("") + "…" : clean;
+  if (!clean) return "";
+  return truncateDisplayLine(clean, maxCols);
 }
 
 export function formatRpStatusLine(
   state: SessionRpState,
   card: CompiledCard | null,
-  xray?: ContextXRaySnapshot | null,
+  _xray?: ContextXRaySnapshot | null,
 ): string {
   const charName = clampSeg(card ? card.identity.nickname || card.identity.name : state.cardSlug ?? "RP", 10);
-  const parts = [`◆ ${charName}`];
-  if (state.location) parts.push(clampSeg(state.location, 12));
-  if (state.worldTimeLabel) parts.push(clampSeg(state.worldTimeLabel, 12));
-  else if (state.era) parts.push(clampSeg(state.era, 12));
-  parts.push(`T${state.turn}`);
+  const sep = " · ";
+  const sepW = displayWidth(sep);
+
+  const head = `◆ ${charName}`;
+  const turnSeg = `T${state.turn}`;
+  const sidecarFailSeg = getSidecarFailed(state) ? "⚠同步" : null;
+
+  // Priority-ordered optional segments (trimmed by display columns so total stays <= 44 cols)
+  const optionalSegs: string[] = [];
+  if (state.location) optionalSegs.push(clampSeg(state.location, 12));
+  if (state.worldTimeLabel) optionalSegs.push(clampSeg(state.worldTimeLabel, 10));
+  else if (state.era) optionalSegs.push(clampSeg(state.era, 10));
+
   const activeFlags = Object.values(state.flags).filter(Boolean).length;
-  if (activeFlags > 0) parts.push(`🚩${activeFlags}`);
+  if (activeFlags > 0) optionalSegs.push(`🚩${activeFlags}`);
+
   const openHooks = Array.from(state.foresights.values()).filter((h) => h.status === "open").length;
-  if (openHooks > 0) parts.push(`伏笔:${openHooks}`);
-  const kv = formatKvBadge(xray);
-  if (kv && (kv.startsWith("⚠") || (xray && xray.cacheHitStreak >= 2))) parts.push(kv);
-  return parts.join(" · ");
+  if (openHooks > 0) optionalSegs.push(`伏笔:${openHooks}`);
+
+  // Reserve width for mandatory head + turnSeg + optional sidecar failure badge
+  const tailSegs = [turnSeg, ...(sidecarFailSeg ? [sidecarFailSeg] : [])];
+  const tailWidth = tailSegs.reduce((acc, s) => acc + sepW + displayWidth(s), 0);
+  let usedWidth = displayWidth(head) + tailWidth;
+
+  const chosenMiddle: string[] = [];
+  for (const seg of optionalSegs) {
+    if (!seg) continue;
+    const needed = sepW + displayWidth(seg);
+    if (usedWidth + needed <= MOBILE_MAX_COLS) {
+      chosenMiddle.push(seg);
+      usedWidth += needed;
+    }
+  }
+
+  const line = [head, ...chosenMiddle, ...tailSegs].join(sep);
+  return displayWidth(line) <= MOBILE_MAX_COLS ? line : truncateDisplayLine(line, MOBILE_MAX_COLS);
 }
 
 function formatBoundedStat(
@@ -95,16 +115,27 @@ function buildHudRawLines(
   const charName = card ? card.identity.nickname || card.identity.name : state.cardSlug ?? "RP";
   const lines: string[] = [];
 
-  const headerParts = [
-    `╭─ ◆ ${charName}`,
-    [state.era, state.worldTimeLabel, `T${state.turn}`].filter(Boolean).join(" · "),
-    state.location ? `📍${state.location}` : null,
-    state.presentNpcs.length > 0 ? `在场:${state.presentNpcs.join("、")}` : null,
-  ].filter(Boolean);
-  lines.push(headerParts.join("  │  "));
+  // Split header cleanly across short lines for narrow mobile widths
+  const titleParts = [`╭─ ◆ ${charName}`, state.era, state.worldTimeLabel, `T${state.turn}`].filter(Boolean);
+  lines.push(titleParts.join(" · "));
+
+  const locPart = state.location ? `📍${state.location}` : null;
+  const npcPart = state.presentNpcs.length > 0 ? `在场:${state.presentNpcs.join("、")}` : null;
+  if (locPart && npcPart) {
+    const combined = `│ ${locPart} · ${npcPart}`;
+    if (displayWidth(combined) <= MOBILE_MAX_COLS) {
+      lines.push(combined);
+    } else {
+      lines.push(`│ ${locPart}`);
+      lines.push(`│ ${npcPart}`);
+    }
+  } else if (locPart) {
+    lines.push(`│ ${locPart}`);
+  } else if (npcPart) {
+    lines.push(`│ ${npcPart}`);
+  }
 
   const openHooks = Array.from(state.foresights.values()).filter((h) => h.status === "open").length;
-  const kvBadge = formatKvBadge(xray);
   const activeFlagNames = Object.entries(state.flags).filter(([, v]) => Boolean(v)).map(([k]) => k);
   const metaParts = [
     `扮演:${state.currentPersona.name}`,
@@ -114,9 +145,10 @@ function buildHudRawLines(
     xray && xray.blindSpotCount > 0 ? `🔒盲区:${xray.blindSpotCount}` : null,
     state.activeCharacters.length > 1 ? `共演:${state.activeCharacters.length}卡` : null,
     state.innerMonologue ? "💭内心戏" : null,
-    kvBadge,
+    getSidecarFailed(state) ? "⚠同步" : null,
   ].filter(Boolean);
   lines.push(`│ ${metaParts.join(" · ")}`);
+
   if (activeFlagNames.length > 0) {
     lines.push(`│ 🚩 状态  ${activeFlagNames.slice(0, 5).join(" · ")}${activeFlagNames.length > 5 ? ` (+${activeFlagNames.length - 5})` : ""}`);
   }
@@ -125,7 +157,7 @@ function buildHudRawLines(
     lines.push(`│ 🎯 目标  ${state.sceneObjective}`);
   }
 
-  // Triggered Storylets (smart adaptive: only shown when at least 1 storylet is live!)
+  // Triggered Storylets (smart adaptive: only shown when at least 1 storylet is live)
   const liveStorylets = evaluateActiveStorylets(state);
   if (liveStorylets.length > 0) {
     lines.push(`│ 🃏 剧情  ${liveStorylets.slice(0, 2).map((s) => s.title).join(" · ")}`);
@@ -159,7 +191,7 @@ function buildHudRawLines(
     lines.push(`│ 数值  ${statSnippets.slice(0, 2).join("  ")}`);
   }
 
-  // Inventory highlight (smart: shown when inventory module is on OR any items exist)
+  // Inventory highlight
   const invPairs: string[] = [];
   for (const [actor, bag] of Object.entries(state.inventory)) {
     for (const [item, qty] of Object.entries(bag)) {
@@ -182,11 +214,11 @@ function buildHudRawLines(
     );
   }
 
-  // Narrative Health alert (only shown when genuine repetition or stagnation is detected!)
+  // Narrative Health alert (only shown when genuine repetition or stagnation is detected)
   if (xray && ((xray.repetitionScore ?? 0) >= 0.42 || (xray.stagnantTurns ?? 0) >= 4)) {
     const alerts: string[] = [];
     if ((xray.repetitionScore ?? 0) >= 0.42) {
-      alerts.push(`复读率 ${Math.round((xray.repetitionScore ?? 0) * 100)}%（已自动注入去重引导）`);
+      alerts.push(`复读率 ${Math.round((xray.repetitionScore ?? 0) * 100)}%`);
     }
     if ((xray.stagnantTurns ?? 0) >= 4) {
       alerts.push(`连续 ${xray.stagnantTurns} 轮无进展`);
@@ -198,12 +230,12 @@ function buildHudRawLines(
     lines.push(
       `│ 导演  ${state.notes
         .slice(0, 2)
-        .map((n) => `${n.text.slice(0, 28)}${n.remainingTurns !== null ? ` (${n.remainingTurns}轮)` : ""}`)
+        .map((n) => `${n.text.slice(0, 20)}${n.remainingTurns !== null ? ` (${n.remainingTurns}轮)` : ""}`)
         .join(" / ")}`,
     );
   }
 
-  lines.push("╰─ /rp 菜单 · /rp panel 世界面板 · /rp hud 切换或隐藏");
+  lines.push("╰──────────────────────");
   return lines;
 }
 
@@ -226,7 +258,7 @@ export function renderRpHud(
     const rawLines = buildHudRawLines(state, card, xray);
 
     // Official Pi SDK: component factory in TUI mode (dynamic terminal width + theme styling),
-    // width-clamped string[] in RPC / mobile / test mode (JSON-RPC serializable).
+    // width-clamped string[] in RPC / mobile / test mode (JSON-RPC serializable, strictly <= 44 cols).
     if (ctx.mode === "tui") {
       ctx.ui.setWidget(
         "rp-hud",
@@ -242,7 +274,7 @@ export function renderRpHud(
         { placement: "aboveEditor" },
       );
     } else {
-      const mobileClamped = rawLines.map((l) => truncateDisplayLine(l, 72));
+      const mobileClamped = rawLines.map((l) => truncateDisplayLine(l, MOBILE_MAX_COLS));
       ctx.ui.setWidget("rp-hud", mobileClamped, { placement: "aboveEditor" });
     }
   } else {

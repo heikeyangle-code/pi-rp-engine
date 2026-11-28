@@ -247,14 +247,14 @@ function renderEditorialCard(options: {
     lines.push(`${border} ${wrapped[i]!}`);
   }
   if (maxLines && wrapped.length > maxLines) {
-    lines.push(`${border} ${styleDim(theme, `… 其余 ${wrapped.length - maxLines} 行已折叠，展开查看全文`)}`);
+    lines.push(`${border} ${styleDim(theme, truncateDisplayLine(`… 其余 ${wrapped.length - maxLines} 行已折叠`, innerWidth))}`);
   }
 
   lines.push(footerRule);
   return lines;
 }
 
-/** Register custom Pi message renderers for auxiliary RP cards (`rp:event`, `rp:ooc`, `rp:era`).
+/** Register custom Pi message renderers for auxiliary RP cards (`rp:event`, `rp:ooc`, `rp:era`, `rp:rewrite`).
  *  Note: `rp:greeting` intentionally uses Pi's native Markdown renderer without an ASCII frame for clean reading. */
 export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
   if (typeof pi.registerMessageRenderer !== "function") return;
@@ -268,7 +268,9 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
           ? "RECAP"
           : details.kind === "xray"
             ? "X-RAY"
-            : "EVENT";
+            : details.kind === "quick_reply"
+              ? "QUICK"
+              : "EVENT";
     const title =
       details.title ||
       (details.kind === "roll"
@@ -276,8 +278,10 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
         : details.kind === "recap"
           ? "前情提要"
           : details.kind === "xray"
-            ? "上下文 X-Ray 透视"
-            : "世界事件");
+            ? "上下文透视"
+            : details.kind === "quick_reply"
+              ? "⚡ 快捷动作"
+              : "世界事件");
     const text = extractMessageText(message);
     return createLinesComponent((width) =>
       renderEditorialCard({
@@ -286,7 +290,12 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
         subtitle: details.subtitle,
         body: text,
         accentColor:
-          details.kind === "roll" || details.kind === "recap" || details.kind === "xray" ? "accent" : "muted",
+          details.kind === "roll" ||
+          details.kind === "recap" ||
+          details.kind === "xray" ||
+          details.kind === "quick_reply"
+            ? "accent"
+            : "muted",
         theme,
         width,
         maxLines: options?.expanded
@@ -300,13 +309,35 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
     );
   });
 
+  pi.registerMessageRenderer("rp:rewrite", (message, options, theme) => {
+    const text = extractMessageText(message);
+    return createLinesComponent((width) => {
+      const innerWidth = Math.max(24, Math.min(width - 2, 96));
+      const header = styleDim(theme, truncateDisplayLine("✂️ 改写版本", innerWidth));
+      const rawLines = text.replace(/\r\n?/g, "\n").split("\n");
+      const wrapped: string[] = [];
+      for (const raw of rawLines) {
+        wrapped.push(...wrapDisplayLine(raw, innerWidth));
+      }
+      const maxLines = options?.expanded ? undefined : 24;
+      const limit = maxLines && wrapped.length > maxLines ? maxLines : wrapped.length;
+      const lines: string[] = [header];
+      for (let i = 0; i < limit; i++) {
+        lines.push(wrapped[i]!);
+      }
+      if (maxLines && wrapped.length > maxLines) {
+        lines.push(styleDim(theme, truncateDisplayLine(`… 其余 ${wrapped.length - maxLines} 行已折叠`, innerWidth)));
+      }
+      return lines;
+    });
+  });
+
   pi.registerMessageRenderer("rp:ooc", (message, options, theme) => {
     const text = extractMessageText(message);
     return createLinesComponent((width) =>
       renderEditorialCard({
         tag: "OOC",
         title: "场外讨论",
-        subtitle: "不推进剧情与世界时钟",
         body: text,
         accentColor: "dim",
         theme,
@@ -319,7 +350,7 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
   pi.registerMessageRenderer("rp:era", (message, options, theme) => {
     const details = (message.details ?? {}) as { fromEra?: string; toEra?: string; milestones?: string[] };
     const title =
-      details.fromEra && details.toEra ? `${details.fromEra}  ━━▶  ${details.toEra}` : "幕次跃迁 · 蒙太奇";
+      details.fromEra && details.toEra ? `${details.fromEra} → ${details.toEra}` : "幕次跃迁";
     const subtitle = details.milestones?.length ? `解锁：${details.milestones.join("、")}` : undefined;
     const text = extractMessageText(message);
     return createLinesComponent((width) =>
@@ -336,4 +367,3 @@ export function registerRpMessageRenderers(pi: PiExtensionAPI): void {
     );
   });
 }
-
