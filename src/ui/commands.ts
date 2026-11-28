@@ -13,8 +13,10 @@ import {
   actionContinue,
   actionDirectorNote,
   actionExitRp,
+  actionGenerateLoreEntry,
   actionGreeting,
   actionIdeas,
+  actionImpersonate,
   actionImportFile,
   actionLoadCard,
   actionManageCast,
@@ -28,7 +30,9 @@ import {
   actionSetHud,
   actionSetSettlementMode,
   actionShowShortcuts,
+  actionSidePrompt,
   actionSkipMontage,
+  actionSummarizeOldFloors,
   actionToggleHide,
   actionToggleRawPassthrough,
 } from "./actions.js";
@@ -37,24 +41,28 @@ import { openRpDashboard, type DashboardRuntime } from "./dashboard.js";
 const SUBCOMMANDS: Array<{ value: string; description: string }> = [
   { value: "import", description: "打开文件浏览器导入角色卡 / 世界书 / 预设（支持批量）" },
   { value: "load", description: "从角色库加载角色卡（仅绑定当前会话）" },
-  { value: "panel", description: "打开实时世界面板与状态/世界书编辑器 (Ctrl+Shift+R)" },
-  { value: "analyze", description: "一键 AI 智能建档：识别卡型、初态、别名与防剧透门禁（永久缓存）" },
+  { value: "panel", description: "打开世界面板：场景/人物/记忆本/世界书/导演台 (Ctrl+Shift+R)" },
+  { value: "imp", description: "以玩家视角帮我代写一段回复并填入输入框 (Alt+I)" },
+  { value: "ask", description: "零污染场外提问 Side Prompt，不写入历史 (Alt+Q)" },
   { value: "reroll", description: "重摇上一条回复，旧分支保留在 /tree (Alt+W)" },
   { value: "continue", description: "让角色无缝续写剧情 (Alt+K)" },
   { value: "act", description: "生成 3 个符合当下情境的行动建议 (Alt+A)" },
   { value: "recap", description: "0 Token 瞬时合成前情提要与当前局势摘要" },
-  { value: "roll", description: "打开快捷掷骰检定器，支持优势/劣势/DC (Alt+G)" },
-  { value: "note", description: "管理导演指令 (Alt+N)" },
-  { value: "ooc", description: "发起场外 OOC 讨论，不推进剧情 (Alt+O)" },
+  { value: "summarize", description: "将较早的对话楼层总结进记忆本并隐藏（省 Token 防失忆）" },
+  { value: "loregen", description: "从最近对话为新出现的人物/地点一键生成世界书条目" },
+  { value: "analyze", description: "一键 AI 智能建档：识别卡型、初态、别名与防剧透门禁（永久缓存）" },
+  { value: "note", description: "管理导演指令 Author's Note (Alt+N)" },
   { value: "pace", description: "切换叙事节奏 (relaxed / balanced / dramatic · Alt+P)" },
+  { value: "skip", description: "切场景 / 跳时间 (Alt+T)" },
+  { value: "ooc", description: "发起 OOC 讨论，不推进剧情（也可直接输入 ((内容))）" },
+  { value: "roll", description: "快捷掷骰检定器，支持优势/劣势/DC" },
   { value: "save", description: "保存剧情书签 (Alt+B)" },
   { value: "goto", description: "跳转或分叉至已保存的剧情书签 (Alt+J)" },
   { value: "hide", description: "交互式隐藏对话楼层（不发给模型，不删记录）" },
   { value: "unhide", description: "恢复已隐藏的对话楼层" },
-  { value: "persona", description: "切换或新建玩家人设（不破坏缓存）" },
+  { value: "persona", description: "切换或新建玩家马甲（不破坏缓存）" },
   { value: "greet", description: "切换/重发角色开场白" },
   { value: "cast", description: "交互式管理多角色同场共演" },
-  { value: "skip", description: "时间推进 / 幕间蒙太奇 (Alt+T)" },
   { value: "preset", description: "加载或关闭酒馆预设" },
   { value: "hud", description: "切换 HUD 显示模式 (minimal / full / off · Alt+H)" },
   { value: "mode", description: "切换后台结算模式 (tool-assisted / sidecar-light / off)" },
@@ -71,6 +79,13 @@ export function makeDashboardRuntime(rt: RpRuntimeHandle): DashboardRuntime {
     commitTx: (tx) => rt.commitTx(tx),
     refreshHud: (ctx) => rt.refreshHud(ctx),
     exitRp: (ctx, askConfirm) => actionExitRp(rt, ctx, askConfirm),
+    skipScene: (ctx) => actionSkipMontage(rt, ctx, ""),
+    recapStory: (ctx) => actionRecap(rt, ctx),
+    summarizeOldFloors: (ctx) => actionSummarizeOldFloors(rt, ctx, ""),
+    generateLoreEntry: (ctx) => actionGenerateLoreEntry(rt, ctx, ""),
+    switchPersona: (ctx) => actionPersona(rt, ctx, ""),
+    manageCast: (ctx) => actionManageCast(rt, ctx, ""),
+    quickRoll: (ctx) => actionManualRoll(rt, ctx, ""),
   };
 }
 
@@ -96,19 +111,18 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
   const card = rt.getCard();
   const title = `🎭 ${[card?.identity.name ?? state.cardSlug ?? "RP", state.era, state.worldTimeLabel, `T${state.turn}`].filter(Boolean).join(" · ")}（Alt+R）`;
   const pick = await ctx.ui.select(title, [
-    "📊 打开世界面板 & 实时状态/世界书编辑器 (Ctrl+Shift+R)",
-    "🔄 重摇上一条回复 (Alt+W)  /  ▶ 续写 (Alt+K)  /  💡 行动建议 (Alt+A)",
-    "📜 前情提要 · 0 Token 瞬时局势回顾 (/rp recap)",
-    "🎲 快捷掷骰检定 (Alt+G)",
+    "📊 打开世界面板（场景 / 人物 / 记忆本 / 世界书 / 导演台 · Ctrl+Shift+R）",
+    "✍️ 帮我代写主角回复 (Alt+I)  /  💭 零污染场外提问 (Alt+Q)",
+    "🔄 重摇上一条 (Alt+W)  /  ▶ 续写 (Alt+K)  /  💡 行动建议 (Alt+A)",
+    "📖 前情提要 · 总结隐藏旧楼 · 剧情生成新世界书",
     "🎬 导演指令与叙事节奏 (Alt+N / Alt+P)",
-    "💬 OOC 场外讨论 (Alt+O)",
+    "⏳ 切场景 / 跳时间 (Alt+T)",
     "🔖 剧情书签：保存 (Alt+B) / 跳转分叉 (Alt+J)",
-    "⏳ 幕间蒙太奇 / 推进时间 (Alt+T)",
     "🙈 隐藏或恢复对话楼层 (/rp hide)",
-    "🧑 切换玩家人设 / 👥 同场共演 / 🎭 切换角色或开场白",
-    "🔍 一键 AI 智能建档（识别初态 / 物品 / 别名 / 防剧透门禁）",
+    "🧑 切换玩家马甲 / 👥 同场共演 / 🎭 切换角色或开场白",
+    "🔍 一键 AI 智能建档（识别卡型 / 初态 / 别名 / 防剧透门禁）",
     "📥 导入新的角色卡 / 世界书 / 预设",
-    "⚙ 引擎设置（HUD / 预设 / 结算模式 / 原味直通 / 快捷键）",
+    "⚙ 引擎设置（HUD / 预设 / 结算模式 / 原味直通 / 掷骰 / 快捷键）",
     "🚪 彻底退出本会话 RP 模式 (Alt+Shift+X)",
     "✕ 关闭",
   ]);
@@ -116,6 +130,16 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
 
   if (pick.startsWith("📊")) {
     await openRpDashboard(makeDashboardRuntime(rt), ctx);
+  } else if (pick.startsWith("✍️")) {
+    const sub = await ctx.ui.select("智能辅助", [
+      "✍️ 帮我代写主角回复并填入输入框 (Alt+I)",
+      "💭 零污染场外提问 Side Prompt (Alt+Q)",
+      "💬 传统对话内 OOC 讨论 (/rp ooc)",
+      "← 返回",
+    ]);
+    if (sub?.startsWith("✍️")) await actionImpersonate(rt, ctx, "");
+    else if (sub?.startsWith("💭")) await actionSidePrompt(rt, ctx, "");
+    else if (sub?.startsWith("💬")) await actionOoc(rt, ctx, "");
   } else if (pick.startsWith("🔄")) {
     const sub = await ctx.ui.select("剧情推进与重摇", [
       "🔄 重摇上一条回复 (Alt+W)",
@@ -126,10 +150,16 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     if (sub?.startsWith("🔄")) await actionReroll(rt, ctx, "");
     else if (sub?.startsWith("▶")) await actionContinue(rt, ctx);
     else if (sub?.startsWith("💡")) await actionIdeas(rt, ctx);
-  } else if (pick.startsWith("📜")) {
-    await actionRecap(rt, ctx);
-  } else if (pick.startsWith("🎲")) {
-    await actionManualRoll(rt, ctx, "");
+  } else if (pick.startsWith("📖")) {
+    const sub = await ctx.ui.select("记忆与世界书", [
+      "📜 前情提要（0 Token 瞬时合成 · /rp recap）",
+      "📦 总结并隐藏较早的对话楼层 (/rp summarize)",
+      "✨ 从最近剧情生成新世界书条目 (/rp loregen)",
+      "← 返回",
+    ]);
+    if (sub?.startsWith("📜")) await actionRecap(rt, ctx);
+    else if (sub?.startsWith("📦")) await actionSummarizeOldFloors(rt, ctx, "");
+    else if (sub?.startsWith("✨")) await actionGenerateLoreEntry(rt, ctx, "");
   } else if (pick.startsWith("🎬")) {
     const sub = await ctx.ui.select("导演台", [
       "📝 管理导演指令 (Alt+N)",
@@ -138,8 +168,8 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     ]);
     if (sub?.startsWith("📝")) await actionDirectorNote(rt, ctx, "");
     else if (sub?.startsWith("🎚")) await actionSelectPacing(rt, ctx, "");
-  } else if (pick.startsWith("💬")) {
-    await actionOoc(rt, ctx, "");
+  } else if (pick.startsWith("⏳")) {
+    await actionSkipMontage(rt, ctx, "");
   } else if (pick.startsWith("🔖")) {
     const sub = await ctx.ui.select("剧情书签与时间线", [
       "🔖 保存当前节点为书签 (Alt+B)",
@@ -148,13 +178,11 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     ]);
     if (sub?.startsWith("🔖")) await actionBookmarkSave(rt, ctx, "");
     else if (sub?.startsWith("⏪")) await actionBookmarkGoto(rt, ctx, "");
-  } else if (pick.startsWith("⏳")) {
-    await actionSkipMontage(rt, ctx, "");
   } else if (pick.startsWith("🙈")) {
     await actionToggleHide(rt, ctx, "", true);
   } else if (pick.startsWith("🧑")) {
-    const sub = await ctx.ui.select("角色与人设", [
-      "🧑 切换/新建玩家人设 (Persona)",
+    const sub = await ctx.ui.select("角色与马甲", [
+      "🧑 切换/新建玩家马甲 (Persona)",
       "👥 管理同场共演角色卡 (Cast)",
       "💬 重发/切换开场白 (Greeting)",
       "🎭 切换其他主角色卡 (Load)",
@@ -169,11 +197,12 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
   } else if (pick.startsWith("📥")) {
     await actionImportFile(rt, ctx, "");
   } else if (pick.startsWith("⚙")) {
-    const sub = await ctx.ui.select("引擎设置", [
+    const sub = await ctx.ui.select("引擎设置与工具", [
       `🖥 切换 HUD 模式（当前：${state.hudMode} · Alt+H）`,
       `🎛 切换酒馆预设（当前：${state.presetId ?? "无"}）`,
       `⚙️ 切换结算模式（当前：${state.settlementMode}）`,
       `🛡 原味直通模式（当前：${state.rawPassthrough ? "开" : "关"}）`,
+      "🎲 快捷掷骰检定 (/rp roll)",
       "⌨️ 查看全部快捷键",
       "← 返回",
     ]);
@@ -181,6 +210,7 @@ export async function openRpMenu(rt: RpRuntimeHandle, ctx: PiExtensionContext): 
     else if (sub?.startsWith("🎛")) await actionPreset(rt, ctx, "");
     else if (sub?.startsWith("⚙️")) await actionSetSettlementMode(rt, ctx, "");
     else if (sub?.startsWith("🛡")) await actionToggleRawPassthrough(rt, ctx, "");
+    else if (sub?.startsWith("🎲")) await actionManualRoll(rt, ctx, "");
     else if (sub?.startsWith("⌨️")) await actionShowShortcuts(ctx);
   } else if (pick.startsWith("🚪")) {
     await actionExitRp(rt, ctx, true);
@@ -254,6 +284,22 @@ export function registerRpCommands(pi: PiExtensionAPI, rt: RpRuntimeHandle): voi
         case "stats":
         case "report":
           await openRpDashboard(makeDashboardRuntime(rt), ctx);
+          return;
+        case "imp":
+        case "impersonate":
+          await actionImpersonate(rt, ctx, rest);
+          return;
+        case "ask":
+        case "side":
+          await actionSidePrompt(rt, ctx, rest);
+          return;
+        case "summarize":
+        case "archive":
+          await actionSummarizeOldFloors(rt, ctx, rest);
+          return;
+        case "loregen":
+        case "lore-add":
+          await actionGenerateLoreEntry(rt, ctx, rest);
           return;
         case "reroll":
         case "swipe":

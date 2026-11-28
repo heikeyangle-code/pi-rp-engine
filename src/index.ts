@@ -59,11 +59,12 @@ import {
   actionDirectorNote,
   actionExitRp,
   actionIdeas,
-  actionManualRoll,
-  actionOoc,
+  actionImpersonate,
   actionReroll,
   actionSetHud,
+  actionSidePrompt,
   actionSkipMontage,
+  bindCardToCurrentSession,
 } from "./ui/actions.js";
 import { makeDashboardRuntime, openRpMenu, registerRpCommands } from "./ui/commands.js";
 import { openRpDashboard } from "./ui/dashboard.js";
@@ -258,18 +259,24 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   // Register `/rp` command palette & subcommands
   registerRpCommands(pi, runtime);
 
+  // Register optional CLI flag `pi --rp-card <slug>` for direct single-session launch
+  pi.registerFlag?.("rp-card", {
+    type: "string",
+    description: "Bind a compiled character card slug immediately in this session",
+  });
+
   // Register 14 ergonomic, terminal-safe shortcuts
   registerRpShortcuts(pi, {
     isActive: () => state.active,
     openMenu: (ctx) => openRpMenu(runtime, ctx),
     openDashboard: (ctx) => openRpDashboard(makeDashboardRuntime(runtime), ctx),
+    impersonate: (ctx) => actionImpersonate(runtime, ctx, ""),
+    sidePrompt: (ctx) => actionSidePrompt(runtime, ctx, ""),
     rerollLast: (ctx) => actionReroll(runtime, ctx, ""),
     continueStory: (ctx) => actionContinue(runtime, ctx),
     actionIdeas: (ctx) => actionIdeas(runtime, ctx),
     directorNote: (ctx) => actionDirectorNote(runtime, ctx, ""),
     cyclePacing: (ctx) => actionCyclePacing(runtime, ctx),
-    oocChat: (ctx) => actionOoc(runtime, ctx, ""),
-    quickRoll: (ctx) => actionManualRoll(runtime, ctx, ""),
     skipTime: (ctx) => actionSkipMontage(runtime, ctx, ""),
     saveBookmark: (ctx) => actionBookmarkSave(runtime, ctx, ""),
     gotoBookmark: (ctx) => actionBookmarkGoto(runtime, ctx, ""),
@@ -302,8 +309,22 @@ export default function rpEngineExtension(pi: PiExtensionAPI): void {
   // Official Pi SDK Lifecycle Event Hooks
   // -------------------------------------------------------------------------
 
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (event, ctx) => {
     reloadRuntime(ctx);
+    // Optional explicit CLI flag `--rp-card <slug>` on fresh startup only (never auto-binds otherwise)
+    if (!state.active && event?.reason === "startup" && typeof pi.getFlag === "function") {
+      const flagSlug = pi.getFlag("rp-card");
+      if (typeof flagSlug === "string" && flagSlug.trim()) {
+        const resolved = resolveCardBySlug(ctx.cwd, flagSlug.trim());
+        if (resolved) {
+          await bindCardToCurrentSession(runtime, ctx, {
+            card: resolved.card,
+            source: resolved.source,
+            baseDir: resolved.baseDir,
+          });
+        }
+      }
+    }
   });
 
   pi.on("session_tree", (_event, ctx) => {

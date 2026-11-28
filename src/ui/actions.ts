@@ -13,6 +13,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type {
   CompiledCard,
+  CompiledLoreEntry,
   CompiledPreset,
   HudMode,
   PacingMode,
@@ -33,7 +34,7 @@ import { evaluateMacros } from "../parser/macros.js";
 import { rollDiceCheck } from "../engine/dice.js";
 import { computeMessageFingerprint } from "../engine/state-replay.js";
 import { getActiveFacts } from "../memory/bitemporal.js";
-import { canCompleteWithRegistry } from "../engine/llm-helper.js";
+import { canCompleteWithRegistry, completeWithRegistry } from "../engine/llm-helper.js";
 import {
   getGlobalLibraryDir,
   getProjectRpDir,
@@ -1570,4 +1571,374 @@ export async function actionRecap(rt: RpRuntimeHandle, ctx: PiExtensionContext):
     },
     { triggerTurn: false },
   );
+}
+
+/** Helper: extract recent visible dialogue transcript lines from the current branch. */
+function collectRecentDialogueLines(ctx: PiExtensionContext, state: SessionRpState, limit = 8): string[] {
+  const branch = ctx.sessionManager.getBranch();
+  const out: string[] = [];
+  for (const e of branch) {
+    if (e.type !== "message" || !e.message) continue;
+    if (e.message.role !== "user" && e.message.role !== "assistant") continue;
+    const fp = computeMessageFingerprint(e.message);
+    if (state.hiddenEntryIds.has(e.id) || state.hiddenFingerprints.has(fp)) continue;
+    const txt = extractMsgPlain(e.message).trim();
+    if (!txt) continue;
+    const speaker = e.message.role === "user" ? state.currentPersona.name : "叙事";
+    out.push(`[${speaker}] ${txt.slice(0, 600)}`);
+  }
+  return out.slice(-limit);
+}
+
+/**
+ * Guided Impersonate (`/rp imp` & `Alt+I`):
+ * Drafts an in-character player reply from the user's persona perspective and prefills Pi's editor
+ * via official `ctx.ui.setEditorText()` — zero chat pollution until the user edits and presses Enter!
+ */
+export async function actionImpersonate(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  if (!canCompleteWithRegistry(ctx)) {
+    ctx.ui.notify("当前环境不支持模型调用，无法代写主角回复。", "warning");
+    return;
+  }
+
+  let hint = argsText.trim();
+  if (!hint) {
+    const entered = await ctx.ui.input(
+      "✍️ 帮我代写主角回复（可输入简短意图，留空则按当前情境自然接话）",
+      "",
+    );
+    if (entered === undefined) return;
+    hint = entered.trim();
+  }
+
+  const recent = collectRecentDialogueLines(ctx, state, 6);
+  const systemPrompt =
+    `You are drafting the player's next in-character reply for an interactive roleplay. ` +
+    `Write strictly from the perspective of player persona "${state.currentPersona.name}"` +
+    `${state.currentPersona.description ? ` (${state.currentPersona.description.slice(0, 200)})` : ""}. ` +
+    `Match the story's language and tone. Output ONLY the player's reply text (2-4 sentences, no meta commentary, no quotes wrapping the whole output).`;
+
+  const userPrompt =
+    `Character: ${card.identity.name}\n` +
+    `Scene: ${[state.era, state.worldTimeLabel, state.location].filter(Boolean).join(" · ") || "(unset)"}\n` +
+    (recent.length ? `Recent dialogue:\n${recent.join("\n")}\n\n` : "") +
+    (hint ? `Player intent hint: ${hint}\n` : "") +
+    `Draft the player's next reply now:`;
+
+  ctx.ui.setWorkingMessage?.("正在以你的视角起草回复…");
+  let draft = "";
+  try {
+    draft = (await completeWithRegistry(ctx, ctx.model, { systemPrompt, userPrompt, maxTokens: 320, signal: ctx.signal })).trim();
+  } catch (err) {
+    ctx.ui.notify(`代写失败：${(err as Error).message}`, "error");
+    return;
+  } finally {
+    ctx.ui.setWorkingMessage?.(undefined);
+  }
+
+  if (!draft) {
+    ctx.ui.notify("未生成有效草稿，请重试。", "warning");
+    return;
+  }
+
+  ctx.ui.setEditorText(draft);
+  ctx.ui.notify("✍️ 已将代写草稿填入输入框，可直接修改后按回车发送。", "info");
+}
+
+/**
+ * Zero-Pollution Side Prompt (`/rp ask` & `Alt+Q`):
+ * Asks the LLM an out-of-character question (character psychology, clue check, plot brainstorm)
+ * using current world state & recent chat WITHOUT adding anything to conversation history or advancing turns.
+ */
+export async function actionSidePrompt(rt: RpRuntimeHandle, ctx: PiExtensionContext, argsText: string): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  if (!canCompleteWithRegistry(ctx)) {
+    ctx.ui.notify("当前环境不支持模型调用，无法发起场外提问。", "warning");
+    return;
+  }
+
+  let question = argsText.trim();
+  if (!question) {
+    const quick = await ctx.ui.select("💭 零污染场外提问（不进对话历史，不推进剧情）", [
+      "✏️ 输入自定义问题",
+      "🔍 透视角色此刻的真实心理与潜台词",
+      "🧩 梳理目前已出现的线索与未解悬念",
+      "💡 给接下来的剧情构思 3 个不同走向",
+      "✕ 取消",
+    ]);
+    if (!quick || quick.startsWith("✕")) return;
+    if (quick.startsWith("✏️")) {
+      const entered = (await ctx.ui.input("输入你想问 AI 的场外问题", ""))?.trim();
+      if (!entered) return;
+      question = entered;
+    } else {
+      question = quick.replace(/^[^\s]+\s+/, "");
+    }
+  }
+
+  const recent = collectRecentDialogueLines(ctx, state, 8);
+  const facts = getActiveFacts(state).slice(-8).map((f) => `- [T${f.validFromTurn}] ${f.statement}`);
+  const systemPrompt =
+    `You are an out-of-character (OOC) story assistant for the user playing "${card.identity.name}". ` +
+    `Answer the user's question directly, concisely, and insightfully in the user's language. Do NOT continue the roleplay prose.`;
+  const userPrompt =
+    `Character core: ${card.identity.name} — ${card.frozen.description.slice(0, 500)}\n` +
+    `Current state: ${[state.era, state.worldTimeLabel, state.location].filter(Boolean).join(" · ") || "unset"} | Turn ${state.turn}\n` +
+    (facts.length ? `Established facts:\n${facts.join("\n")}\n\n` : "") +
+    (recent.length ? `Recent dialogue:\n${recent.join("\n")}\n\n` : "") +
+    `User's OOC question: ${question}`;
+
+  ctx.ui.setWorkingMessage?.("场外分析思考中（不写入历史）…");
+  let answer = "";
+  try {
+    answer = (await completeWithRegistry(ctx, ctx.model, { systemPrompt, userPrompt, maxTokens: 700, signal: ctx.signal })).trim();
+  } catch (err) {
+    ctx.ui.notify(`场外提问失败：${(err as Error).message}`, "error");
+    return;
+  } finally {
+    ctx.ui.setWorkingMessage?.(undefined);
+  }
+
+  if (!answer) {
+    ctx.ui.notify("模型未返回内容。", "warning");
+    return;
+  }
+
+  if (typeof ctx.ui.editor === "function") {
+    await ctx.ui.editor(`💭 场外回答（关闭即清除，不占上下文）· ${question.slice(0, 28)}`, answer);
+  } else {
+    const lines = answer.split(/\r?\n/).filter((l) => l.trim()).slice(0, 24);
+    await ctx.ui.select(`💭 场外回答：${question.slice(0, 32)}`, [...lines, "✕ 关闭"]);
+  }
+}
+
+/**
+ * Memory-Books style Summarize & Hide Old Floors (`/rp summarize`):
+ * Summarizes the earliest visible N dialogue floors into a bi-temporal memory entry and hides them
+ * non-destructively so context stays lean without losing story continuity.
+ */
+export async function actionSummarizeOldFloors(
+  rt: RpRuntimeHandle,
+  ctx: PiExtensionContext,
+  argsText: string,
+): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  if (!canCompleteWithRegistry(ctx)) {
+    ctx.ui.notify("当前环境不支持模型调用，无法自动总结旧楼层。", "warning");
+    return;
+  }
+
+  const branch = ctx.sessionManager.getBranch();
+  const visibleMsgs = branch.filter((e) => {
+    if (e.type !== "message" || !e.message) return false;
+    if (e.message.role !== "user" && e.message.role !== "assistant") return false;
+    const fp = computeMessageFingerprint(e.message);
+    return !state.hiddenEntryIds.has(e.id) && !state.hiddenFingerprints.has(fp);
+  });
+
+  if (visibleMsgs.length < 4) {
+    ctx.ui.notify("当前可见对话楼层少于 4 条，暂不需要归档总结。", "info");
+    return;
+  }
+
+  let count = Number(argsText.trim());
+  if (!Number.isFinite(count) || count <= 0) {
+    const pick = await ctx.ui.select(
+      `📦 总结并隐藏较早的对话楼层（当前可见 ${visibleMsgs.length} 条，保留最新几轮原文）`,
+      [
+        `总结最早的 ${Math.min(10, visibleMsgs.length - 2)} 条（推荐）`,
+        `总结最早的 ${Math.min(20, visibleMsgs.length - 2)} 条`,
+        `保留最近 6 条，其余全部总结并隐藏（${Math.max(0, visibleMsgs.length - 6)} 条）`,
+        "✕ 取消",
+      ],
+    );
+    if (!pick || pick.startsWith("✕")) return;
+    const m = /(\d+)\s*条/.exec(pick);
+    count = m ? Number(m[1]) : 0;
+  }
+
+  count = Math.min(Math.max(0, Math.floor(count)), visibleMsgs.length - 2);
+  if (count <= 0) {
+    ctx.ui.notify("没有可归档的旧楼层。", "info");
+    return;
+  }
+
+  const targets = visibleMsgs.slice(0, count);
+  const transcript = targets
+    .map((e) => {
+      const role = e.message!.role === "user" ? state.currentPersona.name : card.identity.name;
+      return `[${role}] ${extractMsgPlain(e.message).slice(0, 500)}`;
+    })
+    .join("\n");
+
+  ctx.ui.setWorkingMessage?.(`正在将最早 ${count} 条对话归档进记忆本…`);
+  let summary = "";
+  try {
+    summary = (
+      await completeWithRegistry(ctx, ctx.model, {
+        systemPrompt:
+          "Summarize the following roleplay excerpt into 1 concise, dense factual memory paragraph (max 180 Chinese chars or 90 English words) preserving key plot events, relationship shifts, promises, and clues. Output ONLY the summary text.",
+        userPrompt: transcript,
+        maxTokens: 320,
+        signal: ctx.signal,
+      })
+    ).trim();
+  } catch (err) {
+    ctx.ui.notify(`总结失败：${(err as Error).message}`, "error");
+    return;
+  } finally {
+    ctx.ui.setWorkingMessage?.(undefined);
+  }
+
+  if (!summary) {
+    ctx.ui.notify("未能生成有效摘要。", "warning");
+    return;
+  }
+
+  const ok = await ctx.ui.confirm(
+    `写入记忆本并隐藏这 ${count} 条旧楼层？`,
+    `摘要预览：\n${summary}\n\n（旧楼层仅对模型隐藏，原聊天记录完整保留，随时可 /rp unhide 恢复）`,
+  );
+  if (!ok) return;
+
+  rt.commitTx({
+    kind: "fact_add",
+    fact: {
+      id: `mem_arc_${Date.now().toString(36)}`,
+      statement: `[阶段归档] ${summary}`,
+      entities: [card.identity.name, ...(state.location ? [state.location] : [])],
+      validFromTurn: state.turn,
+      validUntilTurn: null,
+      witnessIds: "public",
+    },
+  });
+  rt.commitTx({
+    kind: "hide_toggle",
+    entryIds: targets.map((e) => e.id),
+    fingerprints: targets.map((e) => computeMessageFingerprint(e.message!)),
+    hidden: true,
+  });
+  rt.refreshHud(ctx);
+  ctx.ui.notify(`✅ 已将 ${count} 条旧楼层总结写入记忆本并隐藏，上下文已瘦身。`, "info");
+}
+
+/**
+ * Dynamic World Info Entry Generator (`/rp loregen`):
+ * Extracts a new structured Lorebook entry for an emergent NPC, location, or organization
+ * from the recent dialogue and saves it to the active card's compiled lorebook.
+ */
+export async function actionGenerateLoreEntry(
+  rt: RpRuntimeHandle,
+  ctx: PiExtensionContext,
+  argsText: string,
+): Promise<void> {
+  const state = rt.getState();
+  const card = rt.getCard();
+  if (!state.active || !card) {
+    ctx.ui.notify("当前会话未开启 RP 模式。", "warning");
+    return;
+  }
+  if (!canCompleteWithRegistry(ctx)) {
+    ctx.ui.notify("当前环境不支持模型调用，无法生成世界书条目。", "warning");
+    return;
+  }
+
+  let subject = argsText.trim();
+  if (!subject) {
+    const entered = (await ctx.ui.input("📚 输入要收录进世界书的新人物 / 地点 / 组织名称", ""))?.trim();
+    if (!entered) return;
+    subject = entered;
+  }
+
+  const recent = collectRecentDialogueLines(ctx, state, 10);
+  ctx.ui.setWorkingMessage?.(`正在为「${subject}」生成世界书条目…`);
+  let raw = "";
+  try {
+    raw = await completeWithRegistry(ctx, ctx.model, {
+      systemPrompt:
+        'Extract a concise World Info (Lorebook) entry for the requested subject based on the recent roleplay dialogue. Return ONLY strict JSON: {"title": string, "keys": string[], "content": string}. Keep content factual and under 220 chars.',
+      userPrompt: `Subject: ${subject}\nRecent dialogue:\n${recent.join("\n")}`,
+      maxTokens: 400,
+      signal: ctx.signal,
+    });
+  } catch (err) {
+    ctx.ui.notify(`生成失败：${(err as Error).message}`, "error");
+    return;
+  } finally {
+    ctx.ui.setWorkingMessage?.(undefined);
+  }
+
+  const m = /\{[\s\S]*\}/.exec(raw);
+  if (!m) {
+    ctx.ui.notify("未能解析生成的世界书 JSON，请重试。", "warning");
+    return;
+  }
+
+  let parsed: { title?: string; keys?: string[]; content?: string };
+  try {
+    parsed = JSON.parse(m[0]!);
+  } catch {
+    ctx.ui.notify("生成的世界书格式无效，请重试。", "warning");
+    return;
+  }
+
+  const title = (parsed.title || subject).trim();
+  const keys = Array.isArray(parsed.keys)
+    ? parsed.keys.filter((k): k is string => typeof k === "string" && k.trim().length > 0).map((k) => k.trim())
+    : [subject];
+  if (!keys.includes(subject)) keys.unshift(subject);
+  const content = (parsed.content || "").trim();
+  if (!content) {
+    ctx.ui.notify("生成的条目正文为空。", "warning");
+    return;
+  }
+
+  const ok = await ctx.ui.confirm(
+    `收录世界书条目「${title}」？`,
+    `触发词：${keys.join("、")}\n\n${content}`,
+  );
+  if (!ok) return;
+
+  const compiledBook = compileLoreBook({
+    entries: [
+      {
+        id: `lore_gen_${Date.now().toString(36)}`,
+        comment: title,
+        keys,
+        content,
+        enabled: true,
+        constant: false,
+        insertion_order: 100,
+      },
+    ],
+  });
+  const newEntry: CompiledLoreEntry | undefined = compiledBook.entries[0];
+  if (!newEntry) return;
+
+  card.loreBook.entries.push(newEntry);
+  card.importReport.loreCount = card.loreBook.entries.length;
+  card.importReport.dynamicLoreCount += 1;
+
+  if (state.worldDir) {
+    const rawJson = loadRawCardJson(state.worldDir, card.slug) ?? {};
+    saveCompiledCard({ baseDir: state.worldDir, card, rawJson });
+  }
+  rt.reloadRuntime(ctx);
+  ctx.ui.notify(`✅ 已将「${title}」收录进当前角色卡世界书（触发词：${keys.join("、")}）。`, "info");
 }

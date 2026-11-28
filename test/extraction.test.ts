@@ -282,3 +282,97 @@ test("ModelRegistry helper prefers official streamSimple().result() with timesta
   assert.ok(committed >= 1);
   assert.equal(state.location, "北门茶馆");
 });
+
+test("Forum workflows: actionImpersonate prefills editor via setEditorText without mutating session, actionSidePrompt is zero-pollution", async () => {
+  const { actionImpersonate, actionSidePrompt } = await import("../src/ui/actions.js");
+  const card = compileCharacterCard(
+    { spec: "chara_card_v2", data: { name: "林晚", description: "书店老板", scenario: "小书店", first_mes: "欢迎。" } },
+    "v2",
+  );
+  const state = createInitialRpState();
+  state.active = true;
+  state.cardSlug = card.slug;
+  state.location = "旧书店";
+
+  let editorPrefill = "";
+  let sideEditorTitle = "";
+  let sideEditorText = "";
+  let txCount = 0;
+  let sentCount = 0;
+
+  const mockRt = {
+    pi: {
+      sendMessage() {
+        sentCount++;
+      },
+    } as unknown as PiExtensionAPI,
+    getState: () => state,
+    getCard: () => card,
+    getExtraCastCards: () => [],
+    getPreset: () => null,
+    commitTx() {
+      txCount++;
+    },
+    reloadRuntime() {},
+    refreshHud() {},
+    activateRpTools() {},
+    restoreCodingTools() {},
+    markNextTurnOoc() {},
+    teardownSessionRuntime() {},
+  };
+
+  const mockCtx = {
+    cwd: "/tmp",
+    model: { id: "mock" },
+    sessionManager: {
+      getBranch: () => [
+        { id: "m1", type: "message", message: { role: "assistant", content: "雨越下越大了，要喝杯热茶吗？" } },
+      ],
+      getEntries: () => [],
+      getLeafId: () => "m1",
+    },
+    modelRegistry: {
+      streamSimple() {
+        return {
+          async result() {
+            return { content: [{ type: "text", text: "我收起雨伞点点头：麻烦你了，来杯红茶吧。" }] };
+          },
+        };
+      },
+    },
+    ui: {
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+      setWorkingMessage() {},
+      async select() {
+        return undefined;
+      },
+      async confirm() {
+        return true;
+      },
+      async input() {
+        return "";
+      },
+      async editor(title: string, initialText?: string) {
+        sideEditorTitle = title;
+        sideEditorText = initialText ?? "";
+        return initialText;
+      },
+      setEditorText(text: string) {
+        editorPrefill = text;
+      },
+    },
+  } as unknown as PiExtensionContext;
+
+  await actionImpersonate(mockRt, mockCtx, "答应喝茶");
+  assert.equal(editorPrefill, "我收起雨伞点点头：麻烦你了，来杯红茶吧。");
+  assert.equal(txCount, 0);
+  assert.equal(sentCount, 0);
+
+  await actionSidePrompt(mockRt, mockCtx, "她此刻的心情如何？");
+  assert.ok(sideEditorTitle.includes("场外回答"));
+  assert.equal(sideEditorText, "我收起雨伞点点头：麻烦你了，来杯红茶吧。");
+  assert.equal(txCount, 0);
+  assert.equal(sentCount, 0);
+});

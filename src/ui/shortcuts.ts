@@ -1,11 +1,9 @@
 /**
  * Ergonomic, terminal-safe RP shortcuts registered via Pi's official `pi.registerShortcut`.
  *
- * Terminal safety guarantees:
- *  - Avoids raw terminal-reserved collisions (`ctrl+i`=Tab, `ctrl+m`=Enter, `ctrl+j`=LF,
- *    `ctrl+h`=Backspace, `ctrl+c`/`ctrl+z`/`ctrl+d`/`ctrl+l`/`ctrl+r`/`ctrl+o`).
- *  - In dormant (non-RP) sessions, ONLY `alt+r` opens the RP Launcher; all other RP shortcuts
- *    quietly notify without modifying any coding session state or tools.
+ * Prioritizes daily high-frequency RP workflows (Impersonate, Zero-Pollution Side Prompt,
+ * Reroll/Swipe, Continue, Director Note, Scene/Time Jump, Bookmarks) while keeping TRPG
+ * tools (`/rp roll`) accessible without cluttering everyday shortcuts.
  */
 
 import type { PiExtensionAPI, PiExtensionContext } from "../types.js";
@@ -18,15 +16,15 @@ export interface RpShortcutSpec {
 
 export const RP_SHORTCUT_LIST: RpShortcutSpec[] = [
   { key: "alt+r", label: "主菜单 / 启动器", description: "打开 RP 主菜单（未开启时打开启动器）" },
-  { key: "ctrl+shift+r", label: "世界面板", description: "打开实时世界面板 / 状态与世界书编辑器 (/rp panel)" },
-  { key: "alt+w", label: "重摇回复", description: "分叉重摇上一条回复，旧版本保留在 /tree (/rp reroll)" },
+  { key: "ctrl+shift+r", label: "世界面板", description: "打开场景、人物、记忆本与世界书管理面板 (/rp panel)" },
+  { key: "alt+i", label: "帮我代写", description: "以玩家视角起草回复并填入输入框 (/rp imp)" },
+  { key: "alt+q", label: "场外提问", description: "零污染 Side Prompt，不写入历史与时钟 (/rp ask)" },
+  { key: "alt+w", label: "重摇回复", description: "重摇上一条回复，旧版本保留在 /tree (/rp reroll)" },
   { key: "alt+k", label: "继续续写", description: "让角色无缝续写剧情 (/rp continue)" },
   { key: "alt+a", label: "行动建议", description: "生成 3 个当前情境下的行动选项 (/rp act)" },
-  { key: "alt+n", label: "导演指令", description: "管理导演指令与常用模板 (/rp note)" },
-  { key: "alt+p", label: "切换节奏", description: "一键循环切换节奏：舒缓 → 均衡 → 紧张 (/rp pace)" },
-  { key: "alt+o", label: "OOC 讨论", description: "发起场外 OOC 讨论，不推进剧情 (/rp ooc)" },
-  { key: "alt+g", label: "快捷掷骰", description: "打开快捷掷骰检定器 (/rp roll)" },
-  { key: "alt+t", label: "时间快进", description: "跳过时间 / 触发幕间蒙太奇 (/rp skip)" },
+  { key: "alt+n", label: "导演指令", description: "管理导演指令与文风/篇幅模板 (/rp note)" },
+  { key: "alt+p", label: "切换节奏", description: "循环切换节奏：舒缓 → 均衡 → 紧张 (/rp pace)" },
+  { key: "alt+t", label: "切场景/跳时间", description: "跳过时间或切换至下一场景 (/rp skip)" },
   { key: "alt+b", label: "保存书签", description: "为当前剧情节点打书签 (/rp save)" },
   { key: "alt+j", label: "跳转书签", description: "回溯或分叉至已保存的剧情书签 (/rp goto)" },
   { key: "alt+h", label: "切换 HUD", description: "循环切换 HUD：极简 → 完整 → 隐藏 (/rp hud)" },
@@ -37,13 +35,13 @@ export interface RpShortcutHandlers {
   isActive(): boolean;
   openMenu(ctx: PiExtensionContext): Promise<void>;
   openDashboard(ctx: PiExtensionContext): Promise<void>;
+  impersonate(ctx: PiExtensionContext): Promise<void>;
+  sidePrompt(ctx: PiExtensionContext): Promise<void>;
   rerollLast(ctx: PiExtensionContext): Promise<void>;
   continueStory(ctx: PiExtensionContext): Promise<void>;
   actionIdeas(ctx: PiExtensionContext): Promise<void>;
   directorNote(ctx: PiExtensionContext): Promise<void>;
   cyclePacing(ctx: PiExtensionContext): Promise<void>;
-  oocChat(ctx: PiExtensionContext): Promise<void>;
-  quickRoll(ctx: PiExtensionContext): Promise<void>;
   skipTime(ctx: PiExtensionContext): Promise<void>;
   saveBookmark(ctx: PiExtensionContext): Promise<void>;
   gotoBookmark(ctx: PiExtensionContext): Promise<void>;
@@ -68,8 +66,18 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
   });
 
   pi.registerShortcut("ctrl+shift+r", {
-    description: "RP 世界面板与实时状态编辑器",
+    description: "RP 世界面板（场景/人物/记忆本/世界书）",
     handler: requireActive((ctx) => handlers.openDashboard(ctx)),
+  });
+
+  pi.registerShortcut("alt+i", {
+    description: "RP 帮我代写主角回复 (/rp imp)",
+    handler: requireActive((ctx) => handlers.impersonate(ctx)),
+  });
+
+  pi.registerShortcut("alt+q", {
+    description: "RP 零污染场外提问 (/rp ask)",
+    handler: requireActive((ctx) => handlers.sidePrompt(ctx)),
   });
 
   pi.registerShortcut("alt+w", {
@@ -97,18 +105,8 @@ export function registerRpShortcuts(pi: PiExtensionAPI, handlers: RpShortcutHand
     handler: requireActive((ctx) => handlers.cyclePacing(ctx)),
   });
 
-  pi.registerShortcut("alt+o", {
-    description: "RP 发起 OOC 场外讨论 (/rp ooc)",
-    handler: requireActive((ctx) => handlers.oocChat(ctx)),
-  });
-
-  pi.registerShortcut("alt+g", {
-    description: "RP 快捷掷骰检定 (/rp roll)",
-    handler: requireActive((ctx) => handlers.quickRoll(ctx)),
-  });
-
   pi.registerShortcut("alt+t", {
-    description: "RP 推进时间 / 幕间蒙太奇 (/rp skip)",
+    description: "RP 切场景 / 跳时间 (/rp skip)",
     handler: requireActive((ctx) => handlers.skipTime(ctx)),
   });
 

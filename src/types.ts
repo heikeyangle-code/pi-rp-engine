@@ -163,6 +163,11 @@ export interface PiExtensionAPI {
   registerTool(tool: PiToolDefinition): void;
   registerCommand(name: string, def: PiCommandDefinition): void;
   registerShortcut?(shortcut: string, def: PiShortcutDefinition): void;
+  registerFlag?(
+    name: string,
+    options: { description?: string; type: "boolean" | "string"; default?: boolean | string },
+  ): void;
+  getFlag?(name: string): boolean | string | undefined;
   getActiveTools(): string[];
   setActiveTools(names: string[]): void;
   appendEntry(customType: string, data: unknown): void;
